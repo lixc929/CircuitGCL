@@ -134,7 +134,7 @@ Use the current `test` branch for all implementation and experiment commits. Do 
 | S1. Code-path diagnosis | Done | Explain why the first `SgrlBackboneHead` attempt is too aggressive. | Document that it replaces the downstream `GraphHead` instead of feeding online features into it. | Static GCL vs replacement-style reuse |
 | S2. Online feature reuse | Done | Use the pretrained online encoder online, but keep the original downstream GNN. | Added `--sgrl_mode online_feature`; frozen/eval online encoder produces `H_online` per batch, then `GraphHead` still runs downstream message passing and prediction. | `static + MSE` vs `online_feature_frozen + MSE` |
 | S3. Online feature finetuning | Done | Check whether supervised gradients should update the online encoder. | Added `--sgrl_mode online_feature_finetune`; use separate optimizer groups with lower online-encoder LR. | `online_feature_frozen` vs `online_feature_finetune` |
-| S4. Parameter initialization reuse | Done | Reuse GCL online encoder weights to initialize compatible downstream layers. | Added `init_reuse`; copied only matching tensors, logged skipped keys, and recorded parameter counts. | compact `no-GCL + MSE` vs `init_reuse + MSE`; `static + MSE` GPU rerun pending |
+| S4. Parameter initialization reuse | Done | Reuse GCL online encoder weights to initialize compatible downstream layers. | Added `init_reuse`; copied only matching tensors, logged skipped keys, and recorded parameter counts. | compact `no-GCL/static/init_reuse + MSE`, all GPU verified |
 | S5. Partial shared backbone | Next | Share early/lower GNN layers while keeping task-specific later layers/head. | Introduce a `SharedGNNBackbone` wrapper with separate GCL predictor and downstream head. | `init_reuse` vs `partial_shared` |
 | S6. Joint shared backbone | Pending | Train one online backbone with both GCL and supervised losses. | Optimize `L = L_supervised + lambda_gcl * L_gcl`; target encoder remains EMA/stop-gradient. | `partial_shared` vs `joint_shared` |
 | S7. Label rebalancing integration | Pending | Test whether rebalancing helps after reuse is architecturally correct. | Run MSE first, then GAI/BMC. Try warmup MSE -> rebalancing only if needed. | best reuse + `MSE/GAI/BMC` |
@@ -379,11 +379,13 @@ Online feature reuse, finetuned online encoder + MSE
 
 ```text
 compact no-GCL + MSE, GPU verified
+compact static + MSE, GPU verified
 init_reuse + MSE, GPU verified
 ```
 
-5. Next: run the strict GPU-verified `static + MSE` comparison, then move to S5
-   partial shared backbone.
+5. Next: move to S5 partial shared backbone. S4 shows that `init_reuse` improves
+   validation and timing-control over compact static, but compact static is
+   still better on digtime and array.
 6. Only after the compact reuse architecture is stable, compare:
 
 ```text

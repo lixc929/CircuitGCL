@@ -653,13 +653,46 @@ GPU-verified paired compact `no-GCL + MSE` baseline:
   --log_dir logs/compact_clustergcn_baseline_gpu_20260709
 ```
 
+GPU-verified paired compact `static + MSE` baseline:
+
+```bash
+/home/lixc/.conda/envs/RCG/bin/python main.py \
+  --dataset ssram+digtime+timing_ctrl+array_128_32_8t \
+  --task regression \
+  --task_level edge \
+  --regress_loss mse \
+  --batch_size 512 \
+  --epochs 20 \
+  --num_workers 0 \
+  --gpu 3 \
+  --sgrl 1 \
+  --sgrl_mode static \
+  --model clustergcn \
+  --hid_dim 63 \
+  --num_gnn_layers 2 \
+  --cl_model clustergcn \
+  --cl_epochs 5 \
+  --cl_gnn_layers 2 \
+  --cl_hid_dim 64 \
+  --cl_batch_size 32768 \
+  --cl_num_neighbors 8 \
+  --num_hops 2 \
+  --num_neighbors 8 \
+  --log_dir logs/static_mse_compact_gpu_20260709
+```
+
+Static compact uses `--hid_dim 63` because the static embedding path combines
+node type, circuit statistics, and CL features, so `GraphHead` requires the
+hidden dimension to be divisible by 3.
+
 ### Result
 
-Both logs start with `CUDA status: available=True` and `Using GPU: 3`.
+All successful logs start with `CUDA status: available=True` and `Using GPU: 3`.
 
 | Mode | Loss | Params | Best epoch | Val MSE | digtime MSE | timing_ctrl MSE | array MSE | Log |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | compact no-GCL | mse | 27,170 | 16 | 0.0101 | 0.0145 | 0.0124 | 0.0113 | `logs/compact_clustergcn_baseline_gpu_20260709/20260709_221835_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| compact static | mse | 27,134 | 17 | 0.0100 | 0.0137 | 0.0117 | 0.0115 | `logs/static_mse_compact_gpu_20260709/20260709_223724_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | init_reuse | mse | 27,170 | 19 | 0.0097 | 0.0141 | 0.0112 | 0.0121 | `logs/init_reuse_dev_gpu_20260709/20260709_220924_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 
 The `init_reuse` log reports:
@@ -676,10 +709,18 @@ SGRL GraphHead init reuse summary: copied_tensors=12, copied_values=17025, skipp
 - Compared with the GPU-verified compact no-GCL baseline, `init_reuse` improves
   validation MSE (`0.0101 -> 0.0097`) and improves digtime/timing_ctrl, while
   array is slightly worse (`0.0113 -> 0.0121`).
+- Compared with the GPU-verified compact static baseline, `init_reuse` has
+  better validation and timing-control MSE, while compact static is better on
+  digtime and array. This means S4 is promising but not a clean win over static
+  GCL yet.
 - This is a better reuse direction than the earlier replacement-style
   `reuse_gate_init` path, which was both less accurate and less faithful to the
   original downstream model.
-- The strict GPU-verified `static + MSE` comparison is still pending. Before
-  expanding S4 to `GAI`/`BMC`, rerun `static + MSE` with the new CUDA diagnostics
-  so that S4 is compared against both compact no-GCL and original static GCL
-  under the same evidence standard.
+- The `static + MSE` rerun had two failed starts before the successful log:
+  `--hid_dim 64` violated the static-path divisibility check, and the first
+  `--hid_dim 63` attempt hit CUDA OOM while GPU3 was nearly full. No external
+  processes were killed or interrupted; the successful run started after GPU3
+  memory was naturally released.
+- Next direction: move to S5 partial shared backbone. S5 should try to keep the
+  compactness benefit of `init_reuse` while preserving the stronger digtime and
+  array transfer behavior of static GCL.
