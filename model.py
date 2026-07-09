@@ -634,7 +634,13 @@ class PartialSharedGraphHead(nn.Module):
             self.pin_attr_layers = nn.Embedding(17, stats_embed_dim)
             if self.stats_fusion == 'concat':
                 fused_dim = self.shared_dim + stats_embed_dim
-            elif self.stats_fusion in ['add', 'gate', 'residual_gate']:
+            elif self.stats_fusion in [
+                'add',
+                'gate',
+                'residual_gate',
+                'scalar_gate',
+                'vector_gate',
+            ]:
                 fused_dim = self.shared_dim
             else:
                 raise ValueError(
@@ -645,6 +651,10 @@ class PartialSharedGraphHead(nn.Module):
                     nn.Linear(self.shared_dim + stats_embed_dim, self.shared_dim),
                     nn.Sigmoid(),
                 )
+            elif self.stats_fusion == 'scalar_gate':
+                self.stats_gate_logit = nn.Parameter(torch.zeros(1))
+            elif self.stats_fusion == 'vector_gate':
+                self.stats_gate_logit = nn.Parameter(torch.zeros(self.shared_dim))
             print(
                 "Using circuit-statistics adapter after partial shared backbone "
                 f"(fusion={self.stats_fusion})."
@@ -747,6 +757,12 @@ class PartialSharedGraphHead(nn.Module):
         if self.stats_fusion == 'residual_gate':
             gate = self.stats_gate(torch.cat((x, stats_x), dim=1))
             return x + gate * stats_x
+        if self.stats_fusion == 'scalar_gate':
+            gate = torch.sigmoid(self.stats_gate_logit)
+            return gate * x + (1.0 - gate) * stats_x
+        if self.stats_fusion == 'vector_gate':
+            gate = torch.sigmoid(self.stats_gate_logit).view(1, -1)
+            return gate * x + (1.0 - gate) * stats_x
         raise ValueError(f'Unsupported partial-shared stats fusion: {self.stats_fusion}')
 
     def _run_tail(self, x, batch):
@@ -838,7 +854,13 @@ class SgrlBackboneHead(nn.Module):
             self.pin_attr_layers = nn.Embedding(17, self.stats_embed_dim)
             if self.stats_fusion == 'concat':
                 fused_dim = hidden_dim + self.stats_embed_dim
-            elif self.stats_fusion in ['add', 'gate', 'residual_gate']:
+            elif self.stats_fusion in [
+                'add',
+                'gate',
+                'residual_gate',
+                'scalar_gate',
+                'vector_gate',
+            ]:
                 fused_dim = hidden_dim
             else:
                 raise ValueError(f'Unsupported SGRL stats fusion: {self.stats_fusion}')
@@ -847,6 +869,10 @@ class SgrlBackboneHead(nn.Module):
                     nn.Linear(hidden_dim + self.stats_embed_dim, hidden_dim),
                     nn.Sigmoid(),
                 )
+            elif self.stats_fusion == 'scalar_gate':
+                self.stats_gate_logit = nn.Parameter(torch.zeros(1))
+            elif self.stats_fusion == 'vector_gate':
+                self.stats_gate_logit = nn.Parameter(torch.zeros(hidden_dim))
             print(
                 "Using circuit-statistics adapter for SGRL backbone reuse "
                 f"(fusion={self.stats_fusion})."
@@ -951,6 +977,12 @@ class SgrlBackboneHead(nn.Module):
         if self.stats_fusion == 'residual_gate':
             gate = self.stats_gate(torch.cat((x, stats_x), dim=1))
             return x + gate * stats_x
+        if self.stats_fusion == 'scalar_gate':
+            gate = torch.sigmoid(self.stats_gate_logit)
+            return gate * x + (1.0 - gate) * stats_x
+        if self.stats_fusion == 'vector_gate':
+            gate = torch.sigmoid(self.stats_gate_logit).view(1, -1)
+            return gate * x + (1.0 - gate) * stats_x
         raise ValueError(f'Unsupported SGRL stats fusion: {self.stats_fusion}')
 
     def forward(self, batch):

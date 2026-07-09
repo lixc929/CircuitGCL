@@ -76,7 +76,15 @@ if __name__ == "__main__":
         '--partial_shared_stats_fusion',
         type=str,
         default='add',
-        choices=['add', 'gate', 'residual_gate', 'concat', 'none'],
+        choices=[
+            'add',
+            'gate',
+            'residual_gate',
+            'scalar_gate',
+            'vector_gate',
+            'concat',
+            'none',
+        ],
         help='How to fuse circuit statistics after the shared lower GNN backbone.',
     )
     parser.add_argument(
@@ -107,7 +115,15 @@ if __name__ == "__main__":
         '--sgrl_reuse_stats_fusion',
         type=str,
         default='concat',
-        choices=['concat', 'add', 'gate', 'residual_gate', 'none'],
+        choices=[
+            'concat',
+            'add',
+            'gate',
+            'residual_gate',
+            'scalar_gate',
+            'vector_gate',
+            'none',
+        ],
         help="How to fuse reused SGRL backbone features and circuit-statistics features.",
     )
     parser.add_argument('--e1_lr', type=float, default=1e-6, help='Learning rate for online encoder in SGRL.')

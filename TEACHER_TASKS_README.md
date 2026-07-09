@@ -135,7 +135,7 @@ Use the current `test` branch for all implementation and experiment commits. Do 
 | S2. Online feature reuse | Done | Use the pretrained online encoder online, but keep the original downstream GNN. | Added `--sgrl_mode online_feature`; frozen/eval online encoder produces `H_online` per batch, then `GraphHead` still runs downstream message passing and prediction. | `static + MSE` vs `online_feature_frozen + MSE` |
 | S3. Online feature finetuning | Done | Check whether supervised gradients should update the online encoder. | Added `--sgrl_mode online_feature_finetune`; use separate optimizer groups with lower online-encoder LR. | `online_feature_frozen` vs `online_feature_finetune` |
 | S4. Parameter initialization reuse | Done | Reuse GCL online encoder weights to initialize compatible downstream layers. | Added `init_reuse`; copied only matching tensors, logged skipped keys, and recorded parameter counts. | compact `no-GCL/static/init_reuse + MSE`, all GPU verified |
-| S5. Partial shared backbone | In progress | Share early/lower GNN layers while keeping task-specific later layers/head. | Added `partial_shared`, `SharedGNNBackbone`, and `PartialSharedGraphHead`; `k2 + add` hurts transfer, and the warmup sweep keeps `k1 + gate + freeze3` as the current best shared-backbone candidate. | `init_reuse` vs `partial_shared_k1/k2/gate/freeze` |
+| S5. Partial shared backbone | In progress | Share early/lower GNN layers while keeping task-specific later layers/head. | Added `partial_shared`, `SharedGNNBackbone`, and `PartialSharedGraphHead`; `k1 + gate + freeze3` is still the accuracy leader, while `scalar_gate/vector_gate + freeze3` reduce parameters but lose transfer. | `init_reuse` vs `partial_shared_k1/k2/gate/freeze/slim_gate` |
 | S6. Joint shared backbone | Pending | Train one online backbone with both GCL and supervised losses. | Optimize `L = L_supervised + lambda_gcl * L_gcl`; target encoder remains EMA/stop-gradient. | `partial_shared` vs `joint_shared` |
 | S7. Label rebalancing integration | Pending | Test whether rebalancing helps after reuse is architecturally correct. | Run MSE first, then GAI/BMC. Try warmup MSE -> rebalancing only if needed. | best reuse + `MSE/GAI/BMC` |
 
@@ -397,6 +397,8 @@ partial_shared_k1 + gate + backbone_lr=1e-5: Val 0.0107; digtime/timing_ctrl/arr
 partial_shared_k1 + gate + freeze1: Val 0.0098; digtime/timing_ctrl/array 0.0141/0.0117/0.0121
 partial_shared_k1 + gate + freeze2: Val 0.0098; digtime/timing_ctrl/array 0.0139/0.0117/0.0120
 partial_shared_k1 + gate + freeze3: Val 0.0098; digtime/timing_ctrl/array 0.0140/0.0117/0.0119
+partial_shared_k1 + scalar_gate + freeze3: Val 0.0102; digtime/timing_ctrl/array 0.0172/0.0117/0.0130
+partial_shared_k1 + vector_gate + freeze3: Val 0.0101; digtime/timing_ctrl/array 0.0189/0.0118/0.0134
 partial_shared_k1 + gate + freeze5: Val 0.0099; digtime/timing_ctrl/array 0.0139/0.0118/0.0120
 partial_shared_k1 + gate + freeze3 + backbone_lr=3e-5: Val 0.0099; digtime/timing_ctrl/array 0.0141/0.0116/0.0121
 ```
@@ -409,8 +411,11 @@ partial_shared_k1 + gate + freeze3 + backbone_lr=3e-5: Val 0.0099; digtime/timin
    transfer much healthier than k2. The warmup sweep suggests `freeze1/2` are
    close but not better overall, `freeze5` adapts too slowly, and lowering the
    shared-backbone LR to `3e-5` is also slower than the plain `freeze3` schedule.
-   The next S5 work should reduce the gate parameter overhead and then run
-   label-rebalancing comparisons on the best shared-backbone candidate.
+   Slim gates reduce the full-gate model from `38,018` parameters to about
+   `29.8k`, but their transfer MSE is worse, especially on digtime. The next S5
+   work should keep full `gate + freeze3` as the accuracy candidate, keep
+   `vector_gate + freeze3` as the slim candidate, and then run label-rebalancing
+   comparisons.
 6. Only after the compact reuse architecture is stable, compare:
 
 ```text

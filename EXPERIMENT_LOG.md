@@ -945,6 +945,8 @@ Model parameters: total=29,762, trainable=29,762, frozen=0.
 | partial_shared_k1_gate_freeze1 | mse | 38,018 total / 28,738 warmup trainable | 18 | 0.0098 | 0.0141 | 0.0117 | 0.0121 | `logs/partial_shared_k1_gate_freeze1_mse_gpu_20260710/20260710_002548_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | partial_shared_k1_gate_freeze2 | mse | 38,018 total / 28,738 warmup trainable | 18 | 0.0098 | 0.0139 | 0.0117 | 0.0120 | `logs/partial_shared_k1_gate_freeze2_mse_gpu_20260710/20260710_003140_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | partial_shared_k1_gate_freeze3 | mse | 38,018 total / 28,738 warmup trainable | 19 | 0.0098 | 0.0140 | 0.0117 | 0.0119 | `logs/partial_shared_k1_gate_freeze3_mse_gpu_20260709/20260710_000538_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_scalar_gate_freeze3 | mse | 29,763 total / 20,483 warmup trainable | 18 | 0.0102 | 0.0172 | 0.0117 | 0.0130 | `logs/partial_shared_k1_scalar_gate_freeze3_mse_gpu_20260710/20260710_005658_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_vector_gate_freeze3 | mse | 29,826 total / 20,546 warmup trainable | 19 | 0.0101 | 0.0189 | 0.0118 | 0.0134 | `logs/partial_shared_k1_vector_gate_freeze3_mse_gpu3_20260710/20260710_010211_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | partial_shared_k1_gate_freeze5 | mse | 38,018 total / 28,738 warmup trainable | 19 | 0.0099 | 0.0139 | 0.0118 | 0.0120 | `logs/partial_shared_k1_gate_freeze5_mse_gpu_20260710/20260710_003708_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | partial_shared_k1_gate_freeze3_backbone_lr3e-5 | mse | 38,018 total / 28,738 warmup trainable | 19 | 0.0099 | 0.0141 | 0.0116 | 0.0121 | `logs/partial_shared_k1_gate_freeze3_backbone_lr3e-5_mse_gpu_20260710/20260710_004222_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 
@@ -980,6 +982,8 @@ Code support added:
 ```text
 --partial_shared_backbone_lr <float>
 --partial_shared_freeze_epochs <int>
+--partial_shared_stats_fusion scalar_gate
+--partial_shared_stats_fusion vector_gate
 ```
 
 `--partial_shared_backbone_lr` creates a separate optimizer group for
@@ -1019,13 +1023,31 @@ Key observations:
 - For `freeze1` and `freeze2`, the final epoch printed slightly lower val losses
   without emitting matching test results. The table uses each log's final
   reported `Best epoch` and `Test results` for reproducible comparison.
+- The slim gate variants replace the 8,256-parameter learned gate MLP with
+  either one scalar gate (`scalar_gate`) or one hidden-dimension gate vector
+  (`vector_gate`). This reduces the `k1 + gate + freeze3` model from `38,018`
+  total parameters to `29,763` or `29,826`, roughly a 21.6% reduction.
+- `partial_shared_k1_vector_gate_freeze3` reaches a slightly better validation
+  MSE than `scalar_gate` (`0.01012813` vs reported-best `0.01020981`), but both
+  lose the strong transfer behavior of the full learned gate. The clearest
+  regression is digtime: `0.0172` for scalar and `0.0189` for vector versus
+  `0.0140` for full `gate + freeze3`.
+- The scalar run printed a final epoch validation loss of `0.01015140` without
+  new matching test results; the table keeps the log's reported best epoch and
+  associated tests. The first vector attempt on GPU1 failed before training
+  because the current PyTorch build does not support the Blackwell `sm_120`
+  architecture; the recorded vector result is the GPU3 rerun.
 
 Current S5 conclusion:
 
 - Do not continue deeper sharing (`k2`) with the current head.
-- Keep `k1 + gate + freeze warmup` as the leading shared-backbone candidate.
-- Use `freeze3` as the default S5 setting; keep `freeze2` as a secondary option
-  if digtime becomes the target metric.
-- Before adding GAI/BMC to S5, reduce/clean the gate parameter overhead if
-  possible, then run the rebalancing comparison on the best shared-backbone
+- Keep full `k1 + gate + freeze3` as the accuracy-leading shared-backbone
   candidate.
+- Keep `k1 + vector_gate + freeze3` and `k1 + scalar_gate + freeze3` as compact
+  ablation baselines: they prove the architecture can be slimmed, but the
+  current slim gates are not accurate enough to replace the full learned gate.
+- If compactness becomes the primary target, the next design should try a
+  middle ground such as grouped/low-rank gate or a tiny bottleneck adapter,
+  instead of jumping directly from 8,256 gate parameters down to 1 or 64.
+- Before adding GAI/BMC to S5, use full `gate + freeze3` for the main accuracy
+  comparison and include `vector_gate + freeze3` as the slim candidate.
