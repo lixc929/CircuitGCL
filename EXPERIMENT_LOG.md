@@ -907,28 +907,57 @@ Partial shared backbone load summary: shared_layers=1, copied_tensors=10, copied
 Model parameters: total=29,762, trainable=29,762, frozen=0.
 ```
 
+The more aggressive S5-k2 run shared both downstream GNN layers with the SGRL
+online GNN and therefore left no downstream-specific tail GNN:
+
+```bash
+/home/lixc/.conda/envs/RCG/bin/python main.py \
+  --dataset ssram+digtime+timing_ctrl+array_128_32_8t \
+  --task regression --task_level edge --regress_loss mse \
+  --batch_size 512 --epochs 20 --num_workers 0 --gpu 3 \
+  --sgrl 1 --sgrl_mode partial_shared \
+  --shared_gnn_layers 2 \
+  --partial_shared_stats_fusion add \
+  --model clustergcn --hid_dim 64 --num_gnn_layers 2 \
+  --cl_model clustergcn --cl_epochs 5 --cl_gnn_layers 2 \
+  --cl_hid_dim 64 --cl_batch_size 32768 --cl_num_neighbors 8 \
+  --num_hops 2 --num_neighbors 8 \
+  --log_dir logs/partial_shared_k2_mse_gpu_20260709
+```
+
+The k2 log reports:
+
+```text
+Partial shared backbone load summary: shared_layers=2, copied_tensors=13, copied_values=17665, skipped=1.
+Model parameters: total=29,762, trainable=29,762, frozen=0.
+```
+
 | Mode | Loss | Params | Best epoch | Val MSE | digtime MSE | timing_ctrl MSE | array MSE | Log |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | compact no-GCL | mse | 27,170 | 16 | 0.0101 | 0.0145 | 0.0124 | 0.0113 | `logs/compact_clustergcn_baseline_gpu_20260709/20260709_221835_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | compact static | mse | 27,134 | 17 | 0.0100 | 0.0137 | 0.0117 | 0.0115 | `logs/static_mse_compact_gpu_20260709/20260709_223724_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | init_reuse | mse | 27,170 | 19 | 0.0097 | 0.0141 | 0.0112 | 0.0121 | `logs/init_reuse_dev_gpu_20260709/20260709_220924_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | partial_shared_k1_add | mse | 29,762 | 19 | 0.0104 | 0.0180 | 0.0123 | 0.0130 | `logs/partial_shared_k1_mse_gpu_20260709/20260709_230332_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k2_add | mse | 29,762 | 18 | 0.0108 | 0.0294 | 0.0152 | 0.0187 | `logs/partial_shared_k2_mse_gpu_20260709/20260709_233131_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 
 ### Interpretation Notes
 
 - The S5-k1 implementation is functional: it loads the SGRL online lower layer,
   trains normally, and steadily reduces validation MSE from 0.0133 to 0.0104.
-- This first `partial_shared_k1 + add` version does not beat S4 `init_reuse`
-  and does not beat compact static/no-GCL on validation MSE.
-- The main weakness is cross-dataset transfer: digtime and array are worse than
-  all three compact baselines, even though timing_ctrl is close to no-GCL.
+- S5-k2 is also functional, but it is not a good reuse candidate in this form:
+  source validation MSE keeps improving to 0.0108, while cross-dataset transfer
+  becomes much worse than k1 and all compact baselines, especially digtime
+  (0.0294) and array (0.0187).
+- This confirms that source validation alone is misleading for S5. The stronger
+  sharing can overfit the training/source distribution even when val improves.
 - The parameter count is also larger than the compact baselines because this
-  version keeps one shared layer plus one downstream tail layer and a stats
-  adapter. It is therefore not yet the simpler final architecture the teacher
-  likely wants.
-- Next S5 direction should test a more compact sharing variant before moving to
-  label rebalancing:
-  - `partial_shared_k2` with no downstream tail GNN.
+  implementation keeps stats adapters and edge/head modules. Even k2 does not
+  yet provide the simpler final architecture numerically, although it is more
+  structurally shared.
+- Next S5 direction should not push sharing deeper with plain `add` fusion.
+  Better next tests:
   - `partial_shared_k1` with `gate` or `residual_gate` stats fusion.
-  - optionally freeze the shared lower layer for the first few epochs if the
-    downstream loss is overwriting the pretrained GCL representation too fast.
+  - `partial_shared_k1` with a smaller supervised LR or frozen shared layer
+    warmup, to reduce overwriting of the pretrained GCL representation.
+  - clean parameter accounting so unused tail modules are not instantiated when
+    `tail_layers == 0`.
