@@ -315,3 +315,92 @@ seed: 42
   the current environment/data path. The current `test` branch contains the
   clean regression fixes, and the next serious experiment should run 20-epoch
   clean no-GCL rebalancing ablations.
+
+## 2026-07-09: Reuse x Rebalancing Development Matrix
+
+### Goal
+
+Run a compact 3 x 3 matrix to separate three questions:
+
+1. original static SGRL embedding path vs no-GCL downstream;
+2. whether fixed `GAI` / `BMC` help over `MSE`;
+3. whether label rebalancing can rescue the current online-encoder reuse path.
+
+This is a development anchor, not a full README/default reproduction. It uses
+the lightweight settings from the reuse pilots so the matrix is comparable with
+earlier local results and can reuse the cached SGRL artifacts.
+
+### Command Driver
+
+```bash
+/home/lixc/.conda/envs/RCG/bin/python -u scripts/run_reuse_rebalance_matrix.py \
+  --gpu 3 \
+  --python /home/lixc/.conda/envs/RCG/bin/python \
+  --quiet
+```
+
+Summary files:
+
+```text
+logs/reuse_rebalance_matrix_20260709/summary.json
+logs/reuse_rebalance_matrix_20260709/summary.md
+```
+
+### Shared Settings
+
+```text
+dataset: ssram+digtime+timing_ctrl+array_128_32_8t
+task: edge regression
+seed: 42
+gpu: 3
+epochs: 20
+batch_size: 512
+num_workers: 0
+cl_epochs: 5
+cl_gnn_layers: 2
+cl_hid_dim: 64
+cl_batch_size: 32768
+cl_num_neighbors: 8
+num_hops: 2
+num_neighbors: 8
+```
+
+Modes:
+
+```text
+static: --sgrl 1 --sgrl_mode static
+nogcl: --sgrl 0
+reuse_gate_init: --sgrl 1 --sgrl_mode init --sgrl_reuse_stats 1 --sgrl_reuse_stats_fusion gate
+```
+
+### Results
+
+| Mode | Loss | Best epoch | Val MSE | digtime MSE | timing_ctrl MSE | array MSE |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| static | mse | 17 | 0.0097 | 0.0151 | 0.0101 | 0.0111 |
+| static | gai | 19 | 0.0096 | 0.0147 | 0.0102 | 0.0111 |
+| static | bmc | 16 | 0.0095 | 0.0146 | 0.0099 | 0.0112 |
+| nogcl | mse | 18 | 0.0096 | 0.0141 | 0.0099 | 0.0113 |
+| nogcl | gai | 15 | 0.0097 | 0.0140 | 0.0106 | 0.0117 |
+| nogcl | bmc | 19 | 0.0095 | 0.0136 | 0.0101 | 0.0110 |
+| reuse_gate_init | mse | 18 | 0.0114 | 0.0177 | 0.0138 | 0.0183 |
+| reuse_gate_init | gai | 18 | 0.0114 | 0.0175 | 0.0139 | 0.0184 |
+| reuse_gate_init | bmc | 19 | 0.0112 | 0.0190 | 0.0142 | 0.0201 |
+
+### Interpretation Notes
+
+- Fixed BMC is the best validation run for both `static` and `nogcl` in this
+  development matrix, but the gains are modest and not uniform across every
+  test dataset.
+- `nogcl + bmc` has the best cross-test profile in this matrix: digtime
+  `0.0136`, timing_ctrl `0.0101`, array `0.0110`.
+- Static SGRL is competitive but not clearly dominant over no-GCL under these
+  lightweight settings. This means downstream architecture and label loss need
+  to be compared carefully before claiming GCL benefit.
+- The current online-reuse path is still much worse than both static and no-GCL.
+  `GAI` does not improve it, and `BMC` slightly improves validation but hurts
+  cross-dataset tests. This supports separating the reuse problem from the
+  rebalancing problem for the next iteration.
+- Current next step: keep `nogcl/static + bmc` as the clean rebalancing anchor,
+  then improve reuse by changing the reuse architecture or optimization rather
+  than expecting label rebalancing alone to fix it.
