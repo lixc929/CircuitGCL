@@ -225,3 +225,93 @@ GPU0 was avoided. The full `gate` pilots used GPU3 for `init` and GPU1 for
   separate label-rebalancing track, because the advisor's feedback suggests it
   may be useful independently even if combined reuse plus rebalancing is not
   immediately additive.
+
+## 2026-07-09: Rebalancing Original-vs-Clean Audit
+
+### Goal
+
+Verify whether the suspected label-rebalancing implementation issues are real
+in the public repository code, without making a broad claim that the paper or
+advisor's internal code is wrong.
+
+### Setup
+
+Two implementations were compared:
+
+```text
+original: origin/master at f43f83c, temporary worktree /tmp/circuitgcl_origin_master_audit
+clean: current test branch at b5ef96b plus local audit script
+```
+
+The original worktree used a symlink to the existing `datasets/` directory. The
+original logs were copied into `logs/rebalancing_impl_audit_original_20260709/`
+for local traceability. Logs remain ignored by git.
+
+### Formula/Shape Audit
+
+Command:
+
+```bash
+/home/lixc/.conda/envs/RCG/bin/python scripts/audit_rebalancing_original_vs_clean.py \
+  --json_out logs/rebalancing_audit_20260709.json
+```
+
+Key findings:
+
+| Item | Original behavior | Clean behavior | Evidence |
+| --- | --- | --- | --- |
+| GAI labels | `edge_label` shape is `[175413, 2]`; flattening gives 350826 values, 43.43% greater than 1.0 | uses only continuous labels, all in `[0.003854, 0.990668]` | `logs/rebalancing_audit_20260709.json` |
+| GAI GMM | component means include exact class-id modes `1.0, 2.0, 3.0, 4.0` | component means stay in normalized label range `0.148347 ... 0.804206` | `logs/rebalancing_audit_20260709.json` |
+| BMC logits | legacy logits `[4, 1] -> [4]`, target shape `[4]`, target dtype `float32` | clean logits `[4, 4]`, target dtype `int64` | `logs/rebalancing_audit_20260709.json` |
+| LDS loss shape | legacy broadcast shape `[4, 4]`, toy loss `0.309275` | clean shape `[4, 1]`, toy loss `0.003775` | `logs/rebalancing_audit_20260709.json` |
+
+Interpretation: the GAI and LDS issues are concrete under the public
+`origin/master` code and current normalized labels. BMC does not crash in the
+current PyTorch environment, but it uses a non-standard one-dimensional
+cross-entropy path rather than Balanced MSE's `[N, N]` batch comparison.
+
+### Training-Level 1-Epoch Check
+
+Shared command settings:
+
+```text
+dataset: ssram+digtime+timing_ctrl+array_128_32_8t
+task: edge regression
+sgrl: 0
+epochs: 1
+batch_size: 512
+num_hops: 2
+num_neighbors: 8
+num_workers: 0
+gpu: 2
+seed: 42
+```
+
+| Impl | Loss | Log | Val MSE | digtime MSE | timing_ctrl MSE | array_128_32_8t MSE |
+| --- | --- | --- | --- | --- | --- | --- |
+| original | mse | `logs/rebalancing_impl_audit_original_20260709/20260709_183240_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` | 0.0140 | 0.0168 | 0.0173 | 0.0142 |
+| clean | mse | `logs/rebalancing_impl_audit_clean_20260709/20260709_183543_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` | 0.0140 | 0.0168 | 0.0173 | 0.0142 |
+| original | gai | `logs/rebalancing_impl_audit_original_20260709/20260709_183323_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossgai_batch512.txt` | 0.0143 | 0.0171 | 0.0175 | 0.0144 |
+| clean | gai | `logs/rebalancing_impl_audit_clean_20260709/20260709_183628_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossgai_batch512.txt` | 0.0138 | 0.0166 | 0.0169 | 0.0138 |
+| original | bmc | `logs/rebalancing_impl_audit_original_20260709/20260709_183413_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossbmc_batch512.txt` | 0.0157 | 0.0191 | 0.0181 | 0.0151 |
+| clean | bmc | `logs/rebalancing_impl_audit_clean_20260709/20260709_183719_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossbmc_batch512.txt` | 0.0128 | 0.0164 | 0.0171 | 0.0131 |
+| original | lds | `logs/rebalancing_impl_audit_original_20260709/20260709_183456_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_losslds_batch512.txt` | 0.0244 | 0.0248 | 0.0255 | 0.0243 |
+| clean | lds | `logs/rebalancing_impl_audit_clean_20260709/20260709_183809_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_losslds_batch512.txt` | 0.0169 | 0.0212 | 0.0169 | 0.0178 |
+
+### Interpretation Notes
+
+- The identical original/clean MSE run validates that the temporary worktree and
+  current branch are comparable under the same seed and training settings.
+- The GAI issue is real in `origin/master`: the original GMM sees class IDs as
+  label values. Clean GAI improves all 1-epoch validation/test MSEs in this
+  audit, but this is still too short to claim final performance.
+- The BMC issue is real as a formula mismatch. Clean BMC changes both loss scale
+  and behavior: original val loss is `2037.76995797`, clean val loss is
+  `0.01278353`, and clean BMC is best in this 1-epoch audit.
+- The LDS broadcasting issue is real. Clean LDS improves over original LDS, but
+  it remains worse than MSE/GAI/BMC in this short run.
+- Current conclusion: do not say the advisor's project is "wrong"; say the
+  public `origin/master` rebalancing code has implementation issues that affect
+  the current environment/data path. The current `test` branch contains the
+  clean regression fixes, and the next serious experiment should run 20-epoch
+  clean no-GCL rebalancing ablations.

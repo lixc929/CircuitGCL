@@ -116,9 +116,21 @@ Two observations:
 
 This matters because label rebalancing based only on the training distribution may overfit `ssram` and fail on shifted test designs.
 
-## 3. Current Label Rebalancing Implementation Issues
+## 3. Label Rebalancing Implementation Audit
 
-### 3.1 GAI Uses the Wrong Label Tensor
+Status after the 2026-07-09 audit:
+
+- The public `origin/master` implementation has concrete issues in regression
+  rebalancing when interpreted against the normalized two-column labels.
+- The current `test` branch already fixes the GAI, BMC, and LDS regression
+  issues through commit `1fcfe5c`.
+- The classification `BalancedSoftmax` mini-batch-count issue still remains a
+  candidate fix because we have not changed that path yet.
+- This should be reported as an implementation audit, not as a claim that the
+  paper results are invalid. The paper/internal experiment code may differ from
+  the public repository state.
+
+### 3.1 GAI Used the Wrong Label Tensor in `origin/master`
 
 `train_gmm(dataset)` currently uses:
 
@@ -133,15 +145,17 @@ After `dataset.norm_nfeat(...)`, `edge_label` has two columns:
 [continuous_label, discrete_class]
 ```
 
-So the current GMM is fitted on both continuous labels and discrete class IDs flattened together. This is likely incorrect. GAI should fit only:
+So the original public implementation fits the GMM on both continuous labels
+and discrete class IDs flattened together. This is likely incorrect. GAI should
+fit only:
 
 ```python
 dataset[0].edge_label[:, 0]
 ```
 
-This is a high-priority fix before judging whether GAI is effective.
+The current `test` branch now keeps only the first column before fitting GMM.
 
-### 3.2 LDS WeightedMSE Has a Broadcasting Risk
+### 3.2 LDS WeightedMSE Had a Broadcasting Risk in `origin/master`
 
 `WeightedMSE.forward(inputs, targets, weights)` expects aligned shapes. In `compute_loss`, LDS currently passes:
 
@@ -158,9 +172,9 @@ target = true[:, 0].view(-1, 1)
 weight = true[:, 1].view(-1, 1)
 ```
 
-This should be fixed before any LDS experiment.
+The current `test` branch reshapes target and weight tensors to `[N, 1]`.
 
-### 3.3 BMC Implementation Looks Incorrect
+### 3.3 BMC Implementation Looked Incorrect in `origin/master`
 
 `bmc_loss` currently creates:
 
@@ -179,7 +193,7 @@ labels = torch.arange(N, device=device).long()
 loss = F.cross_entropy(logits, labels)
 ```
 
-This should also be fixed before BMC experiments.
+The current `test` branch now uses `[N, N]` logits and integer target indices.
 
 ### 3.4 Balanced Softmax Uses Mini-batch Counts
 
@@ -424,7 +438,7 @@ The two can be tested separately and then combined.
 
 ## 6. Proposed Improvement Roadmap
 
-### Phase 0: Fix Existing Rebalancing Bugs
+### Phase 0: Fix and Audit Existing Rebalancing Bugs
 
 Before adding new methods:
 
@@ -433,7 +447,10 @@ Before adding new methods:
 3. Fix BMC batch logits.
 4. Change Balanced Softmax to use global class counts.
 
-This phase is necessary because current conclusions about rebalancing may be unreliable.
+Regression items 1-3 are already fixed on the current `test` branch and were
+audited against `origin/master` on 2026-07-09. Item 4 remains for the
+classification path. This phase is necessary because conclusions about
+rebalancing from the public `origin/master` implementation may be unreliable.
 
 ### Phase 1: Clean Baselines
 
@@ -582,4 +599,3 @@ to label-space balancing
 to representation-space balancing
 to shared-backbone transfer learning
 ```
-
