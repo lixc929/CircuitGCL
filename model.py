@@ -7,6 +7,7 @@ from torch_geometric.nn import (
     GINEConv, ClusterGCNConv
 )
 from torch_geometric.nn.models.mlp import MLP
+from torch_geometric.data import Data
 from sgrl_models import CustomConv
 
 NET = 0
@@ -158,14 +159,16 @@ class GraphHead(nn.Module):
         self.drop_out = args.dropout
     
 
-    def forward(self, batch):
+    def forward(self, batch, cl_x=None):
         ## Node type / Edge type encoding
         x = self.node_encoder(batch.node_type)
         xe = self.edge_encoder(batch.edge_type)
 
         ## Contrastive learning encoder
         if self.use_cl:
-            xcl = self.cl_linear(batch.x)
+            if cl_x is None:
+                cl_x = batch.x
+            xcl = self.cl_linear(cl_x)
             ## concatenate node embeddings and embeddings learned by SGRL
             x = torch.cat((x, xcl), dim=1)
 
@@ -240,9 +243,74 @@ class GraphHead(nn.Module):
             raise ValueError('Invalid task level')
             
         return pred,true_class,true_label
-        
-        
-    
+
+
+class OnlineFeatureGraphHead(nn.Module):
+    """Feed online SGRL features into the original downstream GraphHead.
+
+    This is the conservative S2 reuse path: the GCL online encoder is used as
+    a frozen/eval feature extractor per downstream batch, while the downstream
+    GNN layers and prediction head remain the original GraphHead.
+    """
+
+    def __init__(self, args):
+        super().__init__()
+        self.online_encoder = CustomConv(args)
+        self.graph_head = GraphHead(args)
+        self.online_encoder_frozen = False
+
+    def load_online_encoder_state(self, online_state_dict, freeze=True):
+        prefix = 'online_encoder.'
+        if any(key.startswith(prefix) for key in online_state_dict):
+            encoder_state = {
+                key[len(prefix):]: value
+                for key, value in online_state_dict.items()
+                if key.startswith(prefix)
+            }
+        else:
+            encoder_state = online_state_dict
+
+        load_msg = self.online_encoder.load_state_dict(encoder_state, strict=False)
+        print(
+            "Loaded SGRL online encoder for online feature reuse "
+            f"(missing={len(load_msg.missing_keys)}, "
+            f"unexpected={len(load_msg.unexpected_keys)}, freeze={freeze})."
+        )
+
+        if freeze:
+            self.freeze_online_encoder()
+
+    def freeze_online_encoder(self):
+        self.online_encoder_frozen = True
+        self.online_encoder.eval()
+        for param in self.online_encoder.parameters():
+            param.requires_grad = False
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.online_encoder_frozen:
+            self.online_encoder.eval()
+        return self
+
+    def _make_sgrl_batch(self, batch):
+        return Data(
+            x=batch.node_type.view(-1, 1),
+            edge_index=batch.edge_index,
+            num_nodes=batch.num_nodes,
+        )
+
+    def _online_features(self, batch):
+        sgrl_batch = self._make_sgrl_batch(batch)
+        if self.online_encoder_frozen:
+            with torch.no_grad():
+                return self.online_encoder.encode(sgrl_batch)
+        return self.online_encoder.encode(sgrl_batch)
+
+    def forward(self, batch):
+        cl_x = self._online_features(batch)
+        return self.graph_head(batch, cl_x=cl_x)
+
+
 class SgrlBackboneHead(nn.Module):
     """Downstream head that reuses the SGRL online encoder as its backbone."""
 

@@ -404,3 +404,80 @@ reuse_gate_init: --sgrl 1 --sgrl_mode init --sgrl_reuse_stats 1 --sgrl_reuse_sta
 - Current next step: keep `nogcl/static + bmc` as the clean rebalancing anchor,
   then improve reuse by changing the reuse architecture or optimization rather
   than expecting label rebalancing alone to fix it.
+
+## 2026-07-09: S2 Online Feature Reuse
+
+### Goal
+
+Implement and test the conservative shared-backbone step:
+
+```text
+pretrained frozen SGRL online encoder
+  -> online H_online per downstream batch
+  -> original downstream GraphHead
+  -> original downstream GNN layers and edge head
+```
+
+This differs from the previous replacement-style reuse path, which replaced the
+downstream GNN with `SgrlBackboneHead`.
+
+### Code Path
+
+- `--sgrl_mode online_feature` added in `main.py`.
+- `OnlineFeatureGraphHead` added in `model.py`.
+- `GraphHead.forward(..., cl_x=None)` now accepts external CL features while
+  preserving the static embedding path.
+- `downstream_train.py` builds `OnlineFeatureGraphHead` when
+  `args.use_sgrl_online_features` is enabled.
+
+### Command
+
+```bash
+OPENBLAS_NUM_THREADS=16 OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 NUMEXPR_NUM_THREADS=16 \
+/home/lixc/.conda/envs/RCG/bin/python main.py \
+  --dataset ssram+digtime+timing_ctrl+array_128_32_8t \
+  --task regression \
+  --task_level edge \
+  --regress_loss mse \
+  --batch_size 512 \
+  --epochs 20 \
+  --num_workers 0 \
+  --gpu 3 \
+  --sgrl 1 \
+  --sgrl_mode online_feature \
+  --cl_epochs 5 \
+  --cl_gnn_layers 2 \
+  --cl_hid_dim 64 \
+  --cl_batch_size 32768 \
+  --cl_num_neighbors 8 \
+  --num_hops 2 \
+  --num_neighbors 8 \
+  --log_dir logs/online_feature_dev_20260709
+```
+
+Log:
+
+```text
+logs/online_feature_dev_20260709/20260709_213202_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt
+```
+
+### Result
+
+| Mode | Loss | Best epoch | Val MSE | digtime MSE | timing_ctrl MSE | array MSE |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| static | mse | 17 | 0.0097 | 0.0151 | 0.0101 | 0.0111 |
+| nogcl | mse | 18 | 0.0096 | 0.0141 | 0.0099 | 0.0113 |
+| reuse_gate_init | mse | 18 | 0.0114 | 0.0177 | 0.0138 | 0.0183 |
+| online_feature_frozen | mse | 17 | 0.0096 | 0.0142 | 0.0101 | 0.0112 |
+
+### Interpretation Notes
+
+- S2 passes the development gate: it is close to both `static + MSE` and
+  `nogcl + MSE`, and much better than the replacement-style `reuse_gate_init`.
+- This supports the current interpretation that reuse should keep the
+  downstream `GraphHead` first, rather than immediately replacing it with the
+  SGRL encoder and an MLP head.
+- The result does not yet prove that GCL online reuse is better than no-GCL, but
+  it fixes the architecture-level failure from the first reuse attempt.
+- Next step: S3 online feature finetuning, with a conservative learning rate or
+  a separate optimizer group for the online encoder.

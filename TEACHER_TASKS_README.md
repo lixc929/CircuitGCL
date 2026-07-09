@@ -132,8 +132,8 @@ Use the current `test` branch for all implementation and experiment commits. Do 
 | --- | --- | --- | --- | --- |
 | S0. Definition and evidence | Done | Lock down what "reuse" means and collect paper support. | Use CircuitGCL, BYOL, BGRL, GraphCL, GNN pretraining references in `papers/README.md`. | N/A |
 | S1. Code-path diagnosis | Done | Explain why the first `SgrlBackboneHead` attempt is too aggressive. | Document that it replaces the downstream `GraphHead` instead of feeding online features into it. | Static GCL vs replacement-style reuse |
-| S2. Online feature reuse | Next | Use the pretrained online encoder online, but keep the original downstream GNN. | Add a mode where online encoder produces `H_online` per batch, then `GraphHead` still runs downstream message passing and prediction. Start with frozen/eval online encoder. | `static + MSE` vs `online_feature_frozen + MSE` |
-| S3. Online feature finetuning | Pending | Check whether supervised gradients should update the online encoder. | Add frozen/finetune switch; consider lower LR for online encoder. | `online_feature_frozen` vs `online_feature_finetune` |
+| S2. Online feature reuse | Done | Use the pretrained online encoder online, but keep the original downstream GNN. | Added `--sgrl_mode online_feature`; frozen/eval online encoder produces `H_online` per batch, then `GraphHead` still runs downstream message passing and prediction. | `static + MSE` vs `online_feature_frozen + MSE` |
+| S3. Online feature finetuning | Next | Check whether supervised gradients should update the online encoder. | Add frozen/finetune switch; consider lower LR for online encoder. | `online_feature_frozen` vs `online_feature_finetune` |
 | S4. Parameter initialization reuse | Pending | Reuse GCL online encoder weights to initialize compatible downstream layers. | Audit layer compatibility; copy only matching modules and log skipped keys. | `static + MSE` vs `init_reuse + MSE` |
 | S5. Partial shared backbone | Pending | Share early/lower GNN layers while keeping task-specific later layers/head. | Introduce a `SharedGNNBackbone` wrapper with separate GCL predictor and downstream head. | `init_reuse` vs `partial_shared` |
 | S6. Joint shared backbone | Pending | Train one online backbone with both GCL and supervised losses. | Optimize `L = L_supervised + lambda_gcl * L_gcl`; target encoder remains EMA/stop-gradient. | `partial_shared` vs `joint_shared` |
@@ -141,7 +141,7 @@ Use the current `test` branch for all implementation and experiment commits. Do 
 
 ### 4.3 First Implementation Target
 
-The immediate implementation should be S2:
+The S2 implementation target was:
 
 ```text
 Input sampled downstream graph
@@ -356,8 +356,8 @@ downstream_model/model_17-gai.pth
 
 Recommended order:
 
-1. Implement S2 online feature reuse: frozen/eval GCL online encoder feeding the original downstream `GraphHead`.
-2. Compare:
+1. Completed S2 online feature reuse: frozen/eval GCL online encoder feeding the original downstream `GraphHead`.
+2. Completed the S2 MSE comparison:
 
 ```text
 No GCL + MSE
@@ -366,8 +366,8 @@ Previous replacement-style reuse + MSE
 Online feature reuse + MSE
 ```
 
-3. If S2 is close to static GCL, add online encoder finetuning.
-4. If S2/S3 are stable, move to partial shared backbone.
+3. Next: add S3 online encoder finetuning with a conservative learning rate.
+4. If S3 is stable, move to partial shared backbone.
 5. Only after the reuse architecture is stable, compare:
 
 ```text

@@ -42,12 +42,14 @@ if __name__ == "__main__":
         '--sgrl_mode',
         type=str,
         default='static',
-        choices=['static', 'init', 'freeze'],
+        choices=['static', 'init', 'freeze', 'online_feature'],
         help=(
             "How to use SGRL downstream. "
             "'static' keeps the original cached embedding path; "
             "'init' initializes the downstream backbone from the online encoder; "
-            "'freeze' initializes and freezes the online encoder backbone."
+            "'freeze' initializes and freezes the online encoder backbone; "
+            "'online_feature' computes frozen online-encoder features per downstream batch "
+            "and feeds them into the original downstream GraphHead."
         ),
     )
     parser.add_argument(
@@ -112,12 +114,13 @@ if __name__ == "__main__":
     parser.add_argument('--log_dir', type=str, default='logs', help='The directory to save the log file.')
 
     args = parser.parse_args()
-    args.use_sgrl_embeds = int(args.sgrl == 1 and args.sgrl_mode == 'static')
-    args.use_sgrl_backbone = int(args.sgrl == 1 and args.sgrl_mode in ['init', 'freeze'])
-
     if args.sgrl == 0 and args.sgrl_mode != 'static':
         print(f"[Warning] --sgrl_mode {args.sgrl_mode} is ignored because --sgrl is 0.")
         args.sgrl_mode = 'static'
+
+    args.use_sgrl_embeds = int(args.sgrl == 1 and args.sgrl_mode == 'static')
+    args.use_sgrl_backbone = int(args.sgrl == 1 and args.sgrl_mode in ['init', 'freeze'])
+    args.use_sgrl_online_features = int(args.sgrl == 1 and args.sgrl_mode == 'online_feature')
 
     # Syncronize all random seeds
     random.seed(args.seed)

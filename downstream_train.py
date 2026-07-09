@@ -9,7 +9,7 @@ from sklearn.metrics import (
 import numpy as np
 import time
 from tqdm import tqdm
-from model import GraphHead, SgrlBackboneHead
+from model import GraphHead, OnlineFeatureGraphHead, SgrlBackboneHead
 from sampling import dataset_sampling
 from balanced_mse import GAILoss, BMCLoss, BNILoss, train_gmm, WeightedMSE, get_lds_weights, BalancedSoftmax, FocalLoss, compute_class_weights
 import os
@@ -382,6 +382,13 @@ def class_train(args, classifier,optimizer_classifier,
 
 
 def build_downstream_model(args, sgrl_online_state=None):
+    if getattr(args, 'use_sgrl_online_features', 0):
+        model = OnlineFeatureGraphHead(args)
+        if sgrl_online_state is None:
+            raise ValueError("SGRL online-feature mode requires an online encoder state_dict.")
+        model.load_online_encoder_state(sgrl_online_state, freeze=True)
+        return model
+
     if getattr(args, 'use_sgrl_backbone', 0):
         model = SgrlBackboneHead(args)
         if sgrl_online_state is None:
