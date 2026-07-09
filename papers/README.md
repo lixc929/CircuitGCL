@@ -10,6 +10,17 @@ PDF files are intentionally ignored by Git via `*.pdf`; this index is tracked.
 | `CircuitGCL_Transferable_Parasitic_Estimation_arXiv2507.06535.pdf` | https://arxiv.org/abs/2507.06535 | Formal CircuitGCL paper. |
 | `ICCAD2025_CircuitGCL_presentation.pdf` | Local advisor-provided slides | ICCAD presentation/slides copied from the repo root. |
 
+## Self-Supervised / Encoder Reuse References
+
+| Local file | Source | Notes |
+| --- | --- | --- |
+| `BYOL_Bootstrap_Your_Own_Latent_arXiv2006.07733.pdf` | https://arxiv.org/abs/2006.07733 | Core online/target self-supervised learning reference; downstream uses the learned online representation. |
+| `BGRL_Large_Scale_Representation_Learning_on_Graphs_arXiv2102.06514.pdf` | https://arxiv.org/abs/2102.06514 | Graph adaptation of BYOL-style online/target learning; useful for online encoder reuse in GNNs. |
+| `GraphCL_Graph_Contrastive_Learning_with_Augmentations_arXiv2010.13902.pdf` | https://arxiv.org/abs/2010.13902 | Graph contrastive pretraining baseline covering transfer and semi-supervised settings. |
+| `GNN_Pretraining_Strategies_arXiv1905.12265.pdf` | https://arxiv.org/abs/1905.12265 | General GNN pretraining and downstream fine-tuning reference; includes negative-transfer cautions. |
+| `SimSiam_Simple_Siamese_Representation_Learning_arXiv2011.10566.pdf` | https://arxiv.org/abs/2011.10566 | Non-contrastive Siamese reference showing the role of stop-gradient and predictor. |
+| `MoCo_Momentum_Contrast_arXiv1911.05722.pdf` | https://arxiv.org/abs/1911.05722 | Momentum/target encoder reference for transferable self-supervised representations. |
+
 ## Imbalanced Regression References
 
 | Local file | Source | Notes |
