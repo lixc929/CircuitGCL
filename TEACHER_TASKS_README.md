@@ -50,25 +50,26 @@ In other words, avoid using GCL only as a static embedding generator. Instead, r
 
 Possible implementation directions:
 
-1. **Pretrain then initialize**
+1. **Online feature reuse**
    - Pretrain the online encoder with GCL.
-   - Copy compatible weights into the downstream GNN encoder.
+   - Use it online to produce `H_online` for downstream batches.
+   - Keep the original downstream GNN and prediction head.
+
+2. **Online feature finetuning**
+   - Pretrain the online encoder.
+   - Feed its online features into the downstream GNN.
+   - Allow supervised gradients to finetune the online encoder with a conservative learning rate.
+
+3. **Pretrain then initialize**
+   - Pretrain the online encoder with GCL.
+   - Copy compatible weights into downstream GNN layers where architectures match.
    - Finetune downstream with supervised capacitance loss.
 
-2. **Pretrain then freeze**
-   - Pretrain the online encoder.
-   - Use it as a frozen feature extractor.
-   - Train only the downstream prediction head.
-
-3. **Pretrain then partially finetune**
-   - Freeze lower GNN layers first.
-   - Finetune later layers and the prediction head.
-
-4. **Joint/shared encoder**
+4. **Partial or joint shared encoder**
    - Use one encoder backbone for both GCL loss and downstream prediction.
    - During training, combine contrastive loss and supervised loss with a tunable weight.
 
-The first version should be conservative: implement pretrain -> initialize -> finetune, because it is easiest to compare against the current code and has the lowest engineering risk.
+The first version should be conservative: implement frozen online feature reuse while keeping the original downstream `GraphHead`. This directly tests the advisor's online-encoder/downstream-GNN reuse idea without immediately deleting downstream model capacity.
 
 ## 3. What Not To Misinterpret
 
@@ -82,7 +83,128 @@ The online/target split is useful during contrastive learning:
 
 For downstream prediction, only one encoder/backbone should be used. That encoder should preferably come from or share weights with the online encoder.
 
-## 4. Advisor's Second Task: Separate GCL and Label Rebalancing
+## 4. Shared Backbone Roadmap
+
+This is the concrete roadmap for gradually merging the GCL online GNN encoder and the downstream GNN backbone into one shared backbone.
+
+### 4.1 Final Target
+
+The final model should not merge the online encoder and target encoder. The target encoder remains a training-time teacher/stabilizer for the GCL objective.
+
+The final target is:
+
+```text
+Training:
+graph
+  -> shared online GNN backbone f_theta
+      -> predictor q_theta -> GCL alignment loss against target encoder f_phi
+      -> downstream head -> supervised capacitance loss
+
+target encoder f_phi:
+  -> EMA / stop-gradient teacher for GCL only
+
+Inference:
+graph
+  -> shared online GNN backbone f_theta
+  -> downstream head
+  -> prediction
+```
+
+So "reuse" means:
+
+```text
+GCL online GNN encoder + downstream GNN backbone
+  -> gradually become one shared GNN backbone
+```
+
+It does not mean:
+
+- Merging online and target encoders.
+- Removing the downstream GNN immediately.
+- Using only static GCL embeddings forever.
+- Expecting label rebalancing to fix a bad reuse architecture.
+
+### 4.2 Step-by-Step Plan
+
+Use the current `test` branch for all implementation and experiment commits. Do not push to the teacher upstream repository.
+
+| Step | Status | Goal | Implementation | Main comparison |
+| --- | --- | --- | --- | --- |
+| S0. Definition and evidence | Done | Lock down what "reuse" means and collect paper support. | Use CircuitGCL, BYOL, BGRL, GraphCL, GNN pretraining references in `papers/README.md`. | N/A |
+| S1. Code-path diagnosis | Done | Explain why the first `SgrlBackboneHead` attempt is too aggressive. | Document that it replaces the downstream `GraphHead` instead of feeding online features into it. | Static GCL vs replacement-style reuse |
+| S2. Online feature reuse | Next | Use the pretrained online encoder online, but keep the original downstream GNN. | Add a mode where online encoder produces `H_online` per batch, then `GraphHead` still runs downstream message passing and prediction. Start with frozen/eval online encoder. | `static + MSE` vs `online_feature_frozen + MSE` |
+| S3. Online feature finetuning | Pending | Check whether supervised gradients should update the online encoder. | Add frozen/finetune switch; consider lower LR for online encoder. | `online_feature_frozen` vs `online_feature_finetune` |
+| S4. Parameter initialization reuse | Pending | Reuse GCL online encoder weights to initialize compatible downstream layers. | Audit layer compatibility; copy only matching modules and log skipped keys. | `static + MSE` vs `init_reuse + MSE` |
+| S5. Partial shared backbone | Pending | Share early/lower GNN layers while keeping task-specific later layers/head. | Introduce a `SharedGNNBackbone` wrapper with separate GCL predictor and downstream head. | `init_reuse` vs `partial_shared` |
+| S6. Joint shared backbone | Pending | Train one online backbone with both GCL and supervised losses. | Optimize `L = L_supervised + lambda_gcl * L_gcl`; target encoder remains EMA/stop-gradient. | `partial_shared` vs `joint_shared` |
+| S7. Label rebalancing integration | Pending | Test whether rebalancing helps after reuse is architecturally correct. | Run MSE first, then GAI/BMC. Try warmup MSE -> rebalancing only if needed. | best reuse + `MSE/GAI/BMC` |
+
+### 4.3 First Implementation Target
+
+The immediate implementation should be S2:
+
+```text
+Input sampled downstream graph
+  -> pretrained GCL online encoder, eval/frozen
+  -> H_online
+  -> original downstream GraphHead feature path
+  -> original downstream GNN layers
+  -> original edge/node prediction head
+```
+
+This differs from the previous replacement-style reuse attempt:
+
+```text
+Input graph
+  -> SGRL encoder
+  -> edge MLP
+```
+
+The previous attempt is still useful as a negative control, but it should not be treated as the main shared-backbone method.
+
+### 4.4 Experiment Gate
+
+Each step must pass a small development gate before expanding experiments:
+
+1. Run on the lightweight development matrix:
+
+```text
+dataset: ssram+digtime+timing_ctrl+array_128_32_8t
+task: edge regression
+loss: MSE first
+epochs: 20
+gpu: non-zero GPU, usually GPU 3
+```
+
+2. Compare against:
+
+```text
+no GCL + MSE
+static GCL + MSE
+previous replacement-style reuse + MSE
+```
+
+3. Only expand to `GAI` and `BMC` if the reuse method is at least close to static GCL with MSE.
+
+4. Record every run in `EXPERIMENT_LOG.md`, including command, checkpoint/log path, best epoch, validation MSE, and per-testset MSE.
+
+### 4.5 Success Criteria
+
+The shared-backbone line is worth continuing if:
+
+- S2 frozen online feature reuse is close to or better than static GCL on MSE.
+- Finetuning does not destabilize validation/test transfer.
+- Partial/joint sharing improves at least one transfer testset without large regression on the others.
+- Rebalancing gains appear after the reuse path itself is stable.
+
+If S2 is much worse than static GCL, debug feature alignment first:
+
+- Whether the online encoder sees the same features/edge types as SGRL pretraining.
+- Whether dropout/eval mode matches static embedding extraction.
+- Whether sampled downstream subgraphs match the neighborhood assumptions of GCL embeddings.
+- Whether `H_online` should be detached, normalized, projected, or fused with node statistics before downstream GNN.
+
+## 5. Advisor's Second Task: Separate GCL and Label Rebalancing
 
 The advisor also noted that:
 
@@ -90,7 +212,7 @@ The advisor also noted that:
 
 So the work should be split into clear ablations.
 
-### 4.1 Label Rebalancing Only
+### 5.1 Label Rebalancing Only
 
 Disable SGRL/GCL and compare supervised losses:
 
@@ -107,7 +229,7 @@ Goal:
 - Identify which label rebalancing method is actually stable and useful.
 - Compare per-testset behavior, especially on `timing_ctrl`, `array_128_32_8t`, `ultra8t`, and `sandwich`.
 
-### 4.2 GCL Only
+### 5.2 GCL Only
 
 Use ordinary supervised loss after GCL:
 
@@ -126,7 +248,7 @@ Goal:
 - Check whether GCL itself improves transferability.
 - Determine whether static embedding concatenation is weaker than backbone reuse.
 
-### 4.3 GCL + Label Rebalancing
+### 5.3 GCL + Label Rebalancing
 
 After the separate effects are clear, test combinations:
 
@@ -142,7 +264,7 @@ Goal:
 - Understand why the combination may degrade.
 - Check whether the issue is caused by conflicting objectives, unstable tail weighting, overfitting rare labels, or embedding/backbone mismatch.
 
-## 5. Current Local Baseline Results
+## 6. Current Local Baseline Results
 
 The following 20-epoch runs have already been completed locally on GPU 3:
 
@@ -157,7 +279,7 @@ Batch size:
 128
 ```
 
-### 5.1 MSE Baseline
+### 6.1 MSE Baseline
 
 Command type:
 
@@ -193,7 +315,7 @@ Checkpoint:
 downstream_model/model_17-mse.pth
 ```
 
-### 5.2 GAI Baseline
+### 6.2 GAI Baseline
 
 Command type:
 
@@ -230,25 +352,31 @@ Checkpoint:
 downstream_model/model_17-gai.pth
 ```
 
-## 6. Immediate Next Steps
+## 7. Immediate Next Steps
 
 Recommended order:
 
-1. Run a clean ablation table for `--sgrl 0` with different rebalancing losses.
-2. Run current `--sgrl 1 --regress_loss mse` to measure the existing static-embedding GCL effect.
-3. Implement online-encoder-to-downstream-backbone reuse.
-4. Compare:
+1. Implement S2 online feature reuse: frozen/eval GCL online encoder feeding the original downstream `GraphHead`.
+2. Compare:
 
 ```text
 No GCL + MSE
-No GCL + GAI
 Static GCL embedding + MSE
-Static GCL embedding + GAI
-Backbone reuse GCL + MSE
-Backbone reuse GCL + GAI
+Previous replacement-style reuse + MSE
+Online feature reuse + MSE
 ```
 
-5. If GCL + rebalancing is worse than either alone, test:
+3. If S2 is close to static GCL, add online encoder finetuning.
+4. If S2/S3 are stable, move to partial shared backbone.
+5. Only after the reuse architecture is stable, compare:
+
+```text
+Best reuse + MSE
+Best reuse + GAI
+Best reuse + BMC
+```
+
+6. If GCL + rebalancing is worse than either alone, test:
 
 ```text
 freeze encoder vs finetune encoder
@@ -258,7 +386,7 @@ warmup with MSE, then switch to GAI/BMC
 loss weighting for joint GCL + supervised training
 ```
 
-## 7. Working Hypothesis
+## 8. Working Hypothesis
 
 The likely research story is:
 
