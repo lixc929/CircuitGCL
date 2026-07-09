@@ -147,3 +147,81 @@ batch_size: 512
 - Reasonable next reuse candidates: gated/residual fusion instead of raw concat,
   lower learning rate on reused encoder layers, or reuse only the early encoder
   initialization while preserving more of the original downstream `GraphHead`.
+
+## 2026-07-09: SGRL Gated Reuse Fusion Pilot
+
+### Goal
+
+Test whether a learned gate is better than raw concat when reusing the SGRL
+online encoder as the downstream backbone.
+
+### Code Delta
+
+Added two fusion choices for the reused SGRL backbone:
+
+```text
+--sgrl_reuse_stats_fusion gate
+--sgrl_reuse_stats_fusion residual_gate
+```
+
+`gate` learns an elementwise mix between reused SGRL features and
+circuit-statistics features. `residual_gate` keeps reused SGRL features as the
+base and adds a gated statistics residual.
+
+### Shared Settings
+
+```text
+dataset: ssram+digtime+timing_ctrl+array_128_32_8t
+task: edge regression
+loss: mse
+seed: 42
+cl_epochs: 5
+cl_gnn_layers: 2
+cl_hid_dim: 64
+cl_batch_size: 32768
+cl_num_neighbors: 8
+num_hops: 2
+num_neighbors: 8
+downstream epochs: 20
+batch_size: 512
+```
+
+GPU0 was avoided. The full `gate` pilots used GPU3 for `init` and GPU1 for
+`freeze`. `residual_gate` was only smoke-tested on GPU1.
+
+### Pilot Runs
+
+| Run | Mode | Status | Log | Best Epoch | Best Val MSE | Test MSEs |
+| --- | --- | --- | --- | --- | --- | --- |
+| reuse-gate-init-pilot | `--sgrl 1 --sgrl_mode init --sgrl_reuse_stats 1 --sgrl_reuse_stats_fusion gate` | done | `logs/reuse_gate_pilot_20260709/20260709_174655_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` | 18 | 0.0114 | digtime 0.0177; timing_ctrl 0.0138; array_128_32_8t 0.0184 |
+| reuse-gate-freeze-pilot | `--sgrl 1 --sgrl_mode freeze --sgrl_reuse_stats 1 --sgrl_reuse_stats_fusion gate` | done | `logs/reuse_gate_pilot_20260709/20260709_180109_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` | 19 | 0.0108 | digtime 0.0276; timing_ctrl 0.0151; array_128_32_8t 0.0207 |
+| reuse-residual-gate-smoke | `--sgrl 1 --sgrl_mode init --sgrl_reuse_stats 1 --sgrl_reuse_stats_fusion residual_gate --epochs 1` | smoke only | `logs/reuse_residual_gate_smoke_20260709/20260709_181121_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` | 0 | 0.0212 | digtime 0.0279; timing_ctrl 0.0408; array_128_32_8t 0.0237 |
+
+### Comparison
+
+| Variant | Best Val MSE | digtime MSE | timing_ctrl MSE | array_128_32_8t MSE |
+| --- | --- | --- | --- | --- |
+| no-GCL pilot | 0.0096 | 0.0141 | 0.0099 | 0.0113 |
+| static SGRL embedding pilot | 0.0096 | 0.0136 | 0.0103 | 0.0110 |
+| concat online init reuse pilot | 0.0106 | 0.0246 | 0.0168 | 0.0213 |
+| concat online freeze reuse pilot | 0.0105 | 0.0252 | 0.0180 | 0.0291 |
+| gate online init reuse pilot | 0.0114 | 0.0177 | 0.0138 | 0.0184 |
+| gate online freeze reuse pilot | 0.0108 | 0.0276 | 0.0151 | 0.0207 |
+
+### Interpretation Notes
+
+- `gate` improves the `init` test MSEs compared with raw concat, especially on
+  digtime (`0.0246 -> 0.0177`) and timing_ctrl (`0.0168 -> 0.0138`), but its
+  validation MSE is worse (`0.0106 -> 0.0114`).
+- `gate + freeze` reaches a reasonable validation MSE (`0.0108`), but its
+  cross-dataset tests are still much worse than no-GCL/static baselines.
+- None of the current reuse variants beats no-GCL or static SGRL embedding.
+  Fusion quality helps, but it is not the main bottleneck.
+- `residual_gate` passed a one-epoch runtime smoke test only, so it should not
+  be used as an accuracy conclusion yet.
+- Current next direction: keep this gated fusion available, but shift reuse
+  experiments toward alignment/regularization, such as a lower learning rate
+  for reused encoder layers or partial/early-layer reuse. In parallel, start a
+  separate label-rebalancing track, because the advisor's feedback suggests it
+  may be useful independently even if combined reuse plus rebalancing is not
+  immediately additive.

@@ -60,7 +60,7 @@ if __name__ == "__main__":
         '--sgrl_reuse_stats_fusion',
         type=str,
         default='concat',
-        choices=['concat', 'add', 'none'],
+        choices=['concat', 'add', 'gate', 'residual_gate', 'none'],
         help="How to fuse reused SGRL backbone features and circuit-statistics features.",
     )
     parser.add_argument('--e1_lr', type=float, default=1e-6, help='Learning rate for online encoder in SGRL.')

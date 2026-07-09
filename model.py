@@ -273,10 +273,15 @@ class SgrlBackboneHead(nn.Module):
             self.pin_attr_layers = nn.Embedding(17, self.stats_embed_dim)
             if self.stats_fusion == 'concat':
                 fused_dim = hidden_dim + self.stats_embed_dim
-            elif self.stats_fusion == 'add':
+            elif self.stats_fusion in ['add', 'gate', 'residual_gate']:
                 fused_dim = hidden_dim
             else:
                 raise ValueError(f'Unsupported SGRL stats fusion: {self.stats_fusion}')
+            if self.stats_fusion in ['gate', 'residual_gate']:
+                self.stats_gate = nn.Sequential(
+                    nn.Linear(hidden_dim + self.stats_embed_dim, hidden_dim),
+                    nn.Sigmoid(),
+                )
             print(
                 "Using circuit-statistics adapter for SGRL backbone reuse "
                 f"(fusion={self.stats_fusion})."
@@ -375,6 +380,12 @@ class SgrlBackboneHead(nn.Module):
             return torch.cat((x, stats_x), dim=1)
         if self.stats_fusion == 'add':
             return x + stats_x
+        if self.stats_fusion == 'gate':
+            gate = self.stats_gate(torch.cat((x, stats_x), dim=1))
+            return gate * x + (1.0 - gate) * stats_x
+        if self.stats_fusion == 'residual_gate':
+            gate = self.stats_gate(torch.cat((x, stats_x), dim=1))
+            return x + gate * stats_x
         raise ValueError(f'Unsupported SGRL stats fusion: {self.stats_fusion}')
 
     def forward(self, batch):
