@@ -9,7 +9,12 @@ from sklearn.metrics import (
 import numpy as np
 import time
 from tqdm import tqdm
-from model import GraphHead, OnlineFeatureGraphHead, SgrlBackboneHead
+from model import (
+    GraphHead,
+    OnlineFeatureGraphHead,
+    PartialSharedGraphHead,
+    SgrlBackboneHead,
+)
 from sampling import dataset_sampling
 from balanced_mse import GAILoss, BMCLoss, BNILoss, train_gmm, WeightedMSE, get_lds_weights, BalancedSoftmax, FocalLoss, compute_class_weights
 import os
@@ -382,6 +387,13 @@ def class_train(args, classifier,optimizer_classifier,
 
 
 def build_downstream_model(args, sgrl_online_state=None):
+    if getattr(args, 'use_sgrl_partial_shared', 0):
+        model = PartialSharedGraphHead(args)
+        if sgrl_online_state is None:
+            raise ValueError("SGRL partial-shared mode requires an online encoder state_dict.")
+        model.load_online_encoder_state(sgrl_online_state)
+        return model
+
     if getattr(args, 'use_sgrl_graph_init', 0):
         model = GraphHead(args)
         if sgrl_online_state is None:

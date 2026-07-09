@@ -30,6 +30,30 @@ def shape_str(tensor):
     return 'x'.join(str(dim) for dim in tensor.shape)
 
 
+def build_gnn_layer(model_name, in_dim, out_dim, edge_dim, activation='relu'):
+    if model_name == 'clustergcn':
+        return ClusterGCNConv(in_dim, out_dim)
+    if model_name == 'gcn':
+        return GCNConv(in_dim, out_dim)
+    if model_name == 'sage':
+        return SAGEConv(in_dim, out_dim)
+    if model_name == 'gat':
+        return GATConv(in_dim, out_dim, heads=1)
+    if model_name == 'resgatedgcn':
+        return ResGatedGraphConv(in_dim, out_dim, edge_dim=edge_dim)
+    if model_name == 'gine':
+        mlp = MLP(
+            in_channels=in_dim,
+            hidden_channels=out_dim,
+            out_channels=out_dim,
+            num_layers=2,
+            norm=None,
+            activation=activation,
+        )
+        return GINEConv(mlp, train_eps=True, edge_dim=edge_dim)
+    raise ValueError(f'Unsupported GNN model: {model_name}')
+
+
 class GraphHead(nn.Module):
     """ GNN head for graph-level prediction.
 
@@ -429,6 +453,359 @@ class OnlineFeatureGraphHead(nn.Module):
     def forward(self, batch):
         cl_x = self._online_features(batch)
         return self.graph_head(batch, cl_x=cl_x)
+
+
+class SharedGNNBackbone(nn.Module):
+    """Lower SGRL online encoder layers reused as a shared downstream backbone."""
+
+    def __init__(self, args):
+        super().__init__()
+        self.hidden_dim = args.cl_hid_dim
+        self.shared_layers = args.shared_gnn_layers
+        self.model = args.cl_model
+
+        if self.shared_layers < 0:
+            raise ValueError("--shared_gnn_layers must be non-negative.")
+        if self.shared_layers > args.cl_gnn_layers:
+            raise ValueError(
+                "--shared_gnn_layers cannot exceed --cl_gnn_layers "
+                f"({self.shared_layers} > {args.cl_gnn_layers})."
+            )
+
+        self.node_type_embed = nn.Embedding(6, self.hidden_dim)
+        self.edge_type_embed = nn.Embedding(8, self.hidden_dim)
+        self.layers = nn.ModuleList([
+            build_gnn_layer(
+                args.cl_model,
+                self.hidden_dim,
+                self.hidden_dim,
+                self.hidden_dim,
+                activation=args.cl_act_fn,
+            )
+            for _ in range(self.shared_layers)
+        ])
+
+        self.use_bn = args.use_bn
+        self.bn_node_x = nn.BatchNorm1d(self.hidden_dim)
+        if args.cl_act_fn == 'relu':
+            self.activation = nn.ReLU()
+        elif args.cl_act_fn == 'elu':
+            self.activation = nn.ELU()
+        elif args.cl_act_fn == 'tanh':
+            self.activation = nn.Tanh()
+        elif args.cl_act_fn == 'leakyrelu':
+            self.activation = nn.LeakyReLU()
+        elif args.cl_act_fn == 'prelu':
+            self.activation = nn.PReLU()
+        else:
+            raise ValueError('Invalid activation')
+        self.drop_out = args.cl_dropout
+
+    def load_online_encoder_state(self, online_state_dict):
+        encoder_state = extract_sgrl_encoder_state(online_state_dict)
+        target_state = self.state_dict()
+        copied = []
+        skipped = []
+
+        def copy_tensor(source_key, target_key=None):
+            target_key = target_key or source_key
+            if source_key not in encoder_state:
+                skipped.append((source_key, target_key, 'missing source'))
+                return
+            if target_key not in target_state:
+                skipped.append((source_key, target_key, 'missing target'))
+                return
+
+            source_tensor = encoder_state[source_key]
+            target_tensor = target_state[target_key]
+            if tuple(source_tensor.shape) != tuple(target_tensor.shape):
+                skipped.append((
+                    source_key,
+                    target_key,
+                    f'shape {shape_str(source_tensor)} -> {shape_str(target_tensor)}',
+                ))
+                return
+
+            with torch.no_grad():
+                target_tensor.copy_(
+                    source_tensor.to(
+                        device=target_tensor.device,
+                        dtype=target_tensor.dtype,
+                    )
+                )
+            copied.append((source_key, target_key, target_tensor.numel()))
+
+        copy_tensor('node_type_embed.weight')
+        copy_tensor('edge_type_embed.weight')
+
+        for layer_idx in range(self.shared_layers):
+            source_prefix = f'layers.{layer_idx}.'
+            for source_key in sorted(encoder_state):
+                if source_key.startswith(source_prefix):
+                    copy_tensor(source_key)
+
+        for source_key in [
+            'bn_node_x.weight',
+            'bn_node_x.bias',
+            'bn_node_x.running_mean',
+            'bn_node_x.running_var',
+            'bn_node_x.num_batches_tracked',
+            'activation.weight',
+        ]:
+            copy_tensor(source_key)
+
+        print(
+            "Partial shared backbone load summary: "
+            f"shared_layers={self.shared_layers}, "
+            f"copied_tensors={len(copied)}, "
+            f"copied_values={sum(item[2] for item in copied)}, "
+            f"skipped={len(skipped)}."
+        )
+        if copied:
+            preview = '; '.join(
+                f"{src}->{dst}" for src, dst, _ in copied[:8]
+            )
+            print(f"Partial shared copied preview: {preview}")
+        if skipped:
+            preview = '; '.join(
+                f"{src}->{dst}({reason})" for src, dst, reason in skipped[:8]
+            )
+            print(f"Partial shared skipped preview: {preview}")
+
+    def forward(self, batch):
+        node_type = batch.node_type.view(-1).long()
+        x = self.node_type_embed(node_type)
+
+        edge_attr = None
+        if hasattr(batch, 'edge_type'):
+            edge_type = batch.edge_type.view(-1).long()
+            edge_attr = self.edge_type_embed(edge_type)
+
+        for conv in self.layers:
+            if self.model == 'gine' or self.model == 'resgatedgcn':
+                x = conv(x, batch.edge_index, edge_attr=edge_attr)
+            else:
+                x = conv(x, batch.edge_index)
+
+            if self.use_bn:
+                x = self.bn_node_x(x)
+
+            x = self.activation(x)
+
+            if self.drop_out > 0.0:
+                x = F.dropout(x, p=self.drop_out, training=self.training)
+
+        return x
+
+
+class PartialSharedGraphHead(nn.Module):
+    """Share lower SGRL online GNN layers and keep a downstream tail/head."""
+
+    def __init__(self, args):
+        super().__init__()
+        if args.shared_gnn_layers > args.num_gnn_layers:
+            raise ValueError(
+                "--shared_gnn_layers cannot exceed --num_gnn_layers "
+                f"({args.shared_gnn_layers} > {args.num_gnn_layers})."
+            )
+
+        self.shared_backbone = SharedGNNBackbone(args)
+        self.shared_dim = args.cl_hid_dim
+        self.hidden_dim = args.hid_dim
+        self.task = args.task
+        self.task_level = args.task_level
+        self.net_only = args.net_only
+        self.num_classes = args.num_classes
+        self.class_boundaries = args.class_boundaries
+        self.src_dst_agg = args.src_dst_agg
+        self.model = args.model
+        self.use_stats = bool(
+            args.use_stats and args.partial_shared_stats_fusion != 'none'
+        )
+        self.stats_fusion = (
+            args.partial_shared_stats_fusion if self.use_stats else 'none'
+        )
+
+        stats_embed_dim = self.shared_dim
+        fused_dim = self.shared_dim
+        if self.use_stats:
+            self.net_attr_layers = nn.Linear(17, stats_embed_dim, bias=True)
+            self.dev_attr_layers = nn.Linear(17, stats_embed_dim, bias=True)
+            self.pin_attr_layers = nn.Embedding(17, stats_embed_dim)
+            if self.stats_fusion == 'concat':
+                fused_dim = self.shared_dim + stats_embed_dim
+            elif self.stats_fusion in ['add', 'gate', 'residual_gate']:
+                fused_dim = self.shared_dim
+            else:
+                raise ValueError(
+                    f'Unsupported partial-shared stats fusion: {self.stats_fusion}'
+                )
+            if self.stats_fusion in ['gate', 'residual_gate']:
+                self.stats_gate = nn.Sequential(
+                    nn.Linear(self.shared_dim + stats_embed_dim, self.shared_dim),
+                    nn.Sigmoid(),
+                )
+            print(
+                "Using circuit-statistics adapter after partial shared backbone "
+                f"(fusion={self.stats_fusion})."
+            )
+
+        self.edge_encoder = nn.Embedding(num_embeddings=4, embedding_dim=self.hidden_dim)
+        self.tail_layers = nn.ModuleList()
+        tail_layers = args.num_gnn_layers - args.shared_gnn_layers
+        current_dim = fused_dim
+        for _ in range(tail_layers):
+            self.tail_layers.append(
+                build_gnn_layer(
+                    args.model,
+                    current_dim,
+                    self.hidden_dim,
+                    self.hidden_dim,
+                    activation=args.act_fn,
+                )
+            )
+            current_dim = self.hidden_dim
+
+        self.representation_dim = current_dim
+
+        if args.src_dst_agg == 'pooladd':
+            self.pooling_fun = pygnn.pool.global_add_pool
+        elif args.src_dst_agg == 'poolmean':
+            self.pooling_fun = pygnn.pool.global_mean_pool
+
+        head_input_dim = (
+            self.representation_dim * 2
+            if self.src_dst_agg == 'concat' and self.task_level == 'edge'
+            else self.representation_dim
+        )
+
+        if self.task == 'regression':
+            dim_out = 1
+        elif self.task == 'classification':
+            dim_out = args.num_classes
+        else:
+            raise ValueError('Invalid task')
+
+        self.head_layers = MLP(
+            in_channels=head_input_dim,
+            hidden_channels=self.hidden_dim,
+            out_channels=dim_out,
+            num_layers=args.num_head_layers,
+            use_bn=False,
+            dropout=0.0,
+            activation=args.act_fn,
+        )
+
+        self.use_bn = args.use_bn
+        self.tail_bn_node_x = nn.BatchNorm1d(self.hidden_dim)
+        if args.act_fn == 'relu':
+            self.activation = nn.ReLU()
+        elif args.act_fn == 'elu':
+            self.activation = nn.ELU()
+        elif args.act_fn == 'tanh':
+            self.activation = nn.Tanh()
+        elif args.act_fn == 'leakyrelu':
+            self.activation = nn.LeakyReLU()
+        elif args.act_fn == 'prelu':
+            self.activation = nn.PReLU()
+        else:
+            raise ValueError('Invalid activation')
+
+        self.drop_out = args.dropout
+
+    def load_online_encoder_state(self, online_state_dict):
+        self.shared_backbone.load_online_encoder_state(online_state_dict)
+
+    def _encode_stats(self, batch):
+        node_type = batch.node_type.view(-1)
+        net_node_mask = node_type == NET
+        dev_node_mask = node_type == DEV
+        pin_node_mask = node_type == PIN
+        node_attr_emb = torch.zeros(
+            (batch.num_nodes, self.shared_dim), device=batch.node_attr.device
+        )
+        node_attr_emb[net_node_mask] = \
+            self.net_attr_layers(batch.node_attr[net_node_mask])
+        node_attr_emb[dev_node_mask] = \
+            self.dev_attr_layers(batch.node_attr[dev_node_mask])
+        node_attr_emb[pin_node_mask] = \
+            self.pin_attr_layers(batch.node_attr[pin_node_mask, 0].long())
+        return node_attr_emb
+
+    def _fuse_stats(self, x, batch):
+        if not self.use_stats:
+            return x
+
+        stats_x = self._encode_stats(batch)
+        if self.stats_fusion == 'concat':
+            return torch.cat((x, stats_x), dim=1)
+        if self.stats_fusion == 'add':
+            return x + stats_x
+        if self.stats_fusion == 'gate':
+            gate = self.stats_gate(torch.cat((x, stats_x), dim=1))
+            return gate * x + (1.0 - gate) * stats_x
+        if self.stats_fusion == 'residual_gate':
+            gate = self.stats_gate(torch.cat((x, stats_x), dim=1))
+            return x + gate * stats_x
+        raise ValueError(f'Unsupported partial-shared stats fusion: {self.stats_fusion}')
+
+    def _run_tail(self, x, batch):
+        if len(self.tail_layers) == 0:
+            return x
+
+        edge_attr = self.edge_encoder(batch.edge_type.view(-1).long())
+        for conv in self.tail_layers:
+            if self.model == 'gine' or self.model == 'resgatedgcn':
+                x = conv(x, batch.edge_index, edge_attr=edge_attr)
+            else:
+                x = conv(x, batch.edge_index)
+
+            if self.use_bn:
+                x = self.tail_bn_node_x(x)
+
+            x = self.activation(x)
+
+            if self.drop_out > 0.0:
+                x = F.dropout(x, p=self.drop_out, training=self.training)
+
+        return x
+
+    def forward(self, batch):
+        x = self.shared_backbone(batch)
+        x = self._fuse_stats(x, batch)
+        x = self._run_tail(x, batch)
+
+        if self.task_level == 'node':
+            if self.net_only:
+                net_node_mask = batch.node_type.view(-1) == NET
+                pred = self.head_layers(x[net_node_mask])
+                true_class = batch.y[:, 1][net_node_mask].long()
+                true_label = batch.y[net_node_mask]
+            else:
+                pred = self.head_layers(x)
+                true_class = batch.y[:, 1].long()
+                true_label = batch.y
+
+        elif self.task_level == 'edge':
+            if self.src_dst_agg[:4] == 'pool':
+                graph_emb = self.pooling_fun(x, batch.batch)
+            else:
+                batch_size = batch.edge_label.size(0)
+                src_emb = x[:batch_size, :]
+                dst_emb = x[batch_size:batch_size * 2, :]
+                if self.src_dst_agg == 'concat':
+                    graph_emb = torch.cat((src_emb, dst_emb), dim=1)
+                else:
+                    graph_emb = src_emb + dst_emb
+
+            pred = self.head_layers(graph_emb)
+            true_class = batch.edge_label[:, 1].long()
+            true_label = batch.edge_label
+
+        else:
+            raise ValueError('Invalid task level')
+
+        return pred, true_class, true_label
 
 
 class SgrlBackboneHead(nn.Module):

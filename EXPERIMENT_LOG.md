@@ -724,3 +724,211 @@ SGRL GraphHead init reuse summary: copied_tensors=12, copied_values=17025, skipp
 - Next direction: move to S5 partial shared backbone. S5 should try to keep the
   compactness benefit of `init_reuse` while preserving the stronger digtime and
   array transfer behavior of static GCL.
+
+## 2026-07-09: S5 Partial Shared Backbone Design
+
+### Goal
+
+Move from one-time initialization reuse to a real shared-backbone architecture:
+
+```text
+pretrain SGRL online encoder
+  -> reuse node/edge encoder + lower online GNN layers as shared backbone
+  -> keep a downstream-specific tail GNN and prediction head
+  -> train supervised downstream task with MSE first
+```
+
+This is the first S5 step toward merging the GCL online GNN encoder and the
+downstream GNN backbone into one smaller structure. It is deliberately not yet
+joint contrastive/supervised training; the immediate question is whether a
+partly shared backbone is a better reuse unit than S4's one-time parameter
+initialization.
+
+### Architecture
+
+```text
+batch graph
+  -> SharedGNNBackbone
+       node/edge type embedding from SGRL online encoder
+       first k SGRL online GNN layers
+  -> optional circuit-statistics fusion
+  -> downstream tail GNN layers
+  -> downstream edge/node prediction head
+```
+
+Implemented mode:
+
+```text
+--sgrl_mode partial_shared
+--shared_gnn_layers 1
+```
+
+Code path:
+
+- `main.py`
+  - Added `partial_shared` to `--sgrl_mode`.
+  - Added `--shared_gnn_layers`.
+  - Added `--partial_shared_stats_fusion`.
+- `model.py`
+  - Added `SharedGNNBackbone`.
+  - Added `PartialSharedGraphHead`.
+  - Shared lower layers are loaded from the SGRL online encoder checkpoint.
+  - Downstream tail/head remains task-specific and trainable.
+- `downstream_train.py`
+  - Added `PartialSharedGraphHead` to `build_downstream_model`.
+
+### First Experiment Plan
+
+First run only MSE. Rebalancing losses should wait until the shared-backbone
+architecture is validated.
+
+| Mode | Loss | Purpose |
+| --- | --- | --- |
+| compact no-GCL | mse | Lower compact baseline |
+| compact static | mse | Original static GCL baseline |
+| init_reuse | mse | S4 one-time initialization reuse |
+| partial_shared_k1 | mse | S5 conservative shared lower layer |
+| partial_shared_k2 | mse | S5 more aggressive sharing |
+
+The first S5 command should be:
+
+```bash
+/home/lixc/.conda/envs/RCG/bin/python main.py \
+  --dataset ssram+digtime+timing_ctrl+array_128_32_8t \
+  --task regression \
+  --task_level edge \
+  --regress_loss mse \
+  --batch_size 512 \
+  --epochs 20 \
+  --num_workers 0 \
+  --gpu 3 \
+  --sgrl 1 \
+  --sgrl_mode partial_shared \
+  --shared_gnn_layers 1 \
+  --partial_shared_stats_fusion add \
+  --model clustergcn \
+  --hid_dim 64 \
+  --num_gnn_layers 2 \
+  --cl_model clustergcn \
+  --cl_epochs 5 \
+  --cl_gnn_layers 2 \
+  --cl_hid_dim 64 \
+  --cl_batch_size 32768 \
+  --cl_num_neighbors 8 \
+  --num_hops 2 \
+  --num_neighbors 8 \
+  --log_dir logs/partial_shared_k1_mse_gpu_20260709
+```
+
+Expected decision rule:
+
+- If `partial_shared_k1` matches or improves on `init_reuse`, S5 is a stronger
+  reuse direction than S4.
+- If `partial_shared_k2` degrades, downstream still needs a task-specific tail.
+- If both degrade, the shared lower-layer design should be revised before
+  adding GAI/BMC.
+
+### First GPU Result
+
+Smoke run:
+
+```bash
+/home/lixc/.conda/envs/RCG/bin/python main.py \
+  --dataset ssram+digtime+timing_ctrl+array_128_32_8t \
+  --task regression \
+  --task_level edge \
+  --regress_loss mse \
+  --batch_size 512 \
+  --epochs 1 \
+  --num_workers 0 \
+  --gpu 3 \
+  --sgrl 1 \
+  --sgrl_mode partial_shared \
+  --shared_gnn_layers 1 \
+  --partial_shared_stats_fusion add \
+  --model clustergcn \
+  --hid_dim 64 \
+  --num_gnn_layers 2 \
+  --cl_model clustergcn \
+  --cl_epochs 5 \
+  --cl_gnn_layers 2 \
+  --cl_hid_dim 64 \
+  --cl_batch_size 32768 \
+  --cl_num_neighbors 8 \
+  --num_hops 2 \
+  --num_neighbors 8 \
+  --log_dir logs/partial_shared_k1_smoke_gpu_20260709
+```
+
+The smoke run completed one epoch on GPU3 and verified that checkpoint loading,
+shared-layer copying, forward/backward, validation, and three test loaders all
+work.
+
+Formal 20-epoch run:
+
+```bash
+/home/lixc/.conda/envs/RCG/bin/python main.py \
+  --dataset ssram+digtime+timing_ctrl+array_128_32_8t \
+  --task regression \
+  --task_level edge \
+  --regress_loss mse \
+  --batch_size 512 \
+  --epochs 20 \
+  --num_workers 0 \
+  --gpu 3 \
+  --sgrl 1 \
+  --sgrl_mode partial_shared \
+  --shared_gnn_layers 1 \
+  --partial_shared_stats_fusion add \
+  --model clustergcn \
+  --hid_dim 64 \
+  --num_gnn_layers 2 \
+  --cl_model clustergcn \
+  --cl_epochs 5 \
+  --cl_gnn_layers 2 \
+  --cl_hid_dim 64 \
+  --cl_batch_size 32768 \
+  --cl_num_neighbors 8 \
+  --num_hops 2 \
+  --num_neighbors 8 \
+  --log_dir logs/partial_shared_k1_mse_gpu_20260709
+```
+
+Successful formal log:
+
+```text
+logs/partial_shared_k1_mse_gpu_20260709/20260709_230332_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt
+```
+
+The log reports:
+
+```text
+Partial shared backbone load summary: shared_layers=1, copied_tensors=10, copied_values=9409, skipped=1.
+Model parameters: total=29,762, trainable=29,762, frozen=0.
+```
+
+| Mode | Loss | Params | Best epoch | Val MSE | digtime MSE | timing_ctrl MSE | array MSE | Log |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| compact no-GCL | mse | 27,170 | 16 | 0.0101 | 0.0145 | 0.0124 | 0.0113 | `logs/compact_clustergcn_baseline_gpu_20260709/20260709_221835_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| compact static | mse | 27,134 | 17 | 0.0100 | 0.0137 | 0.0117 | 0.0115 | `logs/static_mse_compact_gpu_20260709/20260709_223724_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| init_reuse | mse | 27,170 | 19 | 0.0097 | 0.0141 | 0.0112 | 0.0121 | `logs/init_reuse_dev_gpu_20260709/20260709_220924_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_add | mse | 29,762 | 19 | 0.0104 | 0.0180 | 0.0123 | 0.0130 | `logs/partial_shared_k1_mse_gpu_20260709/20260709_230332_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+
+### Interpretation Notes
+
+- The S5-k1 implementation is functional: it loads the SGRL online lower layer,
+  trains normally, and steadily reduces validation MSE from 0.0133 to 0.0104.
+- This first `partial_shared_k1 + add` version does not beat S4 `init_reuse`
+  and does not beat compact static/no-GCL on validation MSE.
+- The main weakness is cross-dataset transfer: digtime and array are worse than
+  all three compact baselines, even though timing_ctrl is close to no-GCL.
+- The parameter count is also larger than the compact baselines because this
+  version keeps one shared layer plus one downstream tail layer and a stats
+  adapter. It is therefore not yet the simpler final architecture the teacher
+  likely wants.
+- Next S5 direction should test a more compact sharing variant before moving to
+  label rebalancing:
+  - `partial_shared_k2` with no downstream tail GNN.
+  - `partial_shared_k1` with `gate` or `residual_gate` stats fusion.
+  - optionally freeze the shared lower layer for the first few epochs if the
+    downstream loss is overwriting the pretrained GCL representation too fast.

@@ -49,6 +49,7 @@ if __name__ == "__main__":
             'online_feature',
             'online_feature_finetune',
             'init_reuse',
+            'partial_shared',
         ],
         help=(
             "How to use SGRL downstream. "
@@ -60,8 +61,23 @@ if __name__ == "__main__":
             "'online_feature_finetune' also allows supervised gradients to update "
             "the online encoder; "
             "'init_reuse' initializes compatible original GraphHead parameters from "
-            "the online encoder and then trains a single downstream GraphHead."
+            "the online encoder and then trains a single downstream GraphHead; "
+            "'partial_shared' reuses the online encoder's lower GNN layers as a "
+            "shared downstream backbone and keeps task-specific downstream tail/head."
         ),
+    )
+    parser.add_argument(
+        '--shared_gnn_layers',
+        type=int,
+        default=1,
+        help='Number of lower SGRL online GNN layers to share in partial_shared mode.',
+    )
+    parser.add_argument(
+        '--partial_shared_stats_fusion',
+        type=str,
+        default='add',
+        choices=['add', 'gate', 'residual_gate', 'concat', 'none'],
+        help='How to fuse circuit statistics after the shared lower GNN backbone.',
     )
     parser.add_argument(
         '--sgrl_reuse_stats',
@@ -138,6 +154,7 @@ if __name__ == "__main__":
     args.use_sgrl_embeds = int(args.sgrl == 1 and args.sgrl_mode == 'static')
     args.use_sgrl_backbone = int(args.sgrl == 1 and args.sgrl_mode in ['init', 'freeze'])
     args.use_sgrl_graph_init = int(args.sgrl == 1 and args.sgrl_mode == 'init_reuse')
+    args.use_sgrl_partial_shared = int(args.sgrl == 1 and args.sgrl_mode == 'partial_shared')
     args.use_sgrl_online_features = int(
         args.sgrl == 1
         and args.sgrl_mode in ['online_feature', 'online_feature_finetune']
