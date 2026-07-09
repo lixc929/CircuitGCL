@@ -72,3 +72,78 @@ reuse-init-pilot: best epoch 19, val loss 0.01321202
 - Direct online-backbone reuse underperforms both static SGRL and no-GCL, especially on timing_ctrl.
 - The first suspect is implementation mismatch rather than proof that reuse is bad: `SgrlBackboneHead` currently reuses the online encoder but does not yet include the downstream circuit-statistics adapter used by the original edge model.
 - Next reuse experiment should add a hybrid head: online encoder backbone plus downstream circuit-statistics adapter, then compare `init` and `freeze` under the same settings.
+
+## 2026-07-09: SGRL Hybrid Reuse Adapter Pilot
+
+### Goal
+
+Test the next reuse variant: reuse the SGRL online encoder as the downstream
+backbone, but restore the downstream circuit-statistics adapter before the edge
+head.
+
+### Code Delta
+
+Added two downstream reuse switches:
+
+```text
+--sgrl_reuse_stats 1
+--sgrl_reuse_stats_fusion concat
+```
+
+When `--sgrl_mode init` or `--sgrl_mode freeze` is active, the reused SGRL node
+features are concatenated with node-type/statistics features before the edge
+head. This keeps the teacher-suggested online/downstream reuse path, while
+avoiding the previous pilot's pure-GCL-embedding bottleneck.
+
+### Shared Settings
+
+```text
+dataset: ssram+digtime+timing_ctrl+array_128_32_8t
+task: edge regression
+loss: mse
+gpu: 4
+seed: 42
+cl_epochs: 5
+cl_gnn_layers: 2
+cl_hid_dim: 64
+cl_batch_size: 32768
+cl_num_neighbors: 8
+num_hops: 2
+num_neighbors: 8
+downstream epochs: 20
+batch_size: 512
+```
+
+### Pilot Runs
+
+| Run | Mode | Status | Log | Best Epoch | Best Val MSE | Test MSEs |
+| --- | --- | --- | --- | --- | --- | --- |
+| reuse-hybrid-init-pilot | `--sgrl 1 --sgrl_mode init --sgrl_reuse_stats 1 --sgrl_reuse_stats_fusion concat` | done | `logs/reuse_hybrid_pilot_20260709/20260709_170216_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` | 18 | 0.0106 | digtime 0.0246; timing_ctrl 0.0168; array_128_32_8t 0.0213 |
+| reuse-hybrid-freeze-pilot | `--sgrl 1 --sgrl_mode freeze --sgrl_reuse_stats 1 --sgrl_reuse_stats_fusion concat` | done | `logs/reuse_hybrid_pilot_20260709/20260709_172140_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` | 18 | 0.0105 | digtime 0.0252; timing_ctrl 0.0180; array_128_32_8t 0.0291 |
+
+### Comparison
+
+| Variant | Best Val MSE | digtime MSE | timing_ctrl MSE | array_128_32_8t MSE |
+| --- | --- | --- | --- | --- |
+| no-GCL pilot | 0.0096 | 0.0141 | 0.0099 | 0.0113 |
+| static SGRL embedding pilot | 0.0096 | 0.0136 | 0.0103 | 0.0110 |
+| direct online init reuse pilot | 0.0132 | 0.0150 | 0.0226 | 0.0117 |
+| hybrid online init reuse pilot | 0.0106 | 0.0246 | 0.0168 | 0.0213 |
+| hybrid online freeze reuse pilot | 0.0105 | 0.0252 | 0.0180 | 0.0291 |
+
+### Interpretation Notes
+
+- Adding the circuit-statistics adapter fixes a real part of the reuse mismatch:
+  validation MSE improves from direct reuse `0.0132` to about `0.0105-0.0106`.
+- The hybrid reuse variants still do not beat the no-GCL/static baselines on
+  validation, and their cross-dataset test MSEs are much worse.
+- `freeze` is slightly better than `init` on validation in this pilot, but worse
+  on all three test datasets. This suggests the reused SGRL backbone is not yet
+  aligned with downstream generalization.
+- Current conclusion: online/downstream reuse is a plausible teacher-task
+  direction, but the simple concat adapter is not enough. Keep static/no-GCL as
+  baselines, and treat the next reuse work as alignment/regularization rather
+  than just wiring reuse into the head.
+- Reasonable next reuse candidates: gated/residual fusion instead of raw concat,
+  lower learning rate on reused encoder layers, or reuse only the early encoder
+  initialization while preserving more of the original downstream `GraphHead`.

@@ -251,12 +251,36 @@ class SgrlBackboneHead(nn.Module):
         self.encoder = CustomConv(args)
         self.encoder_frozen = False
         hidden_dim = args.cl_hid_dim
+        stats_fusion = getattr(args, 'sgrl_reuse_stats_fusion', 'concat')
+        self.use_stats = bool(
+            getattr(args, 'use_stats', 0)
+            and getattr(args, 'sgrl_reuse_stats', 1)
+            and stats_fusion != 'none'
+        )
+        self.stats_fusion = stats_fusion if self.use_stats else 'none'
         self.task = args.task
         self.task_level = args.task_level
         self.net_only = args.net_only
         self.num_classes = args.num_classes
         self.class_boundaries = args.class_boundaries
         self.src_dst_agg = args.src_dst_agg
+        self.stats_embed_dim = hidden_dim
+        fused_dim = hidden_dim
+
+        if self.use_stats:
+            self.net_attr_layers = nn.Linear(17, self.stats_embed_dim, bias=True)
+            self.dev_attr_layers = nn.Linear(17, self.stats_embed_dim, bias=True)
+            self.pin_attr_layers = nn.Embedding(17, self.stats_embed_dim)
+            if self.stats_fusion == 'concat':
+                fused_dim = hidden_dim + self.stats_embed_dim
+            elif self.stats_fusion == 'add':
+                fused_dim = hidden_dim
+            else:
+                raise ValueError(f'Unsupported SGRL stats fusion: {self.stats_fusion}')
+            print(
+                "Using circuit-statistics adapter for SGRL backbone reuse "
+                f"(fusion={self.stats_fusion})."
+            )
 
         if args.src_dst_agg == 'pooladd':
             self.pooling_fun = pygnn.pool.global_add_pool
@@ -264,9 +288,9 @@ class SgrlBackboneHead(nn.Module):
             self.pooling_fun = pygnn.pool.global_mean_pool
 
         head_input_dim = (
-            hidden_dim * 2
+            fused_dim * 2
             if self.src_dst_agg == 'concat' and self.task_level == 'edge'
-            else hidden_dim
+            else fused_dim
         )
 
         if self.task == 'regression':
@@ -327,8 +351,35 @@ class SgrlBackboneHead(nn.Module):
             x = self.encoder.encode(batch)
         return x
 
+    def _encode_stats(self, batch):
+        net_node_mask = batch.node_type == NET
+        dev_node_mask = batch.node_type == DEV
+        pin_node_mask = batch.node_type == PIN
+        node_attr_emb = torch.zeros(
+            (batch.num_nodes, self.stats_embed_dim), device=batch.node_attr.device
+        )
+        node_attr_emb[net_node_mask] = \
+            self.net_attr_layers(batch.node_attr[net_node_mask])
+        node_attr_emb[dev_node_mask] = \
+            self.dev_attr_layers(batch.node_attr[dev_node_mask])
+        node_attr_emb[pin_node_mask] = \
+            self.pin_attr_layers(batch.node_attr[pin_node_mask, 0].long())
+        return node_attr_emb
+
+    def _fuse_stats(self, x, batch):
+        if not self.use_stats:
+            return x
+
+        stats_x = self._encode_stats(batch)
+        if self.stats_fusion == 'concat':
+            return torch.cat((x, stats_x), dim=1)
+        if self.stats_fusion == 'add':
+            return x + stats_x
+        raise ValueError(f'Unsupported SGRL stats fusion: {self.stats_fusion}')
+
     def forward(self, batch):
         x = self._encode(batch)
+        x = self._fuse_stats(x, batch)
 
         if self.task_level == 'node':
             if self.net_only:

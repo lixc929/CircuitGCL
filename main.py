@@ -50,6 +50,19 @@ if __name__ == "__main__":
             "'freeze' initializes and freezes the online encoder backbone."
         ),
     )
+    parser.add_argument(
+        '--sgrl_reuse_stats',
+        type=int,
+        default=1,
+        help='0 or 1. Add the downstream circuit-statistics adapter when reusing the SGRL backbone.',
+    )
+    parser.add_argument(
+        '--sgrl_reuse_stats_fusion',
+        type=str,
+        default='concat',
+        choices=['concat', 'add', 'none'],
+        help="How to fuse reused SGRL backbone features and circuit-statistics features.",
+    )
     parser.add_argument('--e1_lr', type=float, default=1e-6, help='Learning rate for online encoder in SGRL.')
     parser.add_argument('--e2_lr', type=float, default=2e-7, help='Learning rate for target encoder in SGRL.')
     parser.add_argument('--momentum', type=float, default=0.99, help='EMA')
