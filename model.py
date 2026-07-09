@@ -7,6 +7,7 @@ from torch_geometric.nn import (
     GINEConv, ClusterGCNConv
 )
 from torch_geometric.nn.models.mlp import MLP
+from sgrl_models import CustomConv
 
 NET = 0
 DEV = 1
@@ -242,4 +243,121 @@ class GraphHead(nn.Module):
         
         
     
+class SgrlBackboneHead(nn.Module):
+    """Downstream head that reuses the SGRL online encoder as its backbone."""
 
+    def __init__(self, args):
+        super().__init__()
+        self.encoder = CustomConv(args)
+        self.encoder_frozen = False
+        hidden_dim = args.cl_hid_dim
+        self.task = args.task
+        self.task_level = args.task_level
+        self.net_only = args.net_only
+        self.num_classes = args.num_classes
+        self.class_boundaries = args.class_boundaries
+        self.src_dst_agg = args.src_dst_agg
+
+        if args.src_dst_agg == 'pooladd':
+            self.pooling_fun = pygnn.pool.global_add_pool
+        elif args.src_dst_agg == 'poolmean':
+            self.pooling_fun = pygnn.pool.global_mean_pool
+
+        head_input_dim = (
+            hidden_dim * 2
+            if self.src_dst_agg == 'concat' and self.task_level == 'edge'
+            else hidden_dim
+        )
+
+        if self.task == 'regression':
+            dim_out = 1
+        elif self.task == 'classification':
+            dim_out = args.num_classes
+        else:
+            raise ValueError('Invalid task')
+
+        self.head_layers = MLP(
+            in_channels=head_input_dim,
+            hidden_channels=hidden_dim,
+            out_channels=dim_out,
+            num_layers=args.num_head_layers,
+            use_bn=False,
+            dropout=0.0,
+            activation=args.act_fn,
+        )
+
+    def load_online_encoder_state(self, online_state_dict, freeze=False):
+        prefix = 'online_encoder.'
+        if any(key.startswith(prefix) for key in online_state_dict):
+            encoder_state = {
+                key[len(prefix):]: value
+                for key, value in online_state_dict.items()
+                if key.startswith(prefix)
+            }
+        else:
+            encoder_state = online_state_dict
+
+        load_msg = self.encoder.load_state_dict(encoder_state, strict=False)
+        print(
+            "Loaded SGRL online encoder into downstream backbone "
+            f"(missing={len(load_msg.missing_keys)}, "
+            f"unexpected={len(load_msg.unexpected_keys)}, freeze={freeze})."
+        )
+
+        if freeze:
+            self.freeze_online_encoder()
+
+    def freeze_online_encoder(self):
+        self.encoder_frozen = True
+        self.encoder.eval()
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.encoder_frozen:
+            self.encoder.eval()
+        return self
+
+    def _encode(self, batch):
+        if self.encoder_frozen:
+            with torch.no_grad():
+                x = self.encoder.encode(batch)
+        else:
+            x = self.encoder.encode(batch)
+        return x
+
+    def forward(self, batch):
+        x = self._encode(batch)
+
+        if self.task_level == 'node':
+            if self.net_only:
+                net_node_mask = batch.node_type == NET
+                pred = self.head_layers(x[net_node_mask])
+                true_class = batch.y[:, 1][net_node_mask].long()
+                true_label = batch.y[net_node_mask]
+            else:
+                pred = self.head_layers(x)
+                true_class = batch.y[:, 1].long()
+                true_label = batch.y
+
+        elif self.task_level == 'edge':
+            if self.src_dst_agg[:4] == 'pool':
+                graph_emb = self.pooling_fun(x, batch.batch)
+            else:
+                batch_size = batch.edge_label.size(0)
+                src_emb = x[:batch_size, :]
+                dst_emb = x[batch_size:batch_size * 2, :]
+                if self.src_dst_agg == 'concat':
+                    graph_emb = torch.cat((src_emb, dst_emb), dim=1)
+                else:
+                    graph_emb = src_emb + dst_emb
+
+            pred = self.head_layers(graph_emb)
+            true_class = batch.edge_label[:, 1].long()
+            true_label = batch.edge_label
+
+        else:
+            raise ValueError('Invalid task level')
+
+        return pred, true_class, true_label

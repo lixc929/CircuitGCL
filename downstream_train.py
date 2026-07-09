@@ -9,7 +9,7 @@ from sklearn.metrics import (
 import numpy as np
 import time
 from tqdm import tqdm
-from model import GraphHead
+from model import GraphHead, SgrlBackboneHead
 from sampling import dataset_sampling
 from balanced_mse import GAILoss, BMCLoss, BNILoss, train_gmm, WeightedMSE, get_lds_weights, BalancedSoftmax, FocalLoss, compute_class_weights
 import os
@@ -131,8 +131,8 @@ def compute_loss(args, pred, true, criterion):
         if args.regress_loss == 'lds':
             loss = criterion(
                 pred, 
-                true[:, 0].squeeze(), 
-                true[:, 1].squeeze() # the weight for each label
+                true[:, 0].view(-1, 1),
+                true[:, 1].view(-1, 1) # the weight for each label
             )
             return loss, pred, true[:, 0].view(pred.size())
 
@@ -381,7 +381,25 @@ def class_train(args, classifier,optimizer_classifier,
         print( "=====================================")
 
 
-def downstream_train(args, dataset, device, cl_embeds=None):
+def build_downstream_model(args, sgrl_online_state=None):
+    if getattr(args, 'use_sgrl_backbone', 0):
+        model = SgrlBackboneHead(args)
+        if sgrl_online_state is None:
+            raise ValueError("SGRL backbone mode requires an online encoder state_dict.")
+        model.load_online_encoder_state(
+            sgrl_online_state,
+            freeze=args.sgrl_mode == 'freeze',
+        )
+        return model
+
+    return GraphHead(args)
+
+
+def trainable_parameters(model):
+    return [param for param in model.parameters() if param.requires_grad]
+
+
+def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=None):
     """ downstream task training for link prediction
     Args:
         args (argparse.Namespace): The arguments
@@ -390,7 +408,7 @@ def downstream_train(args, dataset, device, cl_embeds=None):
         all_node_embeds (torch.tensor): The node embeddings come from the contrastive learning
         device (torch.device): The device to train the model on
     """
-    if args.sgrl:
+    if getattr(args, 'use_sgrl_embeds', args.sgrl):
         dataset.set_cl_embeds(cl_embeds)
 
     dataset.norm_nfeat([NET, DEV])
@@ -431,19 +449,19 @@ def downstream_train(args, dataset, device, cl_embeds=None):
             raise ValueError(f"Loss func {args.regress_loss} not supported!")
         
         start = time.time()
-        model = GraphHead(args)
+        model = build_downstream_model(args, sgrl_online_state)
         model = model.to(device)
-        optimizier = torch.optim.Adam(model.parameters(),lr=args.lr)
+        optimizier = torch.optim.Adam(trainable_parameters(model), lr=args.lr)
         
         regress_train(args, model, optimizier, criterion,
               train_loader, val_loader, test_loaders, max_label,
               device)
         
     elif args.task == 'classification':
-        model = GraphHead(args)
+        model = build_downstream_model(args, sgrl_online_state)
         start = time.time()
         model = model.to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        optimizer = torch.optim.Adam(trainable_parameters(model), lr=args.lr)
         class_train(args, model, optimizer, train_loader, val_loader, test_loaders, max_label,
               device)
     
@@ -464,4 +482,3 @@ def downstream_train(args, dataset, device, cl_embeds=None):
     
     
     
-

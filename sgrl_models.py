@@ -90,7 +90,7 @@ class CustomConv(torch.nn.Module):
             torch.nn.Linear(proj_dim,proj_dim)
         )  
         
-    def forward(self,batch):
+    def encode(self,batch):
         # print(batch)
         ## Node type / Edge type encoding
         z = self.node_type_embed(batch.x).squeeze()
@@ -132,6 +132,10 @@ class CustomConv(torch.nn.Module):
             if self.drop_out > 0.0:
                 z = F.dropout(z, p=self.drop_out, training=self.training)
 
+        return z
+
+    def forward(self,batch):
+        z = self.encode(batch)
         return z, self.projection_head(z)
 
 class CustomOnline(torch.nn.Module):

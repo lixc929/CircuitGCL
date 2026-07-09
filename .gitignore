@@ -1,0 +1,27 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local environments and editor noise
+.venv/
+venv/
+.env
+.DS_Store
+
+# Downloaded datasets and processed graph caches
+datasets/
+
+# Experiment outputs
+logs/
+embeddings/
+downstream_model/
+models_node_cap_classifier/
+
+# Learned artifacts and serialized runtime outputs
+pkl/
+*.pth
+*.pt
+*.pkl
+
+# Local reading/reference PDFs kept out of the code repo
+*.pdf

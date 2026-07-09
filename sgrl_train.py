@@ -9,6 +9,13 @@ import os
 from sram_dataset import adaption_for_sgrl
 from torch_geometric.loader import NeighborLoader, ShaDowKHopSampler, LinkNeighborLoader
 
+
+def state_dict_to_cpu(state_dict):
+    return {
+        key: value.detach().cpu() if torch.is_tensor(value) else value
+        for key, value in state_dict.items()
+    }
+
 def train_online_encoder(online: CustomOnline, optimizer, loader, graph_adj, device):
     tot_loss = 0.0
     num_loss = 0
@@ -112,7 +119,7 @@ def get_all_contrastive_embed(
     # return cl_embeds_for_dataset
     return embeds
 
-def sgrl_train(args, dataset, device):
+def sgrl_train(args, dataset, device, return_embeddings=True, return_online_state=False):
     """
     Training SGRL model.
     Args:
@@ -120,7 +127,9 @@ def sgrl_train(args, dataset, device):
         dataset (torch_geometric.data.InMemoryDataset): The dataset
         device (torch.device): The device
     Returns:
-        torch.Tensor: The embeddings of all nodes in dataset
+        torch.Tensor or dict: By default, the embeddings of all nodes in dataset.
+        If return_embeddings is False and return_online_state is True, returns the
+        online encoder checkpoint path and state_dict for downstream reuse.
     """
     e1_lr = args.e1_lr
     e2_lr = args.e2_lr
@@ -184,6 +193,9 @@ def sgrl_train(args, dataset, device):
     model_name = f"pkl/pkl_online/best_online_{args.dataset}_" + \
         f"{args.cl_model}_layer{num_layers}_" + \
         f"dim{hidden_dim}_{activation}_dr{dropout:.1f}_small.pkl" # small g SGRL
+    target_model_name = model_name.replace('online', 'target')
+    os.makedirs(os.path.dirname(model_name), exist_ok=True)
+    os.makedirs(os.path.dirname(target_model_name), exist_ok=True)
   
 
     if not os.path.exists(model_name):
@@ -210,8 +222,7 @@ def sgrl_train(args, dataset, device):
             
             if target_loss < best_target_loss:
                 best_target_loss = target_loss
-                torch.save(target_model.state_dict(), 
-                           model_name.replace('online', 'target'))
+                torch.save(target_model.state_dict(), target_model_name)
 
             print(f"Epoch:{epoch} online_loss={online_loss:.6f} target_loss={target_loss:.6f}")
 
@@ -221,11 +232,28 @@ def sgrl_train(args, dataset, device):
             else:
                 cnt_wait += 1
 
+    if return_online_state:
+        online_model.load_state_dict(torch.load(model_name, map_location=device))
+        if not return_embeddings:
+            return {
+                'online_model_path': model_name,
+                'online_state_dict': state_dict_to_cpu(online_model.state_dict()),
+            }
+
     #========== get all node embeddings learnt by SGRL ==========#
-    return get_all_contrastive_embed(
+    embeds = get_all_contrastive_embed(
         online_model, model_name, train_graph, 
         train_graph_loader, hidden_dim, num_hop, device
     )
+
+    if return_online_state:
+        return {
+            'embeddings': embeds,
+            'online_model_path': model_name,
+            'online_state_dict': state_dict_to_cpu(online_model.state_dict()),
+        }
+
+    return embeds
 
 # if __name__ == '__main__':
 #     # warnings.filterwarnings("ignore")

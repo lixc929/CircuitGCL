@@ -38,6 +38,18 @@ if __name__ == "__main__":
 
     # SGRL arguments
     parser.add_argument('--sgrl', type=int, default=0, help='Enable contrastive learning, i.e., SGRL.')
+    parser.add_argument(
+        '--sgrl_mode',
+        type=str,
+        default='static',
+        choices=['static', 'init', 'freeze'],
+        help=(
+            "How to use SGRL downstream. "
+            "'static' keeps the original cached embedding path; "
+            "'init' initializes the downstream backbone from the online encoder; "
+            "'freeze' initializes and freezes the online encoder backbone."
+        ),
+    )
     parser.add_argument('--e1_lr', type=float, default=1e-6, help='Learning rate for online encoder in SGRL.')
     parser.add_argument('--e2_lr', type=float, default=2e-7, help='Learning rate for target encoder in SGRL.')
     parser.add_argument('--momentum', type=float, default=0.99, help='EMA')
@@ -87,6 +99,12 @@ if __name__ == "__main__":
     parser.add_argument('--log_dir', type=str, default='logs', help='The directory to save the log file.')
 
     args = parser.parse_args()
+    args.use_sgrl_embeds = int(args.sgrl == 1 and args.sgrl_mode == 'static')
+    args.use_sgrl_backbone = int(args.sgrl == 1 and args.sgrl_mode in ['init', 'freeze'])
+
+    if args.sgrl == 0 and args.sgrl_mode != 'static':
+        print(f"[Warning] --sgrl_mode {args.sgrl_mode} is ignored because --sgrl is 0.")
+        args.sgrl_mode = 'static'
 
     # Syncronize all random seeds
     random.seed(args.seed)
@@ -147,21 +165,36 @@ if __name__ == "__main__":
     )
 
     # STEP 2-3: If you do graph contrastive learning, you should add the code here =========== #
+    cl_embeds = None
+    sgrl_online_state = None
     if args.sgrl == 1:
-        embedding_path = f'./embeddings/'
-        os.makedirs(os.path.dirname(embedding_path), exist_ok=True)
-        embedding_path = os.path.join(embedding_path, f'embeddings_{args.dataset}_layer{args.num_gnn_layers}_dim{args.hid_dim}_{args.act_fn}.pkl')
-        if os.path.exists(embedding_path):
-            cl_embeds = torch.load(embedding_path)
+        if args.sgrl_mode == 'static':
+            embedding_dir = './embeddings/'
+            os.makedirs(embedding_dir, exist_ok=True)
+            embedding_path = os.path.join(
+                embedding_dir,
+                f'embeddings_{args.dataset}_{args.cl_model}_'
+                f'layer{args.cl_gnn_layers}_dim{args.cl_hid_dim}_'
+                f'{args.cl_act_fn}.pkl'
+            )
+            if os.path.exists(embedding_path):
+                cl_embeds = torch.load(embedding_path)
+            else:
+                cl_embeds = sgrl_train(args, dataset, device)
+                torch.save(cl_embeds, embedding_path)
         else:
-            cl_embeds = sgrl_train(args, dataset, device)
-            torch.save(cl_embeds, embedding_path)
-    else:
-        cl_embeds = None
-
+            sgrl_result = sgrl_train(
+                args,
+                dataset,
+                device,
+                return_embeddings=False,
+                return_online_state=True,
+            )
+            sgrl_online_state = sgrl_result['online_state_dict']
+            print(f"Using SGRL online encoder from {sgrl_result['online_model_path']}")
     # STEP 4: Training Epochs ================================================================ #
 
-    downstream_train(args, dataset, device, cl_embeds)
+    downstream_train(args, dataset, device, cl_embeds, sgrl_online_state)
 
     sys.stdout = original_stdout
     log_file.close()

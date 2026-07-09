@@ -4,6 +4,7 @@ from torch.nn.modules.loss import _Loss
 import joblib
 from sklearn.mixture import GaussianMixture
 import time
+import os
 from tqdm import tqdm
 
 import torch
@@ -76,9 +77,13 @@ def train_gmm(dataset):
     start = time.time()
     graph_idx = 0
     train_labels = dataset[graph_idx].edge_label
+    if train_labels.ndim == 2:
+        train_labels = train_labels[:, 0]
 
     for i in range(graph_idx+1, len(dataset.names)):
         test_labels = dataset[i].edge_label
+        if test_labels.ndim == 2:
+            test_labels = test_labels[:, 0]
         # Compute KL divergence and save histograms
         kl_value = kl_divergence(
             test_labels, train_labels, bins=20, 
@@ -96,6 +101,7 @@ def train_gmm(dataset):
     gmm_dict['weights'] = gmm.weights_
     gmm_dict['variances'] = gmm.covariances_
     gmm_path = 'pkl/gmm/gmm.pkl'
+    os.makedirs(os.path.dirname(gmm_path), exist_ok=True)
 
     joblib.dump(gmm_dict, gmm_path)
 
@@ -146,8 +152,11 @@ class BMCLoss(_Loss):
 
 
 def bmc_loss(pred, target, noise_var):
-    logits = - 0.5 * (pred - target).pow(2) / noise_var
-    loss = F.cross_entropy(logits.view(-1), torch.arange(pred.shape[0], dtype=torch.float32, device=pred.device))
+    pred = pred.view(-1, 1)
+    target = target.view(-1, 1)
+    logits = -0.5 * (pred - target.T).pow(2) / noise_var
+    labels = torch.arange(pred.shape[0], dtype=torch.long, device=pred.device)
+    loss = F.cross_entropy(logits, labels)
     loss = loss * (2 * noise_var).detach()
 
     return loss
@@ -184,6 +193,8 @@ class WeightedMSE(_Loss):
         super(WeightedMSE, self).__init__()
 
     def forward(self, inputs, targets, weights):
+        targets = targets.view_as(inputs)
+        weights = weights.view_as(inputs)
         loss = (inputs - targets) ** 2
         loss *= weights
         loss = torch.mean(loss)

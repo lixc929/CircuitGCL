@@ -104,7 +104,7 @@ class SealSramDataset(InMemoryDataset):
         Args:
             ntypes (list): The node types {0, 1} to be normalized
         """
-        if self._data is None or self.slices is None:
+        if self._data is None and self._data_list is not None:
             self.data, self.slices = self.collate(self._data_list)
             self._data_list = None
 
@@ -153,7 +153,7 @@ class SealSramDataset(InMemoryDataset):
         Args:
             embeds (torch.Tensor): The embeddings [N, cl_hid_dim] learned by SGRL.
         """
-        if self._data is None or self.slices is None:
+        if self._data is None and self._data_list is not None:
             self.data, self.slices = self.collate(self._data_list)
             self._data_list = None
 
