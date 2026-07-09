@@ -1038,16 +1038,63 @@ Key observations:
   because the current PyTorch build does not support the Blackwell `sm_120`
   architecture; the recorded vector result is the GPU3 rerun.
 
-Current S5 conclusion:
+Current S5 conclusion after the warmup/slim-gate sweep:
 
 - Do not continue deeper sharing (`k2`) with the current head.
-- Keep full `k1 + gate + freeze3` as the accuracy-leading shared-backbone
-  candidate.
+- Keep full `k1 + gate` as the main shared-backbone architecture. `freeze2`
+  and `freeze3` are both stable; `freeze3` was the first accuracy candidate,
+  while `freeze2` later became the best BMC row in the rebalancing sweep.
 - Keep `k1 + vector_gate + freeze3` and `k1 + scalar_gate + freeze3` as compact
   ablation baselines: they prove the architecture can be slimmed, but the
   current slim gates are not accurate enough to replace the full learned gate.
 - If compactness becomes the primary target, the next design should try a
   middle ground such as grouped/low-rank gate or a tiny bottleneck adapter,
   instead of jumping directly from 8,256 gate parameters down to 1 or 64.
-- Before adding GAI/BMC to S5, use full `gate + freeze3` for the main accuracy
-  comparison and include `vector_gate + freeze3` as the slim candidate.
+
+### S5 Rebalancing Sweep: Gate Accuracy vs Vector Slim
+
+Goal: finish the already-planned label-rebalancing comparison on the current
+best shared-backbone candidates, without adding new architecture branches.
+
+Common setup:
+
+```text
+dataset: ssram+digtime+timing_ctrl+array_128_32_8t
+epochs: 20
+batch_size: 512
+sgrl_mode: partial_shared
+shared_gnn_layers: 1
+cl_epochs: 5
+GPUs: 3/4
+```
+
+The first vector-GAI attempt hit a native GMM/OpenBLAS crash (`code 139`). The
+successful GAI reruns capped BLAS threads with
+`OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1`; they still used
+GPU execution.
+
+| Mode | Loss | Params | Freeze | Best epoch | Val MSE/loss | digtime MSE | timing_ctrl MSE | array MSE | Log |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| partial_shared_k1_gate_freeze3 | mse | 38,018 total / 28,738 warmup trainable | 3 | 19 | 0.0098 / 0.00979278 | 0.0140 | 0.0117 | 0.0119 | `logs/partial_shared_k1_gate_freeze3_mse_gpu_20260709/20260710_000538_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_gate_freeze3 | gai | 38,018 total / 28,738 warmup trainable | 3 | 19 | 0.0098 / 0.00977143 | 0.0140 | 0.0117 | 0.0120 | `logs/partial_shared_k1_gate_freeze3_gai_gpu4_20260710/20260710_011656_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossgai_batch512.txt` |
+| partial_shared_k1_gate_freeze3 | bmc | 38,018 total / 28,738 warmup trainable | 3 | 19 | 0.0098 / 0.00980692 | 0.0142 | 0.0116 | 0.0118 | `logs/partial_shared_k1_gate_freeze3_bmc_gpu3_20260710/20260710_011656_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossbmc_batch512.txt` |
+| partial_shared_k1_vector_gate_freeze3 | mse | 29,826 total / 20,546 warmup trainable | 3 | 19 | 0.0101 / 0.01012813 | 0.0189 | 0.0118 | 0.0134 | `logs/partial_shared_k1_vector_gate_freeze3_mse_gpu3_20260710/20260710_010211_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_vector_gate_freeze3 | gai | 29,826 total / 20,546 warmup trainable | 3 | 19 | 0.0101 / 0.01013507 | 0.0192 | 0.0119 | 0.0133 | `logs/partial_shared_k1_vector_gate_freeze3_gai_gpu3_20260710_retry_gpu_threads1/20260710_012324_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossgai_batch512.txt` |
+| partial_shared_k1_vector_gate_freeze3 | bmc | 29,826 total / 20,546 warmup trainable | 3 | 18 | 0.0101 / 0.01012138 | 0.0181 | 0.0117 | 0.0130 | `logs/partial_shared_k1_vector_gate_freeze3_bmc_gpu4_20260710/20260710_011934_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossbmc_batch512.txt` |
+| partial_shared_k1_gate_freeze2 | gai | 38,018 total / 28,738 warmup trainable | 2 | 18 | 0.0098 / 0.00982826 | 0.0140 | 0.0117 | 0.0119 | `logs/partial_shared_k1_gate_freeze2_gai_gpu4_20260710_threads1/20260710_012939_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossgai_batch512.txt` |
+| partial_shared_k1_gate_freeze2 | bmc | 38,018 total / 28,738 warmup trainable | 2 | 19 | 0.0098 / 0.00982118 | 0.0137 | 0.0114 | 0.0120 | `logs/partial_shared_k1_gate_freeze2_bmc_gpu3_20260710/20260710_012939_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossbmc_batch512.txt` |
+
+Rebalancing observations:
+
+- Full `gate` remains the only reliable reuse structure in this sweep. GAI/BMC
+  do not materially improve source validation over MSE, but BMC improves
+  timing_ctrl and the `freeze2 + BMC` row gives the best current transfer
+  combination: `0.0137/0.0114/0.0120`.
+- `gate + freeze3` is still a stable accuracy row: MSE, GAI, and BMC all stay
+  around `0.0098` validation and `0.014x/0.011x/0.012x` transfer.
+- `vector_gate` is compact but not a primary candidate yet. BMC slightly
+  repairs array/timing_ctrl versus vector-MSE, but digtime remains much worse
+  (`0.0181`-`0.0192`) than the full-gate rows (`0.0137`-`0.0142`).
+- For the current teacher task, layer rebalancing on top of the stable full-gate
+  shared backbone; do not use rebalancing to rescue an over-slimmed reuse
+  architecture.
