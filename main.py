@@ -42,14 +42,16 @@ if __name__ == "__main__":
         '--sgrl_mode',
         type=str,
         default='static',
-        choices=['static', 'init', 'freeze', 'online_feature'],
+        choices=['static', 'init', 'freeze', 'online_feature', 'online_feature_finetune'],
         help=(
             "How to use SGRL downstream. "
             "'static' keeps the original cached embedding path; "
             "'init' initializes the downstream backbone from the online encoder; "
             "'freeze' initializes and freezes the online encoder backbone; "
             "'online_feature' computes frozen online-encoder features per downstream batch "
-            "and feeds them into the original downstream GraphHead."
+            "and feeds them into the original downstream GraphHead; "
+            "'online_feature_finetune' also allows supervised gradients to update "
+            "the online encoder."
         ),
     )
     parser.add_argument(
@@ -67,6 +69,12 @@ if __name__ == "__main__":
     )
     parser.add_argument('--e1_lr', type=float, default=1e-6, help='Learning rate for online encoder in SGRL.')
     parser.add_argument('--e2_lr', type=float, default=2e-7, help='Learning rate for target encoder in SGRL.')
+    parser.add_argument(
+        '--sgrl_online_lr',
+        type=float,
+        default=1e-6,
+        help='Downstream finetuning learning rate for the SGRL online encoder.',
+    )
     parser.add_argument('--momentum', type=float, default=0.99, help='EMA')
     parser.add_argument('--weight_decay', type=float, default=0., help='weight_decay')
     parser.add_argument('--cl_epochs', type=int, default=800, help='cl_epochs')
@@ -120,7 +128,11 @@ if __name__ == "__main__":
 
     args.use_sgrl_embeds = int(args.sgrl == 1 and args.sgrl_mode == 'static')
     args.use_sgrl_backbone = int(args.sgrl == 1 and args.sgrl_mode in ['init', 'freeze'])
-    args.use_sgrl_online_features = int(args.sgrl == 1 and args.sgrl_mode == 'online_feature')
+    args.use_sgrl_online_features = int(
+        args.sgrl == 1
+        and args.sgrl_mode in ['online_feature', 'online_feature_finetune']
+    )
+    args.finetune_sgrl_online = int(args.sgrl == 1 and args.sgrl_mode == 'online_feature_finetune')
 
     # Syncronize all random seeds
     random.seed(args.seed)

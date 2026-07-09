@@ -481,3 +481,79 @@ logs/online_feature_dev_20260709/20260709_213202_edge_regression_ssram+digtime+t
   it fixes the architecture-level failure from the first reuse attempt.
 - Next step: S3 online feature finetuning, with a conservative learning rate or
   a separate optimizer group for the online encoder.
+
+## 2026-07-09: S3 Online Feature Finetuning
+
+### Goal
+
+Test whether the S2 online-feature path benefits from supervised finetuning of
+the pretrained SGRL online encoder. This is still not the compact final model:
+it keeps both the online encoder and downstream `GraphHead`, but lets downstream
+gradients update the online encoder with a much smaller learning rate.
+
+### Code Path
+
+- Added `--sgrl_mode online_feature_finetune`.
+- Added `--sgrl_online_lr` for the downstream finetuning learning rate of the
+  online encoder.
+- `OnlineFeatureGraphHead.load_online_encoder_state(..., freeze=False)` is used
+  in finetune mode.
+- `downstream_train.py` now builds two optimizer groups:
+  online encoder at `--sgrl_online_lr`, downstream parameters at `--lr`.
+
+### Command
+
+```bash
+OPENBLAS_NUM_THREADS=16 OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 NUMEXPR_NUM_THREADS=16 \
+/home/lixc/.conda/envs/RCG/bin/python main.py \
+  --dataset ssram+digtime+timing_ctrl+array_128_32_8t \
+  --task regression \
+  --task_level edge \
+  --regress_loss mse \
+  --batch_size 512 \
+  --epochs 20 \
+  --num_workers 0 \
+  --gpu 3 \
+  --sgrl 1 \
+  --sgrl_mode online_feature_finetune \
+  --sgrl_online_lr 1e-6 \
+  --cl_epochs 5 \
+  --cl_gnn_layers 2 \
+  --cl_hid_dim 64 \
+  --cl_batch_size 32768 \
+  --cl_num_neighbors 8 \
+  --num_hops 2 \
+  --num_neighbors 8 \
+  --log_dir logs/online_feature_finetune_dev_20260709
+```
+
+Log:
+
+```text
+logs/online_feature_finetune_dev_20260709/20260709_214440_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt
+```
+
+### Result
+
+| Mode | Loss | Best epoch | Val MSE | digtime MSE | timing_ctrl MSE | array MSE |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| static | mse | 17 | 0.0097 | 0.0151 | 0.0101 | 0.0111 |
+| nogcl | mse | 18 | 0.0096 | 0.0141 | 0.0099 | 0.0113 |
+| online_feature_frozen | mse | 17 | 0.0096 | 0.0142 | 0.0101 | 0.0112 |
+| online_feature_finetune | mse | 17 | 0.0096 | 0.0148 | 0.0100 | 0.0109 |
+
+Extra note: the raw validation loss kept decreasing after the script's selected
+best epoch, reaching `0.00958864` at epoch 19. The training script selects best
+checkpoints by the rounded `mse` field, so epoch 18/19 were treated as ties and
+did not trigger fresh test evaluation.
+
+### Interpretation Notes
+
+- S3 is stable and reaches the same validation MSE range as S2.
+- Finetuning slightly improves the array test split and timing-control is about
+  the same, but digtime gets worse than frozen online-feature reuse.
+- This does not yet justify spending more time tuning S3. It should remain as a
+  candidate setting, while the main reuse work moves to S4/S5 where we can
+  actually reduce duplicated GNN capacity.
+- Next step: add a compactness-oriented reuse stage, starting with parameter
+  counting and initialization/partial-sharing experiments.

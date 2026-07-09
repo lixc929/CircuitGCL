@@ -386,7 +386,10 @@ def build_downstream_model(args, sgrl_online_state=None):
         model = OnlineFeatureGraphHead(args)
         if sgrl_online_state is None:
             raise ValueError("SGRL online-feature mode requires an online encoder state_dict.")
-        model.load_online_encoder_state(sgrl_online_state, freeze=True)
+        model.load_online_encoder_state(
+            sgrl_online_state,
+            freeze=not getattr(args, 'finetune_sgrl_online', 0),
+        )
         return model
 
     if getattr(args, 'use_sgrl_backbone', 0):
@@ -404,6 +407,31 @@ def build_downstream_model(args, sgrl_online_state=None):
 
 def trainable_parameters(model):
     return [param for param in model.parameters() if param.requires_grad]
+
+
+def build_optimizer(args, model):
+    if getattr(args, 'finetune_sgrl_online', 0) and hasattr(model, 'online_encoder'):
+        online_params = [
+            param for param in model.online_encoder.parameters()
+            if param.requires_grad
+        ]
+        downstream_params = [
+            param for name, param in model.named_parameters()
+            if param.requires_grad and not name.startswith('online_encoder.')
+        ]
+        print(
+            "Using separate optimizer groups for online feature finetuning "
+            f"(online_lr={args.sgrl_online_lr}, downstream_lr={args.lr})."
+        )
+        return torch.optim.Adam(
+            [
+                {'params': online_params, 'lr': args.sgrl_online_lr},
+                {'params': downstream_params, 'lr': args.lr},
+            ],
+            lr=args.lr,
+        )
+
+    return torch.optim.Adam(trainable_parameters(model), lr=args.lr)
 
 
 def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=None):
@@ -458,7 +486,7 @@ def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=No
         start = time.time()
         model = build_downstream_model(args, sgrl_online_state)
         model = model.to(device)
-        optimizier = torch.optim.Adam(trainable_parameters(model), lr=args.lr)
+        optimizier = build_optimizer(args, model)
         
         regress_train(args, model, optimizier, criterion,
               train_loader, val_loader, test_loaders, max_label,
@@ -468,7 +496,7 @@ def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=No
         model = build_downstream_model(args, sgrl_online_state)
         start = time.time()
         model = model.to(device)
-        optimizer = torch.optim.Adam(trainable_parameters(model), lr=args.lr)
+        optimizer = build_optimizer(args, model)
         class_train(args, model, optimizer, train_loader, val_loader, test_loaders, max_label,
               device)
     
