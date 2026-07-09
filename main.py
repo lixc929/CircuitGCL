@@ -42,16 +42,25 @@ if __name__ == "__main__":
         '--sgrl_mode',
         type=str,
         default='static',
-        choices=['static', 'init', 'freeze', 'online_feature', 'online_feature_finetune'],
+        choices=[
+            'static',
+            'init',
+            'freeze',
+            'online_feature',
+            'online_feature_finetune',
+            'init_reuse',
+        ],
         help=(
             "How to use SGRL downstream. "
             "'static' keeps the original cached embedding path; "
-            "'init' initializes the downstream backbone from the online encoder; "
-            "'freeze' initializes and freezes the online encoder backbone; "
+            "'init' uses the online encoder as the downstream backbone; "
+            "'freeze' uses and freezes the online encoder as the downstream backbone; "
             "'online_feature' computes frozen online-encoder features per downstream batch "
             "and feeds them into the original downstream GraphHead; "
             "'online_feature_finetune' also allows supervised gradients to update "
-            "the online encoder."
+            "the online encoder; "
+            "'init_reuse' initializes compatible original GraphHead parameters from "
+            "the online encoder and then trains a single downstream GraphHead."
         ),
     )
     parser.add_argument(
@@ -128,11 +137,16 @@ if __name__ == "__main__":
 
     args.use_sgrl_embeds = int(args.sgrl == 1 and args.sgrl_mode == 'static')
     args.use_sgrl_backbone = int(args.sgrl == 1 and args.sgrl_mode in ['init', 'freeze'])
+    args.use_sgrl_graph_init = int(args.sgrl == 1 and args.sgrl_mode == 'init_reuse')
     args.use_sgrl_online_features = int(
         args.sgrl == 1
         and args.sgrl_mode in ['online_feature', 'online_feature_finetune']
     )
     args.finetune_sgrl_online = int(args.sgrl == 1 and args.sgrl_mode == 'online_feature_finetune')
+    args.use_graph_cl_features = int(
+        args.sgrl == 1
+        and args.sgrl_mode in ['static', 'online_feature', 'online_feature_finetune']
+    )
 
     # Syncronize all random seeds
     random.seed(args.seed)
@@ -169,11 +183,23 @@ if __name__ == "__main__":
 
 
     # Check cuda
-    if args.gpu != -1 and torch.cuda.is_available():
+    cuda_available = torch.cuda.is_available()
+    cuda_device_count = torch.cuda.device_count() if cuda_available else 0
+    print(
+        "CUDA status: "
+        f"available={cuda_available}, device_count={cuda_device_count}, "
+        f"requested_gpu={args.gpu}"
+    )
+    if args.gpu != -1 and cuda_available:
+        if args.gpu >= cuda_device_count:
+            raise ValueError(
+                f"Requested GPU {args.gpu}, but only {cuda_device_count} CUDA devices are visible."
+            )
         device = torch.device("cuda:{}".format(args.gpu))
         print('Using GPU: {}'.format(args.gpu))
     else:
         device = torch.device("cpu")
+        print("Using CPU")
 
     print(f"============= PID = {os.getpid()} ============= ")
     print(args)

@@ -382,6 +382,13 @@ def class_train(args, classifier,optimizer_classifier,
 
 
 def build_downstream_model(args, sgrl_online_state=None):
+    if getattr(args, 'use_sgrl_graph_init', 0):
+        model = GraphHead(args)
+        if sgrl_online_state is None:
+            raise ValueError("SGRL init-reuse mode requires an online encoder state_dict.")
+        model.load_sgrl_encoder_init(sgrl_online_state)
+        return model
+
     if getattr(args, 'use_sgrl_online_features', 0):
         model = OnlineFeatureGraphHead(args)
         if sgrl_online_state is None:
@@ -407,6 +414,30 @@ def build_downstream_model(args, sgrl_online_state=None):
 
 def trainable_parameters(model):
     return [param for param in model.parameters() if param.requires_grad]
+
+
+def print_parameter_summary(model):
+    total = sum(param.numel() for param in model.parameters())
+    trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    frozen = total - trainable
+    print(
+        "Model parameters: "
+        f"total={total:,}, trainable={trainable:,}, frozen={frozen:,}."
+    )
+
+    child_summaries = []
+    for name, child in model.named_children():
+        child_total = sum(param.numel() for param in child.parameters())
+        child_trainable = sum(
+            param.numel() for param in child.parameters()
+            if param.requires_grad
+        )
+        if child_total > 0:
+            child_summaries.append(
+                f"{name}: total={child_total:,}, trainable={child_trainable:,}"
+            )
+    if child_summaries:
+        print("Top-level parameter summary: " + "; ".join(child_summaries))
 
 
 def build_optimizer(args, model):
@@ -486,6 +517,7 @@ def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=No
         start = time.time()
         model = build_downstream_model(args, sgrl_online_state)
         model = model.to(device)
+        print_parameter_summary(model)
         optimizier = build_optimizer(args, model)
         
         regress_train(args, model, optimizier, criterion,
@@ -496,6 +528,7 @@ def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=No
         model = build_downstream_model(args, sgrl_online_state)
         start = time.time()
         model = model.to(device)
+        print_parameter_summary(model)
         optimizer = build_optimizer(args, model)
         class_train(args, model, optimizer, train_loader, val_loader, test_loaders, max_label,
               device)

@@ -14,6 +14,22 @@ NET = 0
 DEV = 1
 PIN = 2
 
+
+def extract_sgrl_encoder_state(online_state_dict):
+    prefix = 'online_encoder.'
+    if any(key.startswith(prefix) for key in online_state_dict):
+        return {
+            key[len(prefix):]: value
+            for key, value in online_state_dict.items()
+            if key.startswith(prefix)
+        }
+    return online_state_dict
+
+
+def shape_str(tensor):
+    return 'x'.join(str(dim) for dim in tensor.shape)
+
+
 class GraphHead(nn.Module):
     """ GNN head for graph-level prediction.
 
@@ -31,7 +47,7 @@ class GraphHead(nn.Module):
     """
     def __init__(self, args):
         super().__init__()
-        self.use_cl = args.sgrl
+        self.use_cl = bool(getattr(args, 'use_graph_cl_features', args.sgrl))
         self.use_stats = args.use_stats
         hidden_dim = args.hid_dim
         node_embed_dim = hidden_dim
@@ -157,6 +173,110 @@ class GraphHead(nn.Module):
         
         ## Dropout setting
         self.drop_out = args.dropout
+
+    def load_sgrl_encoder_init(self, online_state_dict):
+        """Initialize compatible GraphHead tensors from a pretrained SGRL encoder."""
+        encoder_state = extract_sgrl_encoder_state(online_state_dict)
+        target_state = self.state_dict()
+        copied = []
+        skipped = []
+        consumed_sources = set()
+
+        def copy_tensor(source_key, target_key, allow_prefix_rows=False):
+            if source_key not in encoder_state:
+                skipped.append((source_key, target_key, 'missing source'))
+                return
+            if target_key not in target_state:
+                skipped.append((source_key, target_key, 'missing target'))
+                consumed_sources.add(source_key)
+                return
+
+            source_tensor = encoder_state[source_key]
+            target_tensor = target_state[target_key]
+            source_shape = tuple(source_tensor.shape)
+            target_shape = tuple(target_tensor.shape)
+            consumed_sources.add(source_key)
+
+            with torch.no_grad():
+                if source_shape == target_shape:
+                    target_tensor.copy_(source_tensor.to(target_tensor.device))
+                    copied.append((source_key, target_key, 'full', target_tensor.numel()))
+                    return
+
+                if (
+                    allow_prefix_rows
+                    and source_tensor.ndim == 2
+                    and target_tensor.ndim == 2
+                    and target_shape[0] <= source_shape[0]
+                    and target_shape[1] == source_shape[1]
+                ):
+                    target_tensor.copy_(
+                        source_tensor[:target_shape[0]].to(target_tensor.device)
+                    )
+                    copied.append((source_key, target_key, 'prefix_rows', target_tensor.numel()))
+                    return
+
+            skipped.append((
+                source_key,
+                target_key,
+                f'shape {shape_str(source_tensor)} -> {shape_str(target_tensor)}',
+            ))
+
+        copy_tensor('node_type_embed.weight', 'node_encoder.weight', allow_prefix_rows=True)
+        copy_tensor('edge_type_embed.weight', 'edge_encoder.weight', allow_prefix_rows=True)
+
+        layer_prefixes = sorted({
+            key.split('.')[1]
+            for key in encoder_state
+            if key.startswith('layers.') and key.count('.') >= 2
+        }, key=int)
+        for layer_idx in layer_prefixes[:len(self.layers)]:
+            source_prefix = f'layers.{layer_idx}.'
+            for source_key in sorted(encoder_state):
+                if not source_key.startswith(source_prefix):
+                    continue
+                target_key = source_key
+                copy_tensor(source_key, target_key)
+
+        for source_key in ['bn_node_x.weight', 'bn_node_x.bias',
+                           'bn_node_x.running_mean', 'bn_node_x.running_var',
+                           'bn_node_x.num_batches_tracked',
+                           'activation.weight']:
+            copy_tensor(source_key, source_key)
+
+        for source_key in sorted(encoder_state):
+            if source_key in consumed_sources:
+                continue
+            if source_key.startswith('projection_head.'):
+                skipped.append((source_key, '-', 'projection head not used downstream'))
+            elif source_key.startswith('layers.'):
+                skipped.append((source_key, source_key, 'no matching downstream layer'))
+            else:
+                skipped.append((source_key, '-', 'no mapping'))
+
+        copied_tensors = len(copied)
+        copied_values = sum(item[3] for item in copied)
+        print(
+            "SGRL GraphHead init reuse summary: "
+            f"copied_tensors={copied_tensors}, copied_values={copied_values}, "
+            f"skipped={len(skipped)}."
+        )
+        if copied:
+            preview = '; '.join(
+                f"{src}->{dst}({mode})" for src, dst, mode, _ in copied[:8]
+            )
+            print(f"Copied preview: {preview}")
+        if skipped:
+            preview = '; '.join(
+                f"{src}->{dst}({reason})" for src, dst, reason in skipped[:8]
+            )
+            print(f"Skipped preview: {preview}")
+        if copied_tensors == 0:
+            print(
+                "[Warning] No SGRL tensors were compatible with GraphHead. "
+                "For S4 init reuse, align --model/--cl_model and usually set "
+                "--hid_dim close to --cl_hid_dim."
+            )
     
 
     def forward(self, batch, cl_x=None):

@@ -9,6 +9,21 @@ Keep new experiment records here instead of creating many separate Markdown file
 - `LABEL_REBALANCING_ANALYSIS.md`: paper reading notes and label-rebalancing design analysis.
 - `EXPERIMENT_LOG.md`: commands, logs, metrics, and conclusions from actual runs.
 
+## Device Validity Note
+
+Formal experiment logs should now include both lines below:
+
+```text
+CUDA status: available=True, device_count=..., requested_gpu=...
+Using GPU: ...
+```
+
+Runs made before this diagnostic was added are kept as development references,
+but should not be used as final GPU evidence unless they are rerun or otherwise
+verified. In particular, logs with `PID = 2` were sandbox-style runs and should
+be treated as CPU/unverified. The GPU-verified runs below were executed with the
+RCG environment at `/home/lixc/.conda/envs/RCG/bin/python` and GPU 3.
+
 ## 2026-07-09: SGRL Backbone Reuse Pilot
 
 ### Goal
@@ -365,6 +380,11 @@ num_hops: 2
 num_neighbors: 8
 ```
 
+Device note: this matrix was run before explicit CUDA diagnostics were added to
+`main.py`. It remains useful as a compact development comparison, but final
+claims should be based on GPU-verified reruns that print `CUDA status` and
+`Using GPU`.
+
 Modes:
 
 ```text
@@ -557,3 +577,109 @@ did not trigger fresh test evaluation.
   actually reduce duplicated GNN capacity.
 - Next step: add a compactness-oriented reuse stage, starting with parameter
   counting and initialization/partial-sharing experiments.
+
+## 2026-07-09: S4 Parameter Initialization Reuse
+
+### Goal
+
+Move from feature reuse to a compactness-oriented reuse path:
+
+```text
+pretrain SGRL online encoder
+  -> copy compatible online-encoder weights into the original downstream GraphHead
+  -> train one downstream GraphHead for inference
+```
+
+This is different from S2/S3: S2/S3 still carry an online encoder plus the
+downstream `GraphHead` during downstream training, while S4 uses the online
+encoder only for initialization and keeps a single downstream backbone.
+
+### Code Path
+
+- Added `--sgrl_mode init_reuse`.
+- Added `GraphHead.load_sgrl_encoder_init(...)` to copy compatible tensors and
+  print copied/skipped summaries.
+- Added downstream parameter-count logging.
+- Added CUDA diagnostics to every run log.
+
+### Commands
+
+GPU-verified `init_reuse + MSE`:
+
+```bash
+/home/lixc/.conda/envs/RCG/bin/python main.py \
+  --dataset ssram+digtime+timing_ctrl+array_128_32_8t \
+  --task regression \
+  --task_level edge \
+  --regress_loss mse \
+  --batch_size 512 \
+  --epochs 20 \
+  --num_workers 0 \
+  --gpu 3 \
+  --sgrl 1 \
+  --sgrl_mode init_reuse \
+  --model clustergcn \
+  --hid_dim 64 \
+  --num_gnn_layers 2 \
+  --cl_model clustergcn \
+  --cl_epochs 5 \
+  --cl_gnn_layers 2 \
+  --cl_hid_dim 64 \
+  --cl_batch_size 32768 \
+  --cl_num_neighbors 8 \
+  --num_hops 2 \
+  --num_neighbors 8 \
+  --log_dir logs/init_reuse_dev_gpu_20260709
+```
+
+GPU-verified paired compact `no-GCL + MSE` baseline:
+
+```bash
+/home/lixc/.conda/envs/RCG/bin/python main.py \
+  --dataset ssram+digtime+timing_ctrl+array_128_32_8t \
+  --task regression \
+  --task_level edge \
+  --regress_loss mse \
+  --batch_size 512 \
+  --epochs 20 \
+  --num_workers 0 \
+  --gpu 3 \
+  --sgrl 0 \
+  --model clustergcn \
+  --hid_dim 64 \
+  --num_gnn_layers 2 \
+  --num_hops 2 \
+  --num_neighbors 8 \
+  --log_dir logs/compact_clustergcn_baseline_gpu_20260709
+```
+
+### Result
+
+Both logs start with `CUDA status: available=True` and `Using GPU: 3`.
+
+| Mode | Loss | Params | Best epoch | Val MSE | digtime MSE | timing_ctrl MSE | array MSE | Log |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| compact no-GCL | mse | 27,170 | 16 | 0.0101 | 0.0145 | 0.0124 | 0.0113 | `logs/compact_clustergcn_baseline_gpu_20260709/20260709_221835_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| init_reuse | mse | 27,170 | 19 | 0.0097 | 0.0141 | 0.0112 | 0.0121 | `logs/init_reuse_dev_gpu_20260709/20260709_220924_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+
+The `init_reuse` log reports:
+
+```text
+SGRL GraphHead init reuse summary: copied_tensors=12, copied_values=17025, skipped=6.
+```
+
+### Interpretation Notes
+
+- S4 is the first reuse variant in this line that actually makes the downstream
+  inference model compact: after initialization, inference uses one `GraphHead`
+  with the same parameter count as the paired no-GCL baseline.
+- Compared with the GPU-verified compact no-GCL baseline, `init_reuse` improves
+  validation MSE (`0.0101 -> 0.0097`) and improves digtime/timing_ctrl, while
+  array is slightly worse (`0.0113 -> 0.0121`).
+- This is a better reuse direction than the earlier replacement-style
+  `reuse_gate_init` path, which was both less accurate and less faithful to the
+  original downstream model.
+- The strict GPU-verified `static + MSE` comparison is still pending. Before
+  expanding S4 to `GAI`/`BMC`, rerun `static + MSE` with the new CUDA diagnostics
+  so that S4 is compared against both compact no-GCL and original static GCL
+  under the same evidence standard.
