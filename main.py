@@ -80,6 +80,24 @@ if __name__ == "__main__":
         help='How to fuse circuit statistics after the shared lower GNN backbone.',
     )
     parser.add_argument(
+        '--partial_shared_backbone_lr',
+        type=float,
+        default=None,
+        help=(
+            'Optional learning rate for the shared lower GNN backbone in '
+            'partial_shared mode. Default: use --lr for all trainable params.'
+        ),
+    )
+    parser.add_argument(
+        '--partial_shared_freeze_epochs',
+        type=int,
+        default=0,
+        help=(
+            'Freeze the shared lower GNN backbone for this many initial epochs '
+            'in partial_shared mode, then unfreeze and rebuild the optimizer.'
+        ),
+    )
+    parser.add_argument(
         '--sgrl_reuse_stats',
         type=int,
         default=1,

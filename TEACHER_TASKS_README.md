@@ -135,7 +135,7 @@ Use the current `test` branch for all implementation and experiment commits. Do 
 | S2. Online feature reuse | Done | Use the pretrained online encoder online, but keep the original downstream GNN. | Added `--sgrl_mode online_feature`; frozen/eval online encoder produces `H_online` per batch, then `GraphHead` still runs downstream message passing and prediction. | `static + MSE` vs `online_feature_frozen + MSE` |
 | S3. Online feature finetuning | Done | Check whether supervised gradients should update the online encoder. | Added `--sgrl_mode online_feature_finetune`; use separate optimizer groups with lower online-encoder LR. | `online_feature_frozen` vs `online_feature_finetune` |
 | S4. Parameter initialization reuse | Done | Reuse GCL online encoder weights to initialize compatible downstream layers. | Added `init_reuse`; copied only matching tensors, logged skipped keys, and recorded parameter counts. | compact `no-GCL/static/init_reuse + MSE`, all GPU verified |
-| S5. Partial shared backbone | In progress | Share early/lower GNN layers while keeping task-specific later layers/head. | Added `partial_shared`, `SharedGNNBackbone`, and `PartialSharedGraphHead`; `k1 + add` is functional but weaker than S4/static, while `k2 + add` improves source val but hurts cross-dataset transfer. | `init_reuse` vs `partial_shared_k1/k2` |
+| S5. Partial shared backbone | In progress | Share early/lower GNN layers while keeping task-specific later layers/head. | Added `partial_shared`, `SharedGNNBackbone`, and `PartialSharedGraphHead`; `k2 + add` hurts transfer, while `k1 + gate + freeze3` is the current best shared-backbone candidate. | `init_reuse` vs `partial_shared_k1/k2/gate/freeze` |
 | S6. Joint shared backbone | Pending | Train one online backbone with both GCL and supervised losses. | Optimize `L = L_supervised + lambda_gcl * L_gcl`; target encoder remains EMA/stop-gradient. | `partial_shared` vs `joint_shared` |
 | S7. Label rebalancing integration | Pending | Test whether rebalancing helps after reuse is architecturally correct. | Run MSE first, then GAI/BMC. Try warmup MSE -> rebalancing only if needed. | best reuse + `MSE/GAI/BMC` |
 
@@ -386,15 +386,25 @@ init_reuse + MSE, GPU verified
 5. S5 partial shared backbone is now implemented as the next architecture:
    `--sgrl_mode partial_shared` reuses the SGRL online node/edge encoder and
    the first `k` online GNN layers, then keeps a downstream-specific tail GNN
-   and prediction head. First `partial_shared_k1 + add + MSE` completed on
-   GPU3: Val MSE is 0.0104, with digtime/timing_ctrl/array MSE
-   0.0180/0.0123/0.0130. This is functional but weaker than S4 `init_reuse`
-   and compact static. `partial_shared_k2 + add + MSE` also completed on GPU3:
-   Val MSE is 0.0108, with digtime/timing_ctrl/array MSE
-   0.0294/0.0152/0.0187. k2 makes the architecture more structurally shared
-   but gives much worse cross-dataset transfer, so the next S5 tests should
-   return to k1 and try gated/residual-gated stats fusion, lower LR, or a
-   frozen shared-layer warmup before adding label rebalancing.
+   and prediction head. GPU3 MSE results so far:
+
+```text
+partial_shared_k1 + add: Val 0.0104; digtime/timing_ctrl/array 0.0180/0.0123/0.0130
+partial_shared_k2 + add: Val 0.0108; digtime/timing_ctrl/array 0.0294/0.0152/0.0187
+partial_shared_k1 + gate: Val 0.0102; digtime/timing_ctrl/array 0.0140/0.0119/0.0126
+partial_shared_k1 + residual_gate: Val 0.0105; digtime/timing_ctrl/array 0.0147/0.0114/0.0120
+partial_shared_k1 + gate + backbone_lr=1e-5: Val 0.0107; digtime/timing_ctrl/array 0.0150/0.0123/0.0127
+partial_shared_k1 + gate + freeze3: Val 0.0098; digtime/timing_ctrl/array 0.0140/0.0117/0.0119
+```
+
+   k2 makes the architecture more structurally shared but badly hurts
+   cross-dataset transfer. Learned gate fusion repairs most of the k1/add
+   transfer loss. The best S5 candidate is now `k1 + gate + freeze3`, where the
+   shared GNN backbone is frozen for the first 3 downstream epochs and then
+   unfrozen. It reaches compact-baseline-level validation MSE while keeping
+   transfer much healthier than k2. The next S5 work should sweep warmup length
+   or unfreeze LR and reduce the gate parameter overhead before adding label
+   rebalancing.
 6. Only after the compact reuse architecture is stable, compare:
 
 ```text

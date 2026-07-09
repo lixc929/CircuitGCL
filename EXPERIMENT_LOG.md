@@ -939,6 +939,10 @@ Model parameters: total=29,762, trainable=29,762, frozen=0.
 | init_reuse | mse | 27,170 | 19 | 0.0097 | 0.0141 | 0.0112 | 0.0121 | `logs/init_reuse_dev_gpu_20260709/20260709_220924_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | partial_shared_k1_add | mse | 29,762 | 19 | 0.0104 | 0.0180 | 0.0123 | 0.0130 | `logs/partial_shared_k1_mse_gpu_20260709/20260709_230332_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | partial_shared_k2_add | mse | 29,762 | 18 | 0.0108 | 0.0294 | 0.0152 | 0.0187 | `logs/partial_shared_k2_mse_gpu_20260709/20260709_233131_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_gate | mse | 38,018 | 19 | 0.0102 | 0.0140 | 0.0119 | 0.0126 | `logs/partial_shared_k1_gate_mse_gpu_20260709/20260709_234332_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_residual_gate | mse | 38,018 | 19 | 0.0105 | 0.0147 | 0.0114 | 0.0120 | `logs/partial_shared_k1_residual_gate_mse_gpu_20260709/20260709_234916_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_gate_backbone_lr1e-5 | mse | 38,018 | 19 | 0.0107 | 0.0150 | 0.0123 | 0.0127 | `logs/partial_shared_k1_gate_backbone_lr1e-5_mse_gpu_20260709/20260709_235738_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_gate_freeze3 | mse | 38,018 total / 28,738 warmup trainable | 19 | 0.0098 | 0.0140 | 0.0117 | 0.0119 | `logs/partial_shared_k1_gate_freeze3_mse_gpu_20260709/20260710_000538_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 
 ### Interpretation Notes
 
@@ -961,3 +965,47 @@ Model parameters: total=29,762, trainable=29,762, frozen=0.
     warmup, to reduce overwriting of the pretrained GCL representation.
   - clean parameter accounting so unused tail modules are not instantiated when
     `tail_layers == 0`.
+
+### S5 Follow-up: Fusion and Warmup
+
+Follow-up S5 experiments kept `shared_gnn_layers=1` and changed only the
+statistics fusion or shared-backbone optimization schedule.
+
+Code support added:
+
+```text
+--partial_shared_backbone_lr <float>
+--partial_shared_freeze_epochs <int>
+```
+
+`--partial_shared_backbone_lr` creates a separate optimizer group for
+`shared_backbone.*`. `--partial_shared_freeze_epochs N` freezes the shared
+backbone for the first `N` downstream epochs, keeps its batchnorm/dropout path in
+eval mode during the freeze window, then unfreezes it and rebuilds the optimizer.
+
+Key observations:
+
+- `partial_shared_k1_gate` fixes most of the transfer collapse from
+  `partial_shared_k1_add`: digtime improves from `0.0180` to `0.0140`, timing
+  from `0.0123` to `0.0119`, and array from `0.0130` to `0.0126`. The cost is a
+  larger parameter count because the learned gate adds `8,256` parameters.
+- `partial_shared_k1_residual_gate` is not better on validation, but it improves
+  timing_ctrl and array relative to plain gate. This suggests that keeping a
+  statistics residual can help some transfer targets even when source val is
+  weaker.
+- `partial_shared_k1_gate_backbone_lr1e-5` is stable but too conservative. Val
+  reaches only `0.0107`, and digtime remains `0.0150`; lowering the whole shared
+  backbone update rate is less promising than a short freeze warmup.
+- `partial_shared_k1_gate_freeze3` is the current best S5 variant. It reaches
+  Val MSE `0.0098`, matching or slightly beating the compact baselines on source
+  validation, while keeping transfer much healthier than k2/add. Its remaining
+  weakness is digtime (`0.0140`), still slightly worse than compact static
+  (`0.0137`).
+
+Current S5 conclusion:
+
+- Do not continue deeper sharing (`k2`) with the current head.
+- Keep `k1 + gate + freeze warmup` as the leading shared-backbone candidate.
+- Before adding GAI/BMC to S5, run a small warmup sweep (`freeze_epochs=1/2/3/5`
+  or unfreeze LR `3e-5`) and reduce/clean the gate parameter overhead if
+  possible.
