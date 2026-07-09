@@ -942,7 +942,11 @@ Model parameters: total=29,762, trainable=29,762, frozen=0.
 | partial_shared_k1_gate | mse | 38,018 | 19 | 0.0102 | 0.0140 | 0.0119 | 0.0126 | `logs/partial_shared_k1_gate_mse_gpu_20260709/20260709_234332_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | partial_shared_k1_residual_gate | mse | 38,018 | 19 | 0.0105 | 0.0147 | 0.0114 | 0.0120 | `logs/partial_shared_k1_residual_gate_mse_gpu_20260709/20260709_234916_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | partial_shared_k1_gate_backbone_lr1e-5 | mse | 38,018 | 19 | 0.0107 | 0.0150 | 0.0123 | 0.0127 | `logs/partial_shared_k1_gate_backbone_lr1e-5_mse_gpu_20260709/20260709_235738_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_gate_freeze1 | mse | 38,018 total / 28,738 warmup trainable | 18 | 0.0098 | 0.0141 | 0.0117 | 0.0121 | `logs/partial_shared_k1_gate_freeze1_mse_gpu_20260710/20260710_002548_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_gate_freeze2 | mse | 38,018 total / 28,738 warmup trainable | 18 | 0.0098 | 0.0139 | 0.0117 | 0.0120 | `logs/partial_shared_k1_gate_freeze2_mse_gpu_20260710/20260710_003140_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 | partial_shared_k1_gate_freeze3 | mse | 38,018 total / 28,738 warmup trainable | 19 | 0.0098 | 0.0140 | 0.0117 | 0.0119 | `logs/partial_shared_k1_gate_freeze3_mse_gpu_20260709/20260710_000538_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_gate_freeze5 | mse | 38,018 total / 28,738 warmup trainable | 19 | 0.0099 | 0.0139 | 0.0118 | 0.0120 | `logs/partial_shared_k1_gate_freeze5_mse_gpu_20260710/20260710_003708_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
+| partial_shared_k1_gate_freeze3_backbone_lr3e-5 | mse | 38,018 total / 28,738 warmup trainable | 19 | 0.0099 | 0.0141 | 0.0116 | 0.0121 | `logs/partial_shared_k1_gate_freeze3_backbone_lr3e-5_mse_gpu_20260710/20260710_004222_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossmse_batch512.txt` |
 
 ### Interpretation Notes
 
@@ -996,16 +1000,32 @@ Key observations:
 - `partial_shared_k1_gate_backbone_lr1e-5` is stable but too conservative. Val
   reaches only `0.0107`, and digtime remains `0.0150`; lowering the whole shared
   backbone update rate is less promising than a short freeze warmup.
-- `partial_shared_k1_gate_freeze3` is the current best S5 variant. It reaches
-  Val MSE `0.0098`, matching or slightly beating the compact baselines on source
-  validation, while keeping transfer much healthier than k2/add. Its remaining
-  weakness is digtime (`0.0140`), still slightly worse than compact static
+- `partial_shared_k1_gate_freeze3` remains the best S5 variant after the warmup
+  sweep. Its exact reported Val MSE is `0.00979278`, with test MSE
+  `0.01404435/0.01165146/0.01194173` for
+  digtime/timing_ctrl/array. It matches or slightly beats the compact baselines
+  on source validation while keeping transfer much healthier than k2/add. Its
+  remaining weakness is digtime, still slightly worse than compact static
   (`0.0137`).
+- The warmup sweep shows that `freeze1` and `freeze2` are close to `freeze3`
+  (`0.00983751` and `0.00984017` reported Val MSE), but do not beat it overall.
+  `freeze2` has the best digtime among the freeze sweep (`0.01392501`), while
+  `freeze3` keeps the best validation and array transfer.
+- `freeze5` catches up late (`0.00988753`) but is slower and still behind
+  `freeze3`; longer freezing seems to delay downstream adaptation.
+- `freeze3 + backbone_lr=3e-5` also catches up late (`0.00989967`), but it is
+  slower than plain `freeze3`. This suggests that the useful ingredient is the
+  short freeze warmup, not an overly small shared-backbone learning rate.
+- For `freeze1` and `freeze2`, the final epoch printed slightly lower val losses
+  without emitting matching test results. The table uses each log's final
+  reported `Best epoch` and `Test results` for reproducible comparison.
 
 Current S5 conclusion:
 
 - Do not continue deeper sharing (`k2`) with the current head.
 - Keep `k1 + gate + freeze warmup` as the leading shared-backbone candidate.
-- Before adding GAI/BMC to S5, run a small warmup sweep (`freeze_epochs=1/2/3/5`
-  or unfreeze LR `3e-5`) and reduce/clean the gate parameter overhead if
-  possible.
+- Use `freeze3` as the default S5 setting; keep `freeze2` as a secondary option
+  if digtime becomes the target metric.
+- Before adding GAI/BMC to S5, reduce/clean the gate parameter overhead if
+  possible, then run the rebalancing comparison on the best shared-backbone
+  candidate.
