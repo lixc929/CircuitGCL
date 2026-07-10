@@ -101,3 +101,13 @@ def write_run_metrics(args, metrics):
     path = Path(args.run_artifact_dir) / 'metrics.json'
     write_json_atomic(path, metrics)
     return path
+
+
+def finalize_run_artifacts(args, status):
+    config_path = Path(args.run_artifact_dir) / 'run_config.json'
+    with config_path.open(encoding='utf-8') as config_file:
+        config = json.load(config_file)
+    config['status'] = status
+    config['ended_at'] = datetime.datetime.now().astimezone().isoformat()
+    write_json_atomic(config_path, config)
+    return config_path

@@ -9,7 +9,7 @@ from sgrl_train import sgrl_train
 import datetime
 import sys
 
-from run_artifacts import prepare_run_artifacts
+from run_artifacts import finalize_run_artifacts, prepare_run_artifacts
 
 if __name__ == "__main__":
     # STEP 0: Parse Arguments ======================================================================= #
@@ -351,8 +351,14 @@ if __name__ == "__main__":
             print(f"Using SGRL online encoder from {sgrl_result['online_model_path']}")
     # STEP 4: Training Epochs ================================================================ #
 
-    downstream_train(args, dataset, device, cl_embeds, sgrl_online_state)
-
-    sys.stdout = original_stdout
-    log_file.close()
+    try:
+        downstream_train(args, dataset, device, cl_embeds, sgrl_online_state)
+    except BaseException:
+        finalize_run_artifacts(args, status='failed')
+        raise
+    else:
+        finalize_run_artifacts(args, status='completed')
+    finally:
+        sys.stdout = original_stdout
+        log_file.close()
     print(f"Finished running and save results to {log_filename}")

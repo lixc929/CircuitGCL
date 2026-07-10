@@ -7,6 +7,7 @@ import unittest
 import torch
 
 from run_artifacts import (
+    finalize_run_artifacts,
     prepare_run_artifacts,
     save_best_checkpoint,
     write_run_metrics,
@@ -34,6 +35,7 @@ class RunArtifactsTest(unittest.TestCase):
                 metrics={'best_val_mse': 0.1},
             )
             write_run_metrics(args, {'status': 'completed'})
+            finalize_run_artifacts(args, status='completed')
 
             self.assertEqual(checkpoint_path.parent, artifact_dir)
             self.assertTrue((artifact_dir / 'run_config.json').is_file())
@@ -52,6 +54,8 @@ class RunArtifactsTest(unittest.TestCase):
             )
             self.assertEqual(config['args']['seed'], 2)
             self.assertEqual(config['artifact_dir'], str(artifact_dir))
+            self.assertEqual(config['status'], 'completed')
+            self.assertIn('ended_at', config)
 
             other_args = SimpleNamespace(seed=3, log_dir=str(root))
             other_dir = prepare_run_artifacts(other_args, root / 'run_b.txt')
