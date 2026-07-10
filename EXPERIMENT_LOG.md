@@ -1084,17 +1084,92 @@ GPU execution.
 | partial_shared_k1_gate_freeze2 | gai | 38,018 total / 28,738 warmup trainable | 2 | 18 | 0.0098 / 0.00982826 | 0.0140 | 0.0117 | 0.0119 | `logs/partial_shared_k1_gate_freeze2_gai_gpu4_20260710_threads1/20260710_012939_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossgai_batch512.txt` |
 | partial_shared_k1_gate_freeze2 | bmc | 38,018 total / 28,738 warmup trainable | 2 | 19 | 0.0098 / 0.00982118 | 0.0137 | 0.0114 | 0.0120 | `logs/partial_shared_k1_gate_freeze2_bmc_gpu3_20260710/20260710_012939_edge_regression_ssram+digtime+timing_ctrl+array_128_32_8t_lossbmc_batch512.txt` |
 
-Rebalancing observations:
+Single-seed rebalancing observations (superseded where noted by the multi-seed
+audit below):
 
-- Full `gate` remains the only reliable reuse structure in this sweep. GAI/BMC
+- Full `gate` is the best-performing reuse structure in this sweep. GAI/BMC
   do not materially improve source validation over MSE, but BMC improves
-  timing_ctrl and the `freeze2 + BMC` row gives the best current transfer
-  combination: `0.0137/0.0114/0.0120`.
-- `gate + freeze3` is still a stable accuracy row: MSE, GAI, and BMC all stay
+  timing_ctrl and the `freeze2 + BMC` row gives the best transfer result for
+  this seed: `0.0137/0.0114/0.0120`.
+- `gate + freeze3` is internally consistent for this seed: MSE, GAI, and BMC stay
   around `0.0098` validation and `0.014x/0.011x/0.012x` transfer.
 - `vector_gate` is compact but not a primary candidate yet. BMC slightly
   repairs array/timing_ctrl versus vector-MSE, but digtime remains much worse
   (`0.0181`-`0.0192`) than the full-gate rows (`0.0137`-`0.0142`).
-- For the current teacher task, layer rebalancing on top of the stable full-gate
-  shared backbone; do not use rebalancing to rescue an over-slimmed reuse
-  architecture.
+- These single-seed results motivated the full-gate multi-seed audit below;
+  they should not be used alone to claim a stable improvement. Rebalancing also
+  should not be used to rescue an over-slimmed reuse architecture.
+
+### S5 Multi-Seed Stability Audit
+
+Goal: check whether the strongest single-seed S5 rows remain competitive across
+seeds `0/1/2`, using matched original-static controls. No new architecture was
+introduced in this audit.
+
+Common setup:
+
+```text
+dataset: ssram+digtime+timing_ctrl+array_128_32_8t
+epochs: 20
+batch_size: 512
+lr: 1e-4
+cl_epochs: 5
+seeds: 0, 1, 2
+environment: /home/lixc/.conda/envs/RCG
+GPUs: 3/4
+log root: logs/multiseed_s5_gpu_20260710
+```
+
+Every row below completed with `Done!`. `Val MSE/loss` and test metrics come
+from the final reported `Best epoch` block, so each test result remains tied to
+the checkpoint that produced it.
+
+| Mode | Loss | Seed | Best epoch | Val MSE/loss | digtime MSE | timing_ctrl MSE | array MSE | Run directory |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| static | mse | 0 | 18 | 0.0097 / 0.00970833 | 0.0139 | 0.0119 | 0.0114 | `logs/multiseed_s5_gpu_20260710/static_mse_seed0` |
+| static | mse | 1 | 17 | 0.0099 / 0.00994769 | 0.0148 | 0.0116 | 0.0113 | `logs/multiseed_s5_gpu_20260710/static_mse_seed1` |
+| static | mse | 2 | 19 | 0.0099 / 0.00994125 | 0.0142 | 0.0121 | 0.0111 | `logs/multiseed_s5_gpu_20260710/static_mse_seed2` |
+| static | bmc | 0 | 15 | 0.0098 / 0.00979413 | 0.0142 | 0.0117 | 0.0112 | `logs/multiseed_s5_gpu_20260710/static_bmc_seed0` |
+| static | bmc | 1 | 16 | 0.0099 / 0.00991911 | 0.0146 | 0.0119 | 0.0113 | `logs/multiseed_s5_gpu_20260710/static_bmc_seed1` |
+| static | bmc | 2 | 17 | 0.0099 / 0.00994669 | 0.0143 | 0.0126 | 0.0114 | `logs/multiseed_s5_gpu_20260710/static_bmc_seed2` |
+| partial_shared_k1_gate_freeze2 | bmc | 0 | 18 | 0.0098 / 0.00984451 | 0.0140 | 0.0119 | 0.0133 | `logs/multiseed_s5_gpu_20260710/partial_shared_k1_gate_freeze2_bmc_seed0` |
+| partial_shared_k1_gate_freeze2 | bmc | 1 | 18 | 0.0101 / 0.01009922 | 0.0146 | 0.0127 | 0.0129 | `logs/multiseed_s5_gpu_20260710/partial_shared_k1_gate_freeze2_bmc_seed1` |
+| partial_shared_k1_gate_freeze2 | bmc | 2 | 18 | 0.0102 / 0.01024479 | 0.0163 | 0.0126 | 0.0119 | `logs/multiseed_s5_gpu_20260710/partial_shared_k1_gate_freeze2_bmc_seed2` |
+| partial_shared_k1_gate_freeze3 | mse | 0 | 17 | 0.0099 / 0.00990024 | 0.0142 | 0.0122 | 0.0133 | `logs/multiseed_s5_gpu_20260710/partial_shared_k1_gate_freeze3_mse_seed0` |
+| partial_shared_k1_gate_freeze3 | mse | 1 | 19 | 0.0100 / 0.01001535 | 0.0144 | 0.0127 | 0.0123 | `logs/multiseed_s5_gpu_20260710/partial_shared_k1_gate_freeze3_mse_seed1` |
+| partial_shared_k1_gate_freeze3 | mse | 2 | 17 | 0.0103 / 0.01027607 | 0.0165 | 0.0124 | 0.0121 | `logs/multiseed_s5_gpu_20260710/partial_shared_k1_gate_freeze3_mse_seed2` |
+| partial_shared_k1_gate_freeze3 | bmc | 0 | 18 | 0.0099 / 0.00992583 | 0.0137 | 0.0126 | 0.0139 | `logs/multiseed_s5_gpu_20260710/partial_shared_k1_gate_freeze3_bmc_seed0` |
+| partial_shared_k1_gate_freeze3 | bmc | 1 | 19 | 0.0100 / 0.01002019 | 0.0141 | 0.0123 | 0.0129 | `logs/multiseed_s5_gpu_20260710/partial_shared_k1_gate_freeze3_bmc_seed1` |
+| partial_shared_k1_gate_freeze3 | bmc | 2 | 17 | 0.0103 / 0.01029715 | 0.0166 | 0.0121 | 0.0121 | `logs/multiseed_s5_gpu_20260710/partial_shared_k1_gate_freeze3_bmc_seed2` |
+
+The summary uses population standard deviation (`ddof=0`) over the three seeds.
+Validation MSE is limited to the four decimal places emitted by the training
+logger; the per-seed table also keeps the higher-precision validation loss.
+
+| Mode | Loss | Val MSE mean +/- std | digtime mean +/- std | timing_ctrl mean +/- std | array mean +/- std |
+| --- | --- | ---: | ---: | ---: | ---: |
+| static | mse | 0.009833 +/- 0.000094 | 0.014300 +/- 0.000374 | 0.011867 +/- 0.000205 | 0.011267 +/- 0.000125 |
+| static | bmc | 0.009867 +/- 0.000047 | 0.014367 +/- 0.000170 | 0.012067 +/- 0.000386 | 0.011300 +/- 0.000082 |
+| partial_shared_k1_gate_freeze2 | bmc | 0.010033 +/- 0.000170 | 0.014967 +/- 0.000974 | 0.012400 +/- 0.000356 | 0.012700 +/- 0.000589 |
+| partial_shared_k1_gate_freeze3 | mse | 0.010067 +/- 0.000170 | 0.015033 +/- 0.001040 | 0.012433 +/- 0.000205 | 0.012567 +/- 0.000525 |
+| partial_shared_k1_gate_freeze3 | bmc | 0.010067 +/- 0.000170 | 0.014800 +/- 0.001283 | 0.012333 +/- 0.000205 | 0.012967 +/- 0.000736 |
+
+Stability conclusions:
+
+- The earlier single-seed `freeze2 + BMC` best row does not hold across seeds.
+  Its seed-2 digtime MSE rises to `0.0163`, and its three-seed transfer means
+  are all worse than both static controls.
+- Original `static + MSE` has the best three-seed mean on validation and all
+  three transfer datasets. `static + BMC` is close and has lower variance on
+  validation, digtime, and array, but does not improve the means.
+- Within the shared-backbone rows, BMC slightly improves freeze3 digtime and
+  timing_ctrl means relative to MSE, while MSE remains better on array. BMC is
+  therefore not a general fix for the current reuse gap.
+- All three partial-shared configurations are more seed-sensitive on digtime
+  than the static controls. The large seed-2 degradation is the main warning
+  signal and should be treated as an architecture/optimization stability issue,
+  not hidden by selecting seed 0.
+- S5 still demonstrates real structural reuse of the online lower GNN layer,
+  but the current `k1 + gate + freeze` implementation has not yet matched the
+  original static model in multi-seed accuracy or stability. Do not claim the
+  earlier single-seed result as the final reuse improvement.

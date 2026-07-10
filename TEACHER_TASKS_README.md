@@ -411,14 +411,17 @@ partial_shared_k1 + gate + freeze2 + BMC: Val 0.0098; digtime/timing_ctrl/array 
 
    k2 makes the architecture more structurally shared but badly hurts
    cross-dataset transfer. Learned gate fusion repairs most of the k1/add
-   transfer loss. The reliable S5 family is now full `k1 + gate` with short
-   freeze warmup. `freeze3` is stable across MSE/GAI/BMC, and `freeze2 + BMC`
-   currently gives the best transfer row: `0.0137/0.0114/0.0120` on
-   digtime/timing_ctrl/array. Slim gates reduce the full-gate model from
-   `38,018` parameters to about `29.8k`, but their transfer MSE is worse,
-   especially on digtime. The current conclusion is to use full `gate` as the
-   main reuse structure, keep `vector_gate` only as a compact ablation, and avoid
-   adding new architecture branches until the existing results are discussed.
+   transfer loss. The strongest single-seed row was `freeze2 + BMC` at
+   `0.0137/0.0114/0.0120` on digtime/timing_ctrl/array, but the completed
+   seeds `0/1/2` audit shows that this advantage is not stable. Across three
+   seeds, original `static + MSE` has the best validation and transfer means;
+   all tested `k1 + gate + freeze` rows are worse and are especially sensitive
+   on digtime. Slim gates also remain weaker, particularly on digtime. The
+   current conclusion is therefore narrower: full `gate` is still the best
+   reuse implementation tested, but it is not yet a replacement for static
+   GCL on accuracy/stability. Keep `vector_gate` only as a compact ablation and
+   avoid adding new branches until the multi-seed result is discussed. Full
+   per-seed metrics are in `EXPERIMENT_LOG.md`.
 6. Only after the compact reuse architecture is stable, compare:
 
 ```text
@@ -427,9 +430,10 @@ Best reuse + GAI
 Best reuse + BMC
 ```
 
-   This comparison has been run for the current S5 candidates. Rebalancing helps
-   most when the reuse architecture is already stable (`gate + freeze2/3`); it
-   does not fix the weaker `vector_gate` digtime transfer.
+   This comparison has been run for the current S5 candidates. The multi-seed
+   audit shows that BMC only makes small, dataset-dependent changes inside the
+   full-gate family and does not close the gap to static GCL. It also does not
+   fix the weaker `vector_gate` digtime transfer.
 
 7. If GCL + rebalancing is worse than either alone, test:
 
