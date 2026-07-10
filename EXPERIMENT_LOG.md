@@ -1434,3 +1434,57 @@ predictor optimization, EMA update, compact deployment accounting, and
 isolated checkpoint recovery. The next controlled experiments are the same
 architecture with `joint_gcl_lambda = 0, 0.01, 0.05, 0.1` on seed 0; only the
 best candidate should advance to seeds 1/2. Rebalancing remains paused.
+
+#### S6 Seed-0 GCL-Weight Sweep
+
+All four 20-epoch runs used the same `joint_shared` architecture, pretrained
+checkpoint, MSE loss, data split, and seed. Only `joint_gcl_lambda` changed.
+
+```text
+Git commit: ba5cdc9c91048575d6e41e890c609db267edda4e
+log root: logs/s6_lambda_seed0_gpu_parallel_20260711
+valid run directories: lambda_0, lambda_001_gpu3_retry, lambda_005, lambda_01
+GPU: 3/4
+```
+
+| Lambda | Best epoch | Val MSE/loss | digtime MSE | timing_ctrl MSE | array MSE | Online stats scale | Final GCL loss |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 19 | 0.0119 / 0.01186482 | 0.0138 | 0.0182 | 0.0117 | -0.2653 | N/A |
+| 0.01 | 19 | 0.0116 / 0.01158730 | 0.0135 | 0.0176 | 0.0115 | -0.2711 | 0.02005927 |
+| 0.05 | 19 | 0.0115 / 0.01154649 | 0.0136 | 0.0167 | 0.0119 | -0.2770 | 0.01899753 |
+| 0.1 | 19 | 0.0116 / 0.01156188 | 0.0137 | 0.0170 | 0.0121 | -0.2746 | 0.01847927 |
+
+Reference rows:
+
+| Mode | Val MSE | digtime MSE | timing_ctrl MSE | array MSE |
+| --- | ---: | ---: | ---: | ---: |
+| static + MSE, three-seed mean | 0.009833 | 0.014300 | 0.011867 | 0.011267 |
+| corrected freeze3 + MSE, frozen_only mean | 0.010233 | 0.016033 | 0.012800 | 0.012133 |
+| joint_shared, lambda=0.05 seed0 | 0.0115 | 0.0136 | 0.0167 | 0.0119 |
+
+Conclusions:
+
+- Joint GCL regularization helps relative to the identical `lambda=0`
+  architecture. `lambda=0.05` improves validation, digtime, and timing_ctrl;
+  `lambda=0.01` gives the best digtime and array values. The alignment branch
+  is therefore useful rather than inert.
+- `lambda=0.05` is the best overall seed-0 tradeoff, but it does not satisfy the
+  gate for a multi-seed promotion. Its validation is worse than both static and
+  corrected partial sharing, and timing_ctrl remains much worse (`0.0167`
+  versus static `0.011867`).
+- The fully shared two-layer backbone improves digtime and keeps array close,
+  but removing the downstream message-passing tail severely weakens
+  timing_ctrl adaptation. Increasing lambda cannot repair that structural
+  limitation; `0.1` is already slightly worse than `0.05`.
+- All best checkpoints occur at epoch 19, so the current 20-epoch budget may
+  not be fully converged. Longer training alone is not the next priority,
+  because the transfer imbalance is large and systematic.
+- Do not run seeds 1/2 or add GAI/BMC yet. The next design should preserve one
+  deployment backbone while adding lightweight task-specific adaptation
+  inside it, rather than restoring a second full downstream GNN.
+
+Run-selection note: `logs/s6_lambda_seed0_parallel_20260711` contains an
+accidental CPU-only launch and is marked failed. The first GPU4 `lambda_001`
+run under the valid root was intentionally interrupted at epoch 9 and marked
+failed when it was migrated to GPU3. Only the four completed directories named
+above are used in the table.
