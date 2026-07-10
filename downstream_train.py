@@ -782,10 +782,12 @@ def print_parameter_summary(model):
     )
     if hasattr(model, 'deployment_parameter_count'):
         deployment = model.deployment_parameter_count()
-        print(
-            'Deployment parameters: '
-            f'total={deployment:,}; target backbone and predictor are training-only.'
-        )
+        message = f'Deployment parameters: unmerged={deployment:,}'
+        if hasattr(model, 'merged_deployment_parameter_count'):
+            merged = model.merged_deployment_parameter_count()
+            message += f', merged={merged:,}'
+        message += '; target backbone and predictor are training-only.'
+        print(message)
 
     child_summaries = []
     for name, child in model.named_children():

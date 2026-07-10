@@ -56,6 +56,53 @@ def build_gnn_layer(model_name, in_dim, out_dim, edge_dim, activation='relu'):
     raise ValueError(f'Unsupported GNN model: {model_name}')
 
 
+class MergeableLoRALinear(nn.Module):
+    """Low-rank linear update that can be folded into its base weight."""
+
+    def __init__(self, base, rank, alpha=None):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError('LoRA rank must be positive.')
+        if not hasattr(base, 'weight'):
+            raise TypeError('MergeableLoRALinear requires a linear base module.')
+
+        self.base = base
+        self.rank = rank
+        self.alpha = float(rank if alpha is None else alpha)
+        self.scaling = self.alpha / self.rank
+        in_features = getattr(base, 'in_features', None)
+        if in_features is None:
+            in_features = base.in_channels
+        out_features = getattr(base, 'out_features', None)
+        if out_features is None:
+            out_features = base.out_channels
+        self.lora_a = nn.Linear(in_features, rank, bias=False)
+        self.lora_b = nn.Linear(rank, out_features, bias=False)
+        nn.init.kaiming_uniform_(self.lora_a.weight, a=5 ** 0.5)
+        nn.init.zeros_(self.lora_b.weight)
+        self.adapter_enabled = True
+        self.merged = False
+
+    def forward(self, x):
+        output = self.base(x)
+        if self.adapter_enabled and not self.merged:
+            output = output + self.scaling * self.lora_b(self.lora_a(x))
+        return output
+
+    def adapter_parameter_count(self):
+        return self.lora_a.weight.numel() + self.lora_b.weight.numel()
+
+    @torch.no_grad()
+    def merge_and_unwrap(self):
+        if not self.merged:
+            delta = self.scaling * (
+                self.lora_b.weight @ self.lora_a.weight
+            )
+            self.base.weight.add_(delta.to(self.base.weight.dtype))
+            self.merged = True
+        return self.base
+
+
 class GraphHead(nn.Module):
     """ GNN head for graph-level prediction.
 
@@ -626,9 +673,80 @@ class JointSharedEncoder(nn.Module):
             self.dev_attr_layers = nn.Linear(17, self.hidden_dim, bias=True)
             self.pin_attr_layers = nn.Embedding(17, self.hidden_dim)
             self.stats_residual_scale = nn.Parameter(torch.zeros(1))
+        self.lora_rank = getattr(args, 'joint_lora_rank', 0)
+        self.lora_alpha = getattr(args, 'joint_lora_alpha', None)
+        self.lora_layer = getattr(args, 'joint_lora_layer', -1)
+        self.lora_attached = False
 
     def load_online_encoder_state(self, online_state_dict):
         self.gnn.load_online_encoder_state(online_state_dict)
+        if self.lora_rank > 0:
+            self.attach_task_lora()
+
+    def _resolved_lora_layer(self):
+        layer_count = len(self.gnn.layers)
+        layer = self.lora_layer
+        if layer < 0:
+            layer += layer_count
+        if layer < 0 or layer >= layer_count:
+            raise ValueError(
+                f'joint_lora_layer {self.lora_layer} is out of range for '
+                f'{layer_count} GNN layers.'
+            )
+        return layer
+
+    def attach_task_lora(self):
+        if self.lora_attached:
+            return
+        if self.gnn.model != 'clustergcn':
+            raise ValueError(
+                'Mergeable joint LoRA currently supports clustergcn only.'
+            )
+        layer = self.gnn.layers[self._resolved_lora_layer()]
+        layer.lin_out = MergeableLoRALinear(
+            layer.lin_out,
+            rank=self.lora_rank,
+            alpha=self.lora_alpha,
+        )
+        layer.lin_root = MergeableLoRALinear(
+            layer.lin_root,
+            rank=self.lora_rank,
+            alpha=self.lora_alpha,
+        )
+        self.lora_attached = True
+        print(
+            'Attached mergeable task LoRA to joint shared backbone '
+            f'(layer={self._resolved_lora_layer()}, rank={self.lora_rank}, '
+            f'alpha={layer.lin_out.alpha}).'
+        )
+
+    def _lora_modules(self):
+        return [
+            module
+            for module in self.modules()
+            if isinstance(module, MergeableLoRALinear)
+        ]
+
+    def set_task_lora_enabled(self, enabled):
+        for module in self._lora_modules():
+            module.adapter_enabled = enabled
+
+    def lora_parameter_count(self):
+        return sum(
+            module.adapter_parameter_count()
+            for module in self._lora_modules()
+        )
+
+    @torch.no_grad()
+    def merge_task_lora(self):
+        if not self.lora_attached:
+            return 0
+        layer = self.gnn.layers[self._resolved_lora_layer()]
+        merged_values = self.lora_parameter_count()
+        layer.lin_out = layer.lin_out.merge_and_unwrap()
+        layer.lin_root = layer.lin_root.merge_and_unwrap()
+        self.lora_attached = False
+        return merged_values
 
     def _encode_stats(self, batch):
         node_type = batch.node_type.view(-1)
@@ -650,11 +768,15 @@ class JointSharedEncoder(nn.Module):
         )
         return stats_x
 
-    def forward(self, batch):
+    def forward(self, batch, task_path=True):
         x, edge_attr = self.gnn.encode_inputs(batch)
-        if self.use_stats:
+        if self.use_stats and task_path:
             x = x + self.stats_residual_scale * self._encode_stats(batch)
-        return self.gnn.propagate(x, edge_attr, batch)
+        self.set_task_lora_enabled(task_path)
+        try:
+            return self.gnn.propagate(x, edge_attr, batch)
+        finally:
+            self.set_task_lora_enabled(True)
 
 
 class JointSharedGraphHead(nn.Module):
@@ -675,6 +797,9 @@ class JointSharedGraphHead(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.target_momentum = args.momentum
+        self.separate_gcl_base_path = bool(
+            getattr(args, 'joint_lora_rank', 0) > 0
+        )
         self.task = args.task
         self.task_level = args.task_level
         self.net_only = args.net_only
@@ -710,12 +835,15 @@ class JointSharedGraphHead(nn.Module):
 
     def load_online_encoder_state(self, online_state_dict):
         self.shared_backbone.load_online_encoder_state(online_state_dict)
-        self.target_backbone.load_state_dict(self.shared_backbone.state_dict())
+        self.target_backbone = copy.deepcopy(self.shared_backbone)
+        for parameter in self.target_backbone.parameters():
+            parameter.requires_grad = False
         self.target_backbone.eval()
         print(
             'Loaded complete online GNN into joint shared online/EMA backbones '
             f'(layers={len(self.shared_backbone.gnn.layers)}, '
-            'stats_residual_scale=0).'
+            'stats_residual_scale=0, '
+            f'lora_rank={self.shared_backbone.lora_rank}).'
         )
 
     @torch.no_grad()
@@ -730,11 +858,16 @@ class JointSharedGraphHead(nn.Module):
             )
 
     def gcl_loss(self, batch, online_x=None):
-        if online_x is None:
+        if self.separate_gcl_base_path:
+            online_x = self.shared_backbone(batch, task_path=False)
+        elif online_x is None:
             online_x = self.shared_backbone(batch)
         online_prediction = self.predictor(online_x)
         with torch.no_grad():
-            target_x = self.target_backbone(batch)
+            target_x = self.target_backbone(
+                batch,
+                task_path=not self.separate_gcl_base_path,
+            )
         online_prediction = F.normalize(online_prediction, dim=-1, p=2)
         target_x = F.normalize(target_x, dim=-1, p=2)
         return 1.0 - (online_prediction * target_x).sum(dim=-1).mean()
@@ -745,6 +878,14 @@ class JointSharedGraphHead(nn.Module):
             for module in [self.shared_backbone, self.head_layers]
             for parameter in module.parameters()
         )
+
+    def merged_deployment_parameter_count(self):
+        return self.deployment_parameter_count() - \
+            self.shared_backbone.lora_parameter_count()
+
+    @torch.no_grad()
+    def merge_task_lora_for_deployment(self):
+        return self.shared_backbone.merge_task_lora()
 
     def _predict(self, x, batch):
         if self.task_level == 'node':

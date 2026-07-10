@@ -5,7 +5,7 @@ import unittest
 import torch
 from torch_geometric.data import Data
 
-from model import JointSharedGraphHead
+from model import JointSharedGraphHead, MergeableLoRALinear
 
 
 def make_args(**overrides):
@@ -20,6 +20,9 @@ def make_args(**overrides):
         'use_bn': 0,
         'use_stats': 1,
         'momentum': 0.9,
+        'joint_lora_rank': 0,
+        'joint_lora_alpha': None,
+        'joint_lora_layer': -1,
         'task': 'regression',
         'task_level': 'edge',
         'net_only': True,
@@ -60,6 +63,16 @@ class JointSharedTest(unittest.TestCase):
         }
         self.model.load_online_encoder_state(encoder_state)
         self.model.eval()
+
+    def make_lora_model(self, rank=2):
+        model = JointSharedGraphHead(make_args(joint_lora_rank=rank))
+        encoder_state = {
+            f'online_encoder.{key}': value.clone()
+            for key, value in model.shared_backbone.gnn.state_dict().items()
+        }
+        model.load_online_encoder_state(encoder_state)
+        model.eval()
+        return model
 
     def test_zero_init_stats_residual_preserves_pretrained_path(self):
         first = make_batch(torch.randn(6, 17))
@@ -109,6 +122,73 @@ class JointSharedTest(unittest.TestCase):
             for key in target_before
             if target_before[key].is_floating_point()
         ))
+
+    def test_lora_zero_init_and_merge_preserve_task_output(self):
+        model = self.make_lora_model(rank=2)
+        batch = make_batch()
+        with torch.no_grad():
+            base_x = model.shared_backbone(batch, task_path=False)
+            initial_task_x = model.shared_backbone(batch, task_path=True)
+        self.assertTrue(torch.allclose(base_x, initial_task_x, atol=1e-7))
+
+        lora_modules = [
+            module
+            for module in model.shared_backbone.modules()
+            if isinstance(module, MergeableLoRALinear)
+        ]
+        self.assertEqual(len(lora_modules), 2)
+        with torch.no_grad():
+            for module in lora_modules:
+                module.lora_b.weight.fill_(0.05)
+            task_before_merge = model.shared_backbone(
+                batch,
+                task_path=True,
+            )
+            base_after_update = model.shared_backbone(
+                batch,
+                task_path=False,
+            )
+        self.assertFalse(torch.allclose(task_before_merge, base_after_update))
+
+        unmerged = model.deployment_parameter_count()
+        expected_lora_values = model.shared_backbone.lora_parameter_count()
+        self.assertEqual(
+            unmerged - model.merged_deployment_parameter_count(),
+            expected_lora_values,
+        )
+        merged_values = model.merge_task_lora_for_deployment()
+        with torch.no_grad():
+            task_after_merge = model.shared_backbone(
+                batch,
+                task_path=True,
+            )
+        self.assertEqual(merged_values, expected_lora_values)
+        self.assertTrue(torch.allclose(
+            task_before_merge,
+            task_after_merge,
+            atol=1e-6,
+        ))
+        self.assertFalse(any(
+            isinstance(module, MergeableLoRALinear)
+            for module in model.shared_backbone.modules()
+        ))
+
+    def test_lora_gcl_base_path_excludes_stats_and_task_delta(self):
+        model = self.make_lora_model(rank=2)
+        first = make_batch(torch.randn(6, 17))
+        second = make_batch(torch.randn(6, 17) * 20.0)
+        with torch.no_grad():
+            model.shared_backbone.stats_residual_scale.fill_(1.0)
+            for module in model.shared_backbone._lora_modules():
+                module.lora_b.weight.fill_(0.1)
+            first_base = model.shared_backbone(first, task_path=False)
+            second_base = model.shared_backbone(second, task_path=False)
+            first_task = model.shared_backbone(first, task_path=True)
+            second_task = model.shared_backbone(second, task_path=True)
+
+        self.assertTrue(torch.allclose(first_base, second_base, atol=1e-7))
+        self.assertFalse(torch.allclose(first_task, second_task))
+        self.assertFalse(torch.allclose(first_task, first_base))
 
 
 if __name__ == '__main__':

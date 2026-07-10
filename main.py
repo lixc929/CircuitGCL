@@ -146,6 +146,27 @@ if __name__ == "__main__":
         help='Weight of the EMA-target GCL loss in joint_shared mode.',
     )
     parser.add_argument(
+        '--joint_lora_rank',
+        type=int,
+        default=0,
+        help=(
+            'Rank of the mergeable supervised LoRA update on the selected '
+            'joint-shared ClusterGCN layer. Zero disables LoRA.'
+        ),
+    )
+    parser.add_argument(
+        '--joint_lora_alpha',
+        type=float,
+        default=None,
+        help='LoRA scale numerator. Default: rank, giving unit scaling.',
+    )
+    parser.add_argument(
+        '--joint_lora_layer',
+        type=int,
+        default=-1,
+        help='Zero-based joint GNN layer to adapt; -1 selects the last layer.',
+    )
+    parser.add_argument(
         '--sgrl_reuse_stats',
         type=int,
         default=1,
@@ -249,6 +270,13 @@ if __name__ == "__main__":
             )
         if args.joint_gcl_lambda < 0.0:
             raise ValueError('--joint_gcl_lambda must be non-negative.')
+        if args.joint_lora_rank < 0:
+            raise ValueError('--joint_lora_rank must be non-negative.')
+        if args.joint_lora_rank > 0 and args.cl_model != 'clustergcn':
+            raise ValueError(
+                'Mergeable joint LoRA currently supports --cl_model '
+                'clustergcn only.'
+            )
 
     # Syncronize all random seeds
     random.seed(args.seed)
