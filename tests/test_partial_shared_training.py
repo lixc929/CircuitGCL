@@ -1,14 +1,17 @@
 import unittest
 import copy
 import json
+import random
 import tempfile
 from types import SimpleNamespace
 
 import torch
+import numpy as np
 from torch_geometric.data import Data
 
 from downstream_train import (
     apply_partial_shared_backbone_eval_policy,
+    build_partial_shared_audit_context,
     build_optimizer,
     maybe_unfreeze_partial_shared_backbone,
     record_partial_shared_representation_audit,
@@ -53,6 +56,17 @@ class DummyAuditModel(torch.nn.Module):
         stats_x = self._encode_stats(batch)
         gate = self.stats_gate(torch.cat((x, stats_x), dim=1))
         return gate * x + (1.0 - gate) * stats_x
+
+
+class RngConsumingLoader:
+    def __init__(self, batch):
+        self.batch = batch
+
+    def __iter__(self):
+        random.random()
+        np.random.rand()
+        torch.rand(1)
+        yield self.batch
 
 
 def make_args(**overrides):
@@ -169,6 +183,42 @@ class PartialSharedTrainingTest(unittest.TestCase):
             with open(audit_path, encoding='utf-8') as audit_file:
                 lines = [json.loads(line) for line in audit_file]
             self.assertEqual(len(lines), 2)
+
+    def test_audit_batch_capture_preserves_rng_state(self):
+        model = DummyAuditModel()
+        batch = Data(
+            audit_x=torch.ones(4, 2),
+            audit_stats=torch.ones(4, 2),
+            edge_label=torch.tensor([[0.2, 1.0], [0.6, 3.0]]),
+        )
+        random.seed(11)
+        np.random.seed(11)
+        torch.manual_seed(11)
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        torch_state = torch.get_rng_state()
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            args = make_args(
+                partial_shared_audit=1,
+                run_artifact_dir=temporary_dir,
+            )
+            build_partial_shared_audit_context(
+                args,
+                model,
+                RngConsumingLoader(batch),
+                {'transfer': RngConsumingLoader(batch)},
+                torch.device('cpu'),
+            )
+
+        self.assertEqual(random.getstate(), python_state)
+        restored_numpy_state = np.random.get_state()
+        self.assertEqual(restored_numpy_state[0], numpy_state[0])
+        self.assertTrue(np.array_equal(
+            restored_numpy_state[1], numpy_state[1]
+        ))
+        self.assertEqual(restored_numpy_state[2:], numpy_state[2:])
+        self.assertTrue(torch.equal(torch.get_rng_state(), torch_state))
 
 
 if __name__ == '__main__':

@@ -1,5 +1,6 @@
 import copy
 import json
+import random
 
 import torch
 import torch.nn.functional as F
@@ -309,9 +310,22 @@ def build_partial_shared_audit_context(
     for parameter in reference_backbone.parameters():
         parameter.requires_grad = False
 
-    fixed_batches = {'source_val': next(iter(val_loader)).cpu()}
-    for test_name, loader in test_loaders.items():
-        fixed_batches[test_name] = next(iter(loader)).cpu()
+    python_rng_state = random.getstate()
+    numpy_rng_state = np.random.get_state()
+    torch_rng_state = torch.get_rng_state()
+    cuda_rng_states = (
+        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    )
+    try:
+        fixed_batches = {'source_val': next(iter(val_loader)).cpu()}
+        for test_name, loader in test_loaders.items():
+            fixed_batches[test_name] = next(iter(loader)).cpu()
+    finally:
+        random.setstate(python_rng_state)
+        np.random.set_state(numpy_rng_state)
+        torch.set_rng_state(torch_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
 
     audit_path = os.path.join(
         args.run_artifact_dir,
