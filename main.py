@@ -102,7 +102,20 @@ if __name__ == "__main__":
         default=0,
         help=(
             'Freeze the shared lower GNN backbone for this many initial epochs '
-            'in partial_shared mode, then unfreeze and rebuild the optimizer.'
+            'in partial_shared mode, then unfreeze it without resetting the '
+            'optimizer state of downstream parameters.'
+        ),
+    )
+    parser.add_argument(
+        '--partial_shared_backbone_eval_policy',
+        type=str,
+        default='frozen_only',
+        choices=['frozen_only', 'always'],
+        help=(
+            "Control dropout/batchnorm mode independently of gradient freezing. "
+            "'frozen_only' keeps the backbone in eval mode only during the freeze "
+            "window; 'always' keeps it in eval mode throughout downstream training "
+            "while still allowing gradients after unfreezing."
         ),
     )
     parser.add_argument(

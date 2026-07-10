@@ -1173,3 +1173,103 @@ Stability conclusions:
   but the current `k1 + gate + freeze` implementation has not yet matched the
   original static model in multi-seed accuracy or stability. Do not claim the
   earlier single-seed result as the final reuse improvement.
+
+### S5.5 Optimizer, Eval-Mode, and Frozen-Backbone Audit
+
+Goal: separate three possible causes of S5 instability before adding another
+architecture or loss branch:
+
+1. downstream Adam state was reset when the shared backbone was unfrozen;
+2. gradient freezing and dropout/batchnorm eval mode were coupled;
+3. cached static embeddings and online embeddings might see incompatible
+   downstream sampling contexts.
+
+Code changes:
+
+- Unfreezing now adds the newly trainable backbone parameters to the existing
+  Adam optimizer instead of rebuilding it. Existing gate/tail/head optimizer
+  moments and step counts are preserved.
+- Added `--partial_shared_backbone_eval_policy`:
+  - `frozen_only` preserves the previous module-mode behavior;
+  - `always` keeps backbone dropout/batchnorm in eval mode even after gradients
+    are enabled.
+- Added `scripts/audit_static_online_consistency.py` to compare cached static
+  embeddings with outputs from the same online checkpoint inside downstream
+  disjoint `LinkNeighborLoader` batches.
+- Added three focused unit tests for optimizer-state preservation and eval-mode
+  behavior. All tests pass with the RCG environment.
+
+#### Static-vs-Online Representation Consistency
+
+Audit setup:
+
+```text
+checkpoint: best_online_ssram+digtime+timing_ctrl+array_128_32_8t_clustergcn_layer2_dim64_tanh_dr0.3_small.pkl
+cached embeddings: embeddings_ssram+digtime+timing_ctrl+array_128_32_8t_clustergcn_layer2_dim64_tanh.pkl
+downstream sampling: 2 hops, 8 neighbors, disjoint=True
+sample: first 2,048 target edges per circuit
+device: GPU 3
+result: logs/static_online_consistency_20260710/audit_seed0_gpu3.json
+```
+
+| Circuit | Root cosine mean | Root cosine p05 | Root relative L2 mean | Root MSE | All-node cosine mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ssram | 0.9999989 | 0.9999925 | 0.000565 | 7.05e-7 | 0.969866 |
+| digtime | 0.9999995 | 0.9999925 | 0.000242 | 3.02e-7 | 0.972392 |
+| timing_ctrl | 0.9999983 | 0.9999925 | 0.000855 | 1.07e-6 | 0.968608 |
+| array | 0.9999991 | 0.9999925 | 0.000433 | 5.40e-7 | 0.970323 |
+
+The target-edge root embeddings are effectively identical across the cached
+static and online disjoint-batch paths. The lower all-node cosine is expected:
+non-root neighbors in layer-wise sampling do not all receive a complete two-hop
+receptive field, while the target roots do. The downstream edge head consumes
+the roots. This rules out a gross checkpoint/cache/sampler mismatch at the
+prediction endpoints, although it does not by itself validate the current k1
+intermediate-layer fusion.
+
+#### Freeze-All MSE Multi-Seed Control
+
+This control kept the pretrained k1 shared backbone frozen and in eval mode for
+all 20 epochs. Only the statistics gate, downstream tail, and prediction head
+were trained (`28,738` trainable of `38,018` total parameters).
+
+```text
+sgrl_mode: partial_shared
+shared_gnn_layers: 1
+partial_shared_stats_fusion: gate
+partial_shared_freeze_epochs: 20
+partial_shared_backbone_eval_policy: always
+loss: MSE
+seeds: 0, 1, 2
+log root: logs/freeze_all_mse_multiseed_gpu_20260710
+```
+
+| Seed | Best epoch | Val MSE/loss | digtime MSE | timing_ctrl MSE | array MSE | Run directory |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 0 | 18 | 0.0102 / 0.01020449 | 0.0152 | 0.0131 | 0.0153 | `logs/freeze_all_mse_multiseed_gpu_20260710/partial_shared_k1_gate_freeze_all_mse_seed0` |
+| 1 | 18 | 0.0102 / 0.01018344 | 0.0152 | 0.0131 | 0.0137 | `logs/freeze_all_mse_multiseed_gpu_20260710/partial_shared_k1_gate_freeze_all_mse_seed1` |
+| 2 | 19 | 0.0104 / 0.01035412 | 0.0149 | 0.0126 | 0.0141 | `logs/freeze_all_mse_multiseed_gpu_20260710/partial_shared_k1_gate_freeze_all_mse_seed2` |
+
+Population mean and standard deviation over the three seeds:
+
+| Mode | Val MSE mean +/- std | digtime mean +/- std | timing_ctrl mean +/- std | array mean +/- std |
+| --- | ---: | ---: | ---: | ---: |
+| static + MSE | 0.009833 +/- 0.000094 | 0.014300 +/- 0.000374 | 0.011867 +/- 0.000205 | 0.011267 +/- 0.000125 |
+| k1 + gate + freeze3 + MSE | 0.010067 +/- 0.000170 | 0.015033 +/- 0.001040 | 0.012433 +/- 0.000205 | 0.012567 +/- 0.000525 |
+| k1 + gate + freeze_all + MSE | 0.010267 +/- 0.000094 | 0.015100 +/- 0.000141 | 0.012933 +/- 0.000236 | 0.014367 +/- 0.000680 |
+
+Conclusions:
+
+- Freeze-all greatly reduces digtime variance relative to freeze3, so updating
+  the pretrained layer is one source of seed sensitivity.
+- Permanent freezing does not improve mean accuracy. It is worse than freeze3
+  on validation, timing_ctrl, and especially array. The shared layer needs some
+  supervised adaptation after a short warmup.
+- The root consistency audit makes a basic cached-vs-online sampler mismatch
+  unlikely as the primary cause. The remaining high-value variables are the
+  optimizer reset (now fixed), the dropout/eval transition, and the destructive
+  full-gate fusion of intermediate GCL features with circuit statistics.
+- The next controlled experiment should rerun short freeze2/freeze3 MSE with
+  the corrected optimizer and compare `frozen_only` against `always` eval
+  policy. Do not add BMC/GAI or a new architecture until that comparison shows
+  whether optimizer-state preservation and dropout control recover stability.

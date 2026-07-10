@@ -212,14 +212,45 @@ def set_partial_shared_backbone_trainable(args, model, trainable):
     return True
 
 
-def keep_partial_shared_backbone_eval_if_frozen(args, model, epoch):
+def apply_partial_shared_backbone_eval_policy(args, model, epoch):
+    if not has_partial_shared_backbone(args, model):
+        return False
+
     freeze_epochs = getattr(args, 'partial_shared_freeze_epochs', 0)
-    if (
-        has_partial_shared_backbone(args, model)
-        and freeze_epochs > 0
-        and epoch < freeze_epochs
-    ):
+    eval_policy = getattr(
+        args,
+        'partial_shared_backbone_eval_policy',
+        'frozen_only',
+    )
+    is_frozen = freeze_epochs > 0 and epoch < freeze_epochs
+    if is_frozen or eval_policy == 'always':
         model.shared_backbone.eval()
+        return True
+    return False
+
+
+def add_partial_shared_backbone_optimizer_group(args, model, optimizer):
+    existing_param_ids = {
+        id(param)
+        for group in optimizer.param_groups
+        for param in group['params']
+    }
+    backbone_params = [
+        param
+        for param in model.shared_backbone.parameters()
+        if param.requires_grad and id(param) not in existing_param_ids
+    ]
+    if not backbone_params:
+        return 0
+
+    backbone_lr = getattr(args, 'partial_shared_backbone_lr', None)
+    if backbone_lr is None:
+        backbone_lr = args.lr
+    optimizer.add_param_group({
+        'params': backbone_params,
+        'lr': backbone_lr,
+    })
+    return sum(param.numel() for param in backbone_params)
 
 
 def maybe_unfreeze_partial_shared_backbone(args, model, optimizer, epoch):
@@ -230,8 +261,15 @@ def maybe_unfreeze_partial_shared_backbone(args, model, optimizer, epoch):
         and epoch == freeze_epochs
     ):
         set_partial_shared_backbone_trainable(args, model, True)
-        print("Rebuilding optimizer after partial-shared warmup freeze.")
-        optimizer = build_optimizer(args, model)
+        added_values = add_partial_shared_backbone_optimizer_group(
+            args,
+            model,
+            optimizer,
+        )
+        print(
+            "Added partial-shared backbone to the existing optimizer "
+            f"({added_values:,} parameter values); preserved downstream Adam state."
+        )
         optimizer.zero_grad()
     return optimizer
 
@@ -263,7 +301,7 @@ def regress_train(args, regressor, optimizier, criterion,
         )
         logger = Logger(task=args.task, max_label=max_label)
         regressor.train()
-        keep_partial_shared_backbone_eval_if_frozen(args, regressor, epoch)
+        apply_partial_shared_backbone_eval_policy(args, regressor, epoch)
 
         for i, batch in enumerate(tqdm(train_loader, desc=f'Epoch:{epoch}')):
             optimizier.zero_grad()
@@ -353,7 +391,7 @@ def class_train(args, classifier,optimizer_classifier,
         # add the logger for classification task
         logger = Logger(task='classification', max_label=max_label)
         classifier.train()
-        keep_partial_shared_backbone_eval_if_frozen(args, classifier, epoch)
+        apply_partial_shared_backbone_eval_policy(args, classifier, epoch)
 
         for i, batch in enumerate(tqdm(train_loader, desc=f'Epoch:{epoch}')):
             # Move batch to device

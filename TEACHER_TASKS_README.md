@@ -135,9 +135,9 @@ Use the current `test` branch for all implementation and experiment commits. Do 
 | S2. Online feature reuse | Done | Use the pretrained online encoder online, but keep the original downstream GNN. | Added `--sgrl_mode online_feature`; frozen/eval online encoder produces `H_online` per batch, then `GraphHead` still runs downstream message passing and prediction. | `static + MSE` vs `online_feature_frozen + MSE` |
 | S3. Online feature finetuning | Done | Check whether supervised gradients should update the online encoder. | Added `--sgrl_mode online_feature_finetune`; use separate optimizer groups with lower online-encoder LR. | `online_feature_frozen` vs `online_feature_finetune` |
 | S4. Parameter initialization reuse | Done | Reuse GCL online encoder weights to initialize compatible downstream layers. | Added `init_reuse`; copied only matching tensors, logged skipped keys, and recorded parameter counts. | compact `no-GCL/static/init_reuse + MSE`, all GPU verified |
-| S5. Partial shared backbone | Done for current round | Share early/lower GNN layers while keeping task-specific later layers/head. | Added `partial_shared`, `SharedGNNBackbone`, and `PartialSharedGraphHead`; full `k1 + gate` is the reliable shared-backbone path, while `scalar_gate/vector_gate + freeze3` reduce parameters but lose transfer. | `init_reuse` vs `partial_shared_k1/k2/gate/freeze/slim_gate` |
+| S5. Partial shared backbone | Done for current round | Share early/lower GNN layers while keeping task-specific later layers/head. | Added `partial_shared`, `SharedGNNBackbone`, and `PartialSharedGraphHead`; full `k1 + gate` is the best reuse path tested but remains behind static in multi-seed transfer. S5.5 now preserves optimizer state on unfreeze and separates eval mode from gradient freezing. | `init_reuse` vs `partial_shared_k1/k2/gate/freeze/slim_gate` |
 | S6. Joint shared backbone | Pending | Train one online backbone with both GCL and supervised losses. | Optimize `L = L_supervised + lambda_gcl * L_gcl`; target encoder remains EMA/stop-gradient. | `partial_shared` vs `joint_shared` |
-| S7. Label rebalancing integration | Current sweep done | Test whether rebalancing helps after reuse is architecturally correct. | Ran GAI/BMC on `gate+freeze3`, `vector_gate+freeze3`, and `gate+freeze2`; BMC helps the stable full-gate backbone most, not the over-slim vector gate. | best reuse + `MSE/GAI/BMC` |
+| S7. Label rebalancing integration | Current sweep done | Test whether rebalancing helps after reuse is architecturally correct. | Ran GAI/BMC on `gate+freeze3`, `vector_gate+freeze3`, and `gate+freeze2`; single-seed gains did not close the static gap in the multi-seed audit. | best reuse + `MSE/GAI/BMC` |
 
 ### 4.3 First Implementation Target
 
@@ -422,6 +422,17 @@ partial_shared_k1 + gate + freeze2 + BMC: Val 0.0098; digtime/timing_ctrl/array 
    GCL on accuracy/stability. Keep `vector_gate` only as a compact ablation and
    avoid adding new branches until the multi-seed result is discussed. Full
    per-seed metrics are in `EXPERIMENT_LOG.md`.
+
+   The S5.5 diagnostic follow-up found that cached static and online disjoint-
+   batch embeddings are effectively identical at target-edge root nodes, so a
+   basic sampler/checkpoint mismatch is not the main cause. Keeping the shared
+   layer frozen for all 20 epochs lowers digtime variance but hurts validation,
+   timing_ctrl, and array transfer. The shared layer therefore needs short
+   warmup followed by controlled adaptation. Unfreezing now preserves existing
+   downstream Adam state, and eval/dropout mode can be controlled independently
+   with `--partial_shared_backbone_eval_policy`. The next comparison is corrected
+   freeze2/freeze3 MSE under `frozen_only` versus `always`, before S6 or more
+   rebalancing experiments.
 6. Only after the compact reuse architecture is stable, compare:
 
 ```text
