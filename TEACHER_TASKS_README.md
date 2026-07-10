@@ -430,9 +430,13 @@ partial_shared_k1 + gate + freeze2 + BMC: Val 0.0098; digtime/timing_ctrl/array 
    timing_ctrl, and array transfer. The shared layer therefore needs short
    warmup followed by controlled adaptation. Unfreezing now preserves existing
    downstream Adam state, and eval/dropout mode can be controlled independently
-   with `--partial_shared_backbone_eval_policy`. The next comparison is corrected
-   freeze2/freeze3 MSE under `frozen_only` versus `always`, before S6 or more
-   rebalancing experiments.
+   with `--partial_shared_backbone_eval_policy`. The corrected freeze3 MSE
+   comparison is now complete for seeds 0/1/2. `frozen_only` is more stable
+   than `always` on digtime and transfers better to array, but neither policy
+   closes the gap to `static + MSE`. Optimizer reset and eval/dropout coupling
+   were real experimental confounds, not the sole cause of the reuse gap; the
+   next architecture work should focus on partial-sharing/fusion and controlled
+   supervised adaptation before adding more rebalancing branches.
 6. Only after the compact reuse architecture is stable, compare:
 
 ```text

@@ -1269,7 +1269,55 @@ Conclusions:
   unlikely as the primary cause. The remaining high-value variables are the
   optimizer reset (now fixed), the dropout/eval transition, and the destructive
   full-gate fusion of intermediate GCL features with circuit statistics.
-- The next controlled experiment should rerun short freeze2/freeze3 MSE with
-  the corrected optimizer and compare `frozen_only` against `always` eval
-  policy. Do not add BMC/GAI or a new architecture until that comparison shows
-  whether optimizer-state preservation and dropout control recover stability.
+- This motivated a corrected freeze3 MSE rerun with `frozen_only` versus
+  `always` eval policy. The completed comparison is recorded below.
+
+#### Corrected Freeze3 Optimizer and Eval-Policy Sweep
+
+This sweep used `partial_shared_k1 + gate + freeze3 + MSE` for seeds 0, 1,
+and 2. At epoch 3, all six logs contain the new
+`Added partial-shared backbone to the existing optimizer` message and none
+contains the old optimizer-rebuild path. Thus the gate/tail/head Adam state is
+preserved in every run.
+
+```text
+log root: logs/freeze3_optimizer_eval_multiseed_gpu_20260710
+partial_shared_backbone_eval_policy: frozen_only / always
+seeds: 0, 1, 2
+epochs: 20
+loss: MSE
+```
+
+| Eval policy | Seed | Best epoch | Val MSE/loss | digtime MSE | timing_ctrl MSE | array MSE | Run directory |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| frozen_only | 0 | 18 | 0.0101 / 0.01009078 | 0.0157 | 0.0128 | 0.0125 | `logs/freeze3_optimizer_eval_multiseed_gpu_20260710/frozen_only_seed0` |
+| frozen_only | 1 | 19 | 0.0102 / 0.01024406 | 0.0161 | 0.0130 | 0.0119 | `logs/freeze3_optimizer_eval_multiseed_gpu_20260710/frozen_only_seed1` |
+| frozen_only | 2 | 18 | 0.0104 / 0.01041682 | 0.0163 | 0.0126 | 0.0120 | `logs/freeze3_optimizer_eval_multiseed_gpu_20260710/frozen_only_seed2` |
+| always | 0 | 18 | 0.0100 / 0.01004581 | 0.0140 | 0.0128 | 0.0139 | `logs/freeze3_optimizer_eval_multiseed_gpu_20260710/always_seed0` |
+| always | 1 | 15 | 0.0101 / 0.01012399 | 0.0189 | 0.0126 | 0.0129 | `logs/freeze3_optimizer_eval_multiseed_gpu_20260710/always_seed1` |
+| always | 2 | 18 | 0.0103 / 0.01031581 | 0.0148 | 0.0124 | 0.0132 | `logs/freeze3_optimizer_eval_multiseed_gpu_20260710/always_seed2` |
+
+Population mean and standard deviation over the three seeds:
+
+| Mode | Val MSE mean +/- std | digtime mean +/- std | timing_ctrl mean +/- std | array mean +/- std |
+| --- | ---: | ---: | ---: | ---: |
+| static + MSE | 0.009833 +/- 0.000094 | 0.014300 +/- 0.000374 | 0.011867 +/- 0.000205 | 0.011267 +/- 0.000125 |
+| old freeze3 + MSE (optimizer reset) | 0.010067 +/- 0.000170 | 0.015033 +/- 0.001040 | 0.012433 +/- 0.000205 | 0.012567 +/- 0.000525 |
+| corrected freeze3 + MSE, frozen_only | 0.010233 +/- 0.000125 | 0.016033 +/- 0.000249 | 0.012800 +/- 0.000163 | 0.012133 +/- 0.000262 |
+| corrected freeze3 + MSE, always | 0.010133 +/- 0.000125 | 0.015900 +/- 0.002146 | 0.012600 +/- 0.000163 | 0.013333 +/- 0.000419 |
+| freeze_all + MSE | 0.010267 +/- 0.000094 | 0.015100 +/- 0.000141 | 0.012933 +/- 0.000236 | 0.014367 +/- 0.000680 |
+
+Conclusions:
+
+- Preserving Adam state fixes an implementation confound, but it does not
+  recover the static baseline. Neither corrected policy improves the overall
+  mean relative to the old freeze3 result.
+- `frozen_only` is the more stable corrected policy. It has much lower digtime
+  variance than `always` and better array mean, although `always` is slightly
+  better on validation and timing_ctrl means.
+- Keeping the shared backbone in eval mode after unfreezing is not a general
+  solution: `always` produces a large digtime seed-1 failure and the worst
+  digtime variance in this comparison.
+- The original `static + MSE` remains best on validation and all three transfer
+  means. The remaining limitation is therefore in partial-sharing/fusion and
+  supervised adaptation, not just optimizer reset or train/eval coupling.
