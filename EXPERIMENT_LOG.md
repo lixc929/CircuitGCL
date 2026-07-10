@@ -1321,3 +1321,116 @@ Conclusions:
 - The original `static + MSE` remains best on validation and all three transfer
   means. The remaining limitation is therefore in partial-sharing/fusion and
   supervised adaptation, not just optimizer reset or train/eval coupling.
+
+### S5.6 Isolated Artifacts and Representation-Drift Audit
+
+#### Run Artifact Isolation
+
+Parallel runs no longer write to the shared
+`downstream_model/model_<epoch>-<loss>.pth` path. Each timestamped log now owns
+a sibling artifact directory containing:
+
+```text
+run_config.json   exact args, command, Git commit, host, PID, timestamps/status
+best_model.pt     model state, optimizer state, best epoch, args, and metrics
+metrics.json      machine-readable best validation and named test results
+representation_audit.jsonl  optional fixed-batch audit records
+```
+
+Writes use temporary files plus `os.replace`, and successful or failed
+downstream exits finalize `run_config.json`. This removes checkpoint collisions
+between parallel seeds and makes the trained model tied to each reported row
+recoverable.
+
+#### RNG-Neutral Freeze3 Audit
+
+The audit captures one fixed source-validation batch and one fixed batch from
+each transfer circuit. Python, NumPy, CPU Torch, and all CUDA RNG states are
+restored immediately after batch capture, so enabling the audit does not alter
+the subsequent sampling trajectory. A frozen copy of the initialized shared
+backbone is the reference.
+
+```text
+mode: partial_shared_k1 + gate + freeze3 + frozen_only + MSE
+seed: 0
+GPU: 3
+Git commit: 2db823ea3259360574ffa9ad2f943ba03de9b6da
+log root: logs/freeze3_representation_audit_seed0_rng_neutral_gpu3_20260710
+artifact: 20260710_234609_870963_edge_regression_..._artifacts
+```
+
+The run reproduces the corrected seed-0 row: best epoch 18, validation
+MSE/loss `0.0101 / 0.01008070`, and test MSE
+`0.0157 / 0.0129 / 0.0124` for digtime/timing_ctrl/array.
+
+Source-validation representation trajectory:
+
+| Epoch | State | Root cosine | Root relative L2 | Weight relative L2 | Gate mean | Shared norm |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| -1 | initialized | 1.0000 | 0.0000 | 0.0000 | 0.4946 | 5.8288 |
+| 2 | last frozen epoch | 1.0000 | 0.0000 | 0.0000 | 0.4849 | 5.8288 |
+| 3 | first unfrozen epoch | 0.9562 | 0.2893 | 0.0148 | 0.4557 | 5.3747 |
+| 4 | second unfrozen epoch | 0.9038 | 0.4116 | 0.0225 | 0.4458 | 4.9926 |
+| 10 | adapted | 0.7716 | 0.6266 | 0.0392 | 0.4351 | 3.9163 |
+| 18 | best checkpoint epoch | 0.5923 | 0.8087 | 0.0637 | 0.4374 | 3.0268 |
+| 19 | final epoch | 0.5540 | 0.8332 | 0.0659 | 0.4378 | 2.9328 |
+
+At best epoch 18, root cosine is `0.5923 / 0.5793 / 0.5920 / 0.5955`
+for source_val/digtime/timing_ctrl/array. Gate values do not collapse: mean is
+about `0.43-0.44`, no values exceed `0.9`, and at most `0.24%` fall below
+`0.1` at epoch 18. The shared-feature norm falls from about `5.8` to `3.0`
+while statistics norms remain about `4.0-4.5`.
+
+Conclusion: the dominant observed failure is rapid shared-representation drift
+after unfreezing, not gate saturation. A small parameter displacement
+(`6.37%` relative L2 at the best epoch) changes root representation direction
+substantially. This supports adding an explicit GCL/teacher constraint to the
+single deployment backbone instead of continuing freeze or eval-policy sweeps.
+
+### S6 Joint Shared Backbone: Implementation and Smoke Test
+
+Implemented `--sgrl_mode joint_shared` with this training/deployment split:
+
+```text
+node type embedding + alpha * statistics embedding (alpha initialized to 0)
+  -> complete two-layer shared GNN initialized from the online encoder
+  -> supervised edge head
+
+training only:
+  shared representation -> predictor -> EMA target alignment loss
+
+L_total = L_supervised + joint_gcl_lambda * L_gcl
+```
+
+The zero-initialized signed statistics scale preserves the pretrained GCL path
+exactly at initialization. The EMA target receives no gradients and is updated
+after optimizer steps. Target and predictor are omitted from deployment
+parameter accounting.
+
+One-epoch GPU smoke test:
+
+```text
+mode: joint_shared
+joint_shared_gnn_layers: 2
+joint_gcl_lambda: 0.01
+seed: 0
+Git commit: 67851dada10bfe73b534732290bda3a38f2787d3
+log root: logs/joint_shared_lambda001_smoke_seed0_gpu3_20260711
+```
+
+| Check | Result |
+| --- | --- |
+| Complete online layer load | 13 tensors / 17,665 values copied |
+| Training parameters | 58,628 total / 37,699 trainable |
+| Deployment parameters | 29,378 |
+| Epoch-0 GCL loss | 0.41444825 |
+| Learned online stats scale | -0.006521 |
+| EMA target stats scale | -0.003833 |
+| Artifact status | completed; checkpoint/config/metrics present |
+
+The smoke result (Val MSE `0.0146`) is not an accuracy comparison after only
+one epoch. It verifies full-data loading, supervised plus GCL backward,
+predictor optimization, EMA update, compact deployment accounting, and
+isolated checkpoint recovery. The next controlled experiments are the same
+architecture with `joint_gcl_lambda = 0, 0.01, 0.05, 0.1` on seed 0; only the
+best candidate should advance to seeds 1/2. Rebalancing remains paused.

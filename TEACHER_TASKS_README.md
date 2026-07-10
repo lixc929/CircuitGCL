@@ -136,7 +136,7 @@ Use the current `test` branch for all implementation and experiment commits. Do 
 | S3. Online feature finetuning | Done | Check whether supervised gradients should update the online encoder. | Added `--sgrl_mode online_feature_finetune`; use separate optimizer groups with lower online-encoder LR. | `online_feature_frozen` vs `online_feature_finetune` |
 | S4. Parameter initialization reuse | Done | Reuse GCL online encoder weights to initialize compatible downstream layers. | Added `init_reuse`; copied only matching tensors, logged skipped keys, and recorded parameter counts. | compact `no-GCL/static/init_reuse + MSE`, all GPU verified |
 | S5. Partial shared backbone | Done for current round | Share early/lower GNN layers while keeping task-specific later layers/head. | Added `partial_shared`, `SharedGNNBackbone`, and `PartialSharedGraphHead`; full `k1 + gate` is the best reuse path tested but remains behind static in multi-seed transfer. S5.5 now preserves optimizer state on unfreeze and separates eval mode from gradient freezing. | `init_reuse` vs `partial_shared_k1/k2/gate/freeze/slim_gate` |
-| S6. Joint shared backbone | Pending | Train one online backbone with both GCL and supervised losses. | Optimize `L = L_supervised + lambda_gcl * L_gcl`; target encoder remains EMA/stop-gradient. | `partial_shared` vs `joint_shared` |
+| S6. Joint shared backbone | Implemented; accuracy sweep pending | Train one online backbone with both GCL and supervised losses. | Added `joint_shared`: complete two-layer online initialization, zero-init statistics residual, supervised head, predictor, and stop-gradient EMA target. Deployment keeps only one 29,378-parameter backbone/head. | `joint_shared lambda=0/0.01/0.05/0.1` |
 | S7. Label rebalancing integration | Current sweep done | Test whether rebalancing helps after reuse is architecturally correct. | Ran GAI/BMC on `gate+freeze3`, `vector_gate+freeze3`, and `gate+freeze2`; single-seed gains did not close the static gap in the multi-seed audit. | best reuse + `MSE/GAI/BMC` |
 
 ### 4.3 First Implementation Target
@@ -437,6 +437,24 @@ partial_shared_k1 + gate + freeze2 + BMC: Val 0.0098; digtime/timing_ctrl/array 
    were real experimental confounds, not the sole cause of the reuse gap; the
    next architecture work should focus on partial-sharing/fusion and controlled
    supervised adaptation before adding more rebalancing branches.
+
+   The RNG-neutral representation audit now localizes the main instability.
+   The shared root cosine stays at `1.0` through frozen epoch 2, falls to
+   `0.9562` immediately after epoch-3 unfreezing, and reaches `0.5923` at the
+   best epoch 18. Shared feature norm falls from `5.83` to `3.03`, while the
+   full gate remains unsaturated near mean `0.44`. The problem is therefore
+   rapid supervised representation drift, not a gate collapsing to 0 or 1.
+   Full records and the recoverable checkpoint are under the matching
+   timestamped artifact directory documented in `EXPERIMENT_LOG.md`.
+
+   S6 is now implemented as one complete two-layer deployment backbone. Both
+   layers load online-encoder weights; circuit statistics enter through a
+   signed residual scale initialized to zero; and training can add
+   `joint_gcl_lambda * L_gcl` against a stop-gradient EMA target. The target
+   and predictor are training-only, leaving `29,378` deployment parameters.
+   A one-epoch `lambda=0.01` GPU smoke test completed with joint backward, EMA
+   updates, and isolated artifacts. It is not yet an accuracy result. Run the
+   lambda controls on seed 0 before any multi-seed or rebalancing expansion.
 6. Only after the compact reuse architecture is stable, compare:
 
 ```text
