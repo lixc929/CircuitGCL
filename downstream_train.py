@@ -1,3 +1,6 @@
+import copy
+import json
+
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import (
@@ -11,6 +14,7 @@ import time
 from tqdm import tqdm
 from model import (
     GraphHead,
+    JointSharedGraphHead,
     OnlineFeatureGraphHead,
     PartialSharedGraphHead,
     SgrlBackboneHead,
@@ -19,6 +23,8 @@ from sampling import dataset_sampling
 from balanced_mse import GAILoss, BMCLoss, BNILoss, train_gmm, WeightedMSE, get_lds_weights, BalancedSoftmax, FocalLoss, compute_class_weights
 import os
 import matplotlib.pyplot as plt
+
+from run_artifacts import save_best_checkpoint, write_run_metrics
 
 # from torch.utils.data.sampler import SubsetRandomSampler
 # from sram_dataset import LinkPredictionDataset
@@ -273,6 +279,141 @@ def maybe_unfreeze_partial_shared_backbone(args, model, optimizer, epoch):
         optimizer.zero_grad()
     return optimizer
 
+
+def _partial_shared_weight_drift(model, reference_backbone):
+    squared_delta = 0.0
+    squared_reference = 0.0
+    for current, reference in zip(
+        model.shared_backbone.parameters(),
+        reference_backbone.parameters(),
+    ):
+        current_value = current.detach().float()
+        reference_value = reference.detach().float()
+        squared_delta += torch.sum(
+            (current_value - reference_value).pow(2)
+        ).item()
+        squared_reference += torch.sum(reference_value.pow(2)).item()
+    return (squared_delta ** 0.5) / max(squared_reference ** 0.5, 1e-12)
+
+
+def build_partial_shared_audit_context(
+        args, model, val_loader, test_loaders, device):
+    if not (
+        getattr(args, 'partial_shared_audit', 0)
+        and has_partial_shared_backbone(args, model)
+    ):
+        return None
+
+    reference_backbone = copy.deepcopy(model.shared_backbone).to(device)
+    reference_backbone.eval()
+    for parameter in reference_backbone.parameters():
+        parameter.requires_grad = False
+
+    fixed_batches = {'source_val': next(iter(val_loader)).cpu()}
+    for test_name, loader in test_loaders.items():
+        fixed_batches[test_name] = next(iter(loader)).cpu()
+
+    audit_path = os.path.join(
+        args.run_artifact_dir,
+        'representation_audit.jsonl',
+    )
+    print(
+        'Partial-shared representation audit enabled: '
+        f'splits={list(fixed_batches)}, output={audit_path}'
+    )
+    return {
+        'reference_backbone': reference_backbone,
+        'fixed_batches': fixed_batches,
+        'device': device,
+        'path': audit_path,
+    }
+
+
+@torch.no_grad()
+def record_partial_shared_representation_audit(
+        args, model, context, epoch):
+    if context is None:
+        return []
+
+    current_training = model.shared_backbone.training
+    model.shared_backbone.eval()
+    reference_backbone = context['reference_backbone']
+    reference_backbone.eval()
+    weight_relative_l2 = _partial_shared_weight_drift(
+        model,
+        reference_backbone,
+    )
+    records = []
+
+    for split, cpu_batch in context['fixed_batches'].items():
+        batch = cpu_batch.clone().to(context['device'])
+        current_x = model.shared_backbone(batch)
+        reference_x = reference_backbone(batch)
+
+        if args.task_level == 'edge':
+            root_count = 2 * batch.edge_label.size(0)
+        else:
+            root_count = getattr(batch, 'batch_size', batch.num_nodes)
+
+        current_root = current_x[:root_count]
+        reference_root = reference_x[:root_count]
+        difference = current_root - reference_root
+        cosine = F.cosine_similarity(
+            current_root,
+            reference_root,
+            dim=-1,
+            eps=1e-12,
+        )
+        relative_l2 = difference.norm(dim=-1) / reference_root.norm(
+            dim=-1
+        ).clamp_min(1e-12)
+
+        stats_x = model._encode_stats(batch) if model.use_stats else None
+        fused_x = model._fuse_stats(current_x, batch)
+        record = {
+            'epoch': epoch,
+            'split': split,
+            'root_count': int(root_count),
+            'weight_relative_l2': weight_relative_l2,
+            'root_cosine_mean': cosine.mean().item(),
+            'root_cosine_p05': torch.quantile(cosine, 0.05).item(),
+            'root_relative_l2_mean': relative_l2.mean().item(),
+            'root_mse': difference.pow(2).mean().item(),
+            'shared_norm_mean': current_root.norm(dim=-1).mean().item(),
+            'fused_norm_mean': fused_x[:root_count].norm(dim=-1).mean().item(),
+        }
+
+        if stats_x is not None:
+            stats_root = stats_x[:root_count]
+            record['stats_norm_mean'] = stats_root.norm(dim=-1).mean().item()
+
+        if model.stats_fusion in ['gate', 'residual_gate']:
+            gate = model.stats_gate(
+                torch.cat((current_x, stats_x), dim=1)
+            )[:root_count]
+            record.update({
+                'gate_mean': gate.mean().item(),
+                'gate_std': gate.std(unbiased=False).item(),
+                'gate_below_0_1': (gate < 0.1).float().mean().item(),
+                'gate_above_0_9': (gate > 0.9).float().mean().item(),
+            })
+
+        records.append(record)
+        print(
+            'Representation audit '
+            f"epoch={epoch} split={split} "
+            f"cos={record['root_cosine_mean']:.6f} "
+            f"rel_l2={record['root_relative_l2_mean']:.6f} "
+            f"weight_rel_l2={weight_relative_l2:.6f}"
+        )
+
+    with open(context['path'], 'a', encoding='utf-8') as output:
+        for record in records:
+            output.write(json.dumps(record, sort_keys=True) + '\n')
+
+    model.shared_backbone.train(current_training)
+    return records
+
 def regress_train(args, regressor, optimizier, criterion,
           train_loader, val_loader, test_loaders, max_label,
           device):
@@ -294,6 +435,19 @@ def regress_train(args, regressor, optimizier, criterion,
         'best_val_mse': 1e9, 'best_val_loss': 1e9, 
         'best_epoch': 0, 'test_results': []
     }
+    audit_context = build_partial_shared_audit_context(
+        args,
+        regressor,
+        val_loader,
+        test_loaders,
+        device,
+    )
+    record_partial_shared_representation_audit(
+        args,
+        regressor,
+        audit_context,
+        epoch=-1,
+    )
     
     for epoch in range(args.epochs):
         optimizier = maybe_unfreeze_partial_shared_backbone(
@@ -302,27 +456,61 @@ def regress_train(args, regressor, optimizier, criterion,
         logger = Logger(task=args.task, max_label=max_label)
         regressor.train()
         apply_partial_shared_backbone_eval_policy(args, regressor, epoch)
+        joint_gcl_total = 0.0
+        joint_gcl_batches = 0
 
         for i, batch in enumerate(tqdm(train_loader, desc=f'Epoch:{epoch}')):
             optimizier.zero_grad()
+            batch = batch.to(device)
 
             ## Get the prediction from the model
-            y_pred,y_class, y = regressor(batch.to(device))
-            loss, pred, true = compute_loss(args, y_pred, y, criterion=criterion)
+            if getattr(args, 'use_sgrl_joint_shared', 0):
+                y_pred, y_class, y, online_x = regressor(
+                    batch,
+                    return_backbone=True,
+                )
+            else:
+                y_pred, y_class, y = regressor(batch)
+                online_x = None
+            supervised_loss, pred, true = compute_loss(
+                args,
+                y_pred,
+                y,
+                criterion=criterion,
+            )
+            loss = supervised_loss
+            if (
+                getattr(args, 'use_sgrl_joint_shared', 0)
+                and args.joint_gcl_lambda > 0.0
+            ):
+                joint_gcl_loss = regressor.gcl_loss(batch, online_x=online_x)
+                loss = supervised_loss + args.joint_gcl_lambda * joint_gcl_loss
+                joint_gcl_total += joint_gcl_loss.detach().item()
+                joint_gcl_batches += 1
             _true = true.detach().to('cpu', non_blocking=True)
             _pred = y_pred.detach().to('cpu', non_blocking=True)
 
             loss.backward()
             optimizier.step()
+            if (
+                getattr(args, 'use_sgrl_joint_shared', 0)
+                and args.joint_gcl_lambda > 0.0
+            ):
+                regressor.update_target_backbone()
             
             ## Update the logger and print message to the screen
             logger.update_stats(
                 true=_true, pred=_pred, 
                 batch_size=_true.squeeze().size(0), 
-                loss=loss.detach().cpu().item()
+                loss=supervised_loss.detach().cpu().item()
             )
 
         logger.write_epoch(split='train')
+        if joint_gcl_batches:
+            print(
+                f'joint_gcl epoch={epoch} lambda={args.joint_gcl_lambda} '
+                f'loss={joint_gcl_total / joint_gcl_batches:.8f}'
+            )
         ## ========== validation ========== ##
         val_res = eval_epoch(
             args, val_loader, 
@@ -336,6 +524,7 @@ def regress_train(args, regressor, optimizier, criterion,
             best_results['best_epoch'] = epoch
         
             test_results = []
+            test_results_by_name = {}
            
             ## ========== testing on other datasets ========== ##
             for test_name in test_loaders.keys():
@@ -345,16 +534,61 @@ def regress_train(args, regressor, optimizier, criterion,
                     criterion=criterion
                 )
                 test_results.append(res)
-            os.makedirs("downstream_model", exist_ok=True)
-            torch.save(regressor.state_dict(), f"downstream_model/model_{epoch}-{args.regress_loss}.pth")
+                test_results_by_name[test_name] = res
+
+            best_results['test_results'] = test_results
+            best_results['test_results_by_name'] = test_results_by_name
+            artifact_metrics = {
+                'status': 'running',
+                'task': args.task,
+                'loss': args.regress_loss,
+                'joint_gcl_lambda': getattr(args, 'joint_gcl_lambda', 0.0),
+                'best_epoch': best_results['best_epoch'],
+                'best_val_mse': best_results['best_val_mse'],
+                'best_val_loss': best_results['best_val_loss'],
+                'test_results': test_results_by_name,
+            }
+            checkpoint_path = save_best_checkpoint(
+                args,
+                regressor,
+                optimizier,
+                epoch,
+                artifact_metrics,
+            )
+            artifact_metrics['best_checkpoint'] = str(checkpoint_path)
+            write_run_metrics(args, artifact_metrics)
+            print(f"Saved isolated best checkpoint to {checkpoint_path}")
 
         if best_results['best_epoch'] == epoch:
             best_results['test_results'] = test_results
+
+        record_partial_shared_representation_audit(
+            args,
+            regressor,
+            audit_context,
+            epoch=epoch,
+        )
 
         print( "=====================================")
         print(f" Best epoch: {best_results['best_epoch']}, mse: {best_results['best_val_mse']}, loss: {best_results['best_val_loss']}")
         print(f" Test results: {[res for res in best_results['test_results']]}")
         print( "=====================================")
+
+    final_metrics = {
+        'status': 'completed',
+        'task': args.task,
+        'loss': args.regress_loss,
+        'joint_gcl_lambda': getattr(args, 'joint_gcl_lambda', 0.0),
+        'best_epoch': best_results['best_epoch'],
+        'best_val_mse': best_results['best_val_mse'],
+        'best_val_loss': best_results['best_val_loss'],
+        'test_results': best_results.get('test_results_by_name', {}),
+        'best_checkpoint': str(
+            os.path.join(args.run_artifact_dir, 'best_model.pt')
+        ),
+    }
+    write_run_metrics(args, final_metrics)
+    return best_results
 
 def class_train(args, classifier,optimizer_classifier, 
           train_loader, val_loader, test_loaders, max_label,
@@ -476,6 +710,13 @@ def class_train(args, classifier,optimizer_classifier,
 
 
 def build_downstream_model(args, sgrl_online_state=None):
+    if getattr(args, 'use_sgrl_joint_shared', 0):
+        model = JointSharedGraphHead(args)
+        if sgrl_online_state is None:
+            raise ValueError("SGRL joint-shared mode requires an online encoder state_dict.")
+        model.load_online_encoder_state(sgrl_online_state)
+        return model
+
     if getattr(args, 'use_sgrl_partial_shared', 0):
         model = PartialSharedGraphHead(args)
         if sgrl_online_state is None:
@@ -525,6 +766,12 @@ def print_parameter_summary(model):
         "Model parameters: "
         f"total={total:,}, trainable={trainable:,}, frozen={frozen:,}."
     )
+    if hasattr(model, 'deployment_parameter_count'):
+        deployment = model.deployment_parameter_count()
+        print(
+            'Deployment parameters: '
+            f'total={deployment:,}; target backbone and predictor are training-only.'
+        )
 
     child_summaries = []
     for name, child in model.named_children():

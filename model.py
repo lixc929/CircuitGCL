@@ -1,3 +1,5 @@
+import copy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -458,10 +460,12 @@ class OnlineFeatureGraphHead(nn.Module):
 class SharedGNNBackbone(nn.Module):
     """Lower SGRL online encoder layers reused as a shared downstream backbone."""
 
-    def __init__(self, args):
+    def __init__(self, args, num_layers=None):
         super().__init__()
         self.hidden_dim = args.cl_hid_dim
-        self.shared_layers = args.shared_gnn_layers
+        self.shared_layers = (
+            args.shared_gnn_layers if num_layers is None else num_layers
+        )
         self.model = args.cl_model
 
         if self.shared_layers < 0:
@@ -572,7 +576,7 @@ class SharedGNNBackbone(nn.Module):
             )
             print(f"Partial shared skipped preview: {preview}")
 
-    def forward(self, batch):
+    def encode_inputs(self, batch):
         node_type = batch.node_type.view(-1).long()
         x = self.node_type_embed(node_type)
 
@@ -580,6 +584,10 @@ class SharedGNNBackbone(nn.Module):
         if hasattr(batch, 'edge_type'):
             edge_type = batch.edge_type.view(-1).long()
             edge_attr = self.edge_type_embed(edge_type)
+
+        return x, edge_attr
+
+    def propagate(self, x, edge_attr, batch):
 
         for conv in self.layers:
             if self.model == 'gine' or self.model == 'resgatedgcn':
@@ -596,6 +604,183 @@ class SharedGNNBackbone(nn.Module):
                 x = F.dropout(x, p=self.drop_out, training=self.training)
 
         return x
+
+    def forward(self, batch):
+        x, edge_attr = self.encode_inputs(batch)
+        return self.propagate(x, edge_attr, batch)
+
+
+class JointSharedEncoder(nn.Module):
+    """Two-layer deployment encoder shared by GCL and supervision."""
+
+    def __init__(self, args):
+        super().__init__()
+        self.hidden_dim = args.cl_hid_dim
+        self.gnn = SharedGNNBackbone(
+            args,
+            num_layers=args.joint_shared_gnn_layers,
+        )
+        self.use_stats = bool(args.use_stats)
+        if self.use_stats:
+            self.net_attr_layers = nn.Linear(17, self.hidden_dim, bias=True)
+            self.dev_attr_layers = nn.Linear(17, self.hidden_dim, bias=True)
+            self.pin_attr_layers = nn.Embedding(17, self.hidden_dim)
+            self.stats_residual_scale = nn.Parameter(torch.zeros(1))
+
+    def load_online_encoder_state(self, online_state_dict):
+        self.gnn.load_online_encoder_state(online_state_dict)
+
+    def _encode_stats(self, batch):
+        node_type = batch.node_type.view(-1)
+        net_node_mask = node_type == NET
+        dev_node_mask = node_type == DEV
+        pin_node_mask = node_type == PIN
+        stats_x = torch.zeros(
+            (batch.num_nodes, self.hidden_dim),
+            device=batch.node_attr.device,
+        )
+        stats_x[net_node_mask] = self.net_attr_layers(
+            batch.node_attr[net_node_mask]
+        )
+        stats_x[dev_node_mask] = self.dev_attr_layers(
+            batch.node_attr[dev_node_mask]
+        )
+        stats_x[pin_node_mask] = self.pin_attr_layers(
+            batch.node_attr[pin_node_mask, 0].long()
+        )
+        return stats_x
+
+    def forward(self, batch):
+        x, edge_attr = self.gnn.encode_inputs(batch)
+        if self.use_stats:
+            x = x + self.stats_residual_scale * self._encode_stats(batch)
+        return self.gnn.propagate(x, edge_attr, batch)
+
+
+class JointSharedGraphHead(nn.Module):
+    """One deployment backbone optimized by supervised and GCL losses."""
+
+    def __init__(self, args):
+        super().__init__()
+        self.shared_backbone = JointSharedEncoder(args)
+        self.target_backbone = copy.deepcopy(self.shared_backbone)
+        for parameter in self.target_backbone.parameters():
+            parameter.requires_grad = False
+        self.target_backbone.eval()
+
+        hidden_dim = args.cl_hid_dim
+        self.predictor = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.PReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.target_momentum = args.momentum
+        self.task = args.task
+        self.task_level = args.task_level
+        self.net_only = args.net_only
+        self.src_dst_agg = args.src_dst_agg
+        self.num_classes = args.num_classes
+        self.class_boundaries = args.class_boundaries
+
+        if self.src_dst_agg == 'pooladd':
+            self.pooling_fun = pygnn.pool.global_add_pool
+        elif self.src_dst_agg == 'poolmean':
+            self.pooling_fun = pygnn.pool.global_mean_pool
+
+        head_input_dim = (
+            hidden_dim * 2
+            if self.src_dst_agg == 'concat' and self.task_level == 'edge'
+            else hidden_dim
+        )
+        dim_out = 1 if self.task == 'regression' else args.num_classes
+        self.head_layers = MLP(
+            in_channels=head_input_dim,
+            hidden_channels=hidden_dim,
+            out_channels=dim_out,
+            num_layers=args.num_head_layers,
+            use_bn=False,
+            dropout=0.0,
+            activation=args.act_fn,
+        )
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.target_backbone.eval()
+        return self
+
+    def load_online_encoder_state(self, online_state_dict):
+        self.shared_backbone.load_online_encoder_state(online_state_dict)
+        self.target_backbone.load_state_dict(self.shared_backbone.state_dict())
+        self.target_backbone.eval()
+        print(
+            'Loaded complete online GNN into joint shared online/EMA backbones '
+            f'(layers={len(self.shared_backbone.gnn.layers)}, '
+            'stats_residual_scale=0).'
+        )
+
+    @torch.no_grad()
+    def update_target_backbone(self):
+        for target, online in zip(
+            self.target_backbone.parameters(),
+            self.shared_backbone.parameters(),
+        ):
+            target.data.mul_(self.target_momentum).add_(
+                online.data,
+                alpha=1.0 - self.target_momentum,
+            )
+
+    def gcl_loss(self, batch, online_x=None):
+        if online_x is None:
+            online_x = self.shared_backbone(batch)
+        online_prediction = self.predictor(online_x)
+        with torch.no_grad():
+            target_x = self.target_backbone(batch)
+        online_prediction = F.normalize(online_prediction, dim=-1, p=2)
+        target_x = F.normalize(target_x, dim=-1, p=2)
+        return 1.0 - (online_prediction * target_x).sum(dim=-1).mean()
+
+    def deployment_parameter_count(self):
+        return sum(
+            parameter.numel()
+            for module in [self.shared_backbone, self.head_layers]
+            for parameter in module.parameters()
+        )
+
+    def _predict(self, x, batch):
+        if self.task_level == 'node':
+            if self.net_only:
+                net_node_mask = batch.node_type.view(-1) == NET
+                pred = self.head_layers(x[net_node_mask])
+                true_class = batch.y[:, 1][net_node_mask].long()
+                true_label = batch.y[net_node_mask]
+            else:
+                pred = self.head_layers(x)
+                true_class = batch.y[:, 1].long()
+                true_label = batch.y
+        elif self.task_level == 'edge':
+            if self.src_dst_agg[:4] == 'pool':
+                graph_emb = self.pooling_fun(x, batch.batch)
+            else:
+                batch_size = batch.edge_label.size(0)
+                src_emb = x[:batch_size]
+                dst_emb = x[batch_size:batch_size * 2]
+                if self.src_dst_agg == 'concat':
+                    graph_emb = torch.cat((src_emb, dst_emb), dim=1)
+                else:
+                    graph_emb = src_emb + dst_emb
+            pred = self.head_layers(graph_emb)
+            true_class = batch.edge_label[:, 1].long()
+            true_label = batch.edge_label
+        else:
+            raise ValueError(f'Invalid task level: {self.task_level}')
+        return pred, true_class, true_label
+
+    def forward(self, batch, return_backbone=False):
+        x = self.shared_backbone(batch)
+        prediction = self._predict(x, batch)
+        if return_backbone:
+            return (*prediction, x)
+        return prediction
 
 
 class PartialSharedGraphHead(nn.Module):

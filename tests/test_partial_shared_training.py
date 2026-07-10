@@ -1,12 +1,17 @@
 import unittest
+import copy
+import json
+import tempfile
 from types import SimpleNamespace
 
 import torch
+from torch_geometric.data import Data
 
 from downstream_train import (
     apply_partial_shared_backbone_eval_policy,
     build_optimizer,
     maybe_unfreeze_partial_shared_backbone,
+    record_partial_shared_representation_audit,
     set_partial_shared_backbone_trainable,
 )
 
@@ -19,6 +24,35 @@ class DummyPartialSharedModel(torch.nn.Module):
             torch.nn.Dropout(0.5),
         )
         self.head = torch.nn.Linear(2, 1)
+
+
+class DummyAuditBackbone(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(2, 2, bias=False)
+
+    def forward(self, batch):
+        return self.linear(batch.audit_x)
+
+
+class DummyAuditModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.shared_backbone = DummyAuditBackbone()
+        self.use_stats = True
+        self.stats_fusion = 'gate'
+        self.stats_gate = torch.nn.Sequential(
+            torch.nn.Linear(4, 2),
+            torch.nn.Sigmoid(),
+        )
+
+    def _encode_stats(self, batch):
+        return batch.audit_stats
+
+    def _fuse_stats(self, x, batch):
+        stats_x = self._encode_stats(batch)
+        gate = self.stats_gate(torch.cat((x, stats_x), dim=1))
+        return gate * x + (1.0 - gate) * stats_x
 
 
 def make_args(**overrides):
@@ -97,6 +131,44 @@ class PartialSharedTrainingTest(unittest.TestCase):
             apply_partial_shared_backbone_eval_policy(args, model, epoch=2)
         )
         self.assertTrue(model.shared_backbone.training)
+
+    def test_representation_audit_records_drift_and_gate_statistics(self):
+        model = DummyAuditModel()
+        reference = copy.deepcopy(model.shared_backbone)
+        batch = Data(
+            audit_x=torch.tensor([
+                [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 1.0],
+            ]),
+            audit_stats=torch.ones(4, 2),
+            edge_label=torch.tensor([[0.2, 1.0], [0.6, 3.0]]),
+        )
+        args = make_args(task_level='edge')
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            audit_path = f'{temporary_dir}/representation_audit.jsonl'
+            context = {
+                'reference_backbone': reference,
+                'fixed_batches': {'source_val': batch},
+                'device': torch.device('cpu'),
+                'path': audit_path,
+            }
+            initial = record_partial_shared_representation_audit(
+                args, model, context, epoch=-1
+            )[0]
+            self.assertAlmostEqual(initial['root_cosine_mean'], 1.0, places=6)
+            self.assertAlmostEqual(initial['weight_relative_l2'], 0.0, places=6)
+            self.assertIn('gate_mean', initial)
+
+            with torch.no_grad():
+                model.shared_backbone.linear.weight.add_(0.5)
+            changed = record_partial_shared_representation_audit(
+                args, model, context, epoch=0
+            )[0]
+            self.assertGreater(changed['weight_relative_l2'], 0.0)
+
+            with open(audit_path, encoding='utf-8') as audit_file:
+                lines = [json.loads(line) for line in audit_file]
+            self.assertEqual(len(lines), 2)
 
 
 if __name__ == '__main__':

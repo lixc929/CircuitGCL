@@ -9,6 +9,8 @@ from sgrl_train import sgrl_train
 import datetime
 import sys
 
+from run_artifacts import prepare_run_artifacts
+
 if __name__ == "__main__":
     # STEP 0: Parse Arguments ======================================================================= #
     parser = argparse.ArgumentParser(description="CircuitGCL")
@@ -50,6 +52,7 @@ if __name__ == "__main__":
             'online_feature_finetune',
             'init_reuse',
             'partial_shared',
+            'joint_shared',
         ],
         help=(
             "How to use SGRL downstream. "
@@ -63,7 +66,9 @@ if __name__ == "__main__":
             "'init_reuse' initializes compatible original GraphHead parameters from "
             "the online encoder and then trains a single downstream GraphHead; "
             "'partial_shared' reuses the online encoder's lower GNN layers as a "
-            "shared downstream backbone and keeps task-specific downstream tail/head."
+            "shared downstream backbone and keeps task-specific downstream tail/head; "
+            "'joint_shared' trains one complete deployment backbone with supervised "
+            "and optional EMA-target GCL losses."
         ),
     )
     parser.add_argument(
@@ -117,6 +122,28 @@ if __name__ == "__main__":
             "window; 'always' keeps it in eval mode throughout downstream training "
             "while still allowing gradients after unfreezing."
         ),
+    )
+    parser.add_argument(
+        '--partial_shared_audit',
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            'Record fixed-batch representation drift and statistics-fusion '
+            'diagnostics for partial_shared runs.'
+        ),
+    )
+    parser.add_argument(
+        '--joint_shared_gnn_layers',
+        type=int,
+        default=2,
+        help='Number of GNN layers in the single joint-shared deployment backbone.',
+    )
+    parser.add_argument(
+        '--joint_gcl_lambda',
+        type=float,
+        default=0.0,
+        help='Weight of the EMA-target GCL loss in joint_shared mode.',
     )
     parser.add_argument(
         '--sgrl_reuse_stats',
@@ -202,6 +229,7 @@ if __name__ == "__main__":
     args.use_sgrl_backbone = int(args.sgrl == 1 and args.sgrl_mode in ['init', 'freeze'])
     args.use_sgrl_graph_init = int(args.sgrl == 1 and args.sgrl_mode == 'init_reuse')
     args.use_sgrl_partial_shared = int(args.sgrl == 1 and args.sgrl_mode == 'partial_shared')
+    args.use_sgrl_joint_shared = int(args.sgrl == 1 and args.sgrl_mode == 'joint_shared')
     args.use_sgrl_online_features = int(
         args.sgrl == 1
         and args.sgrl_mode in ['online_feature', 'online_feature_finetune']
@@ -211,6 +239,16 @@ if __name__ == "__main__":
         args.sgrl == 1
         and args.sgrl_mode in ['static', 'online_feature', 'online_feature_finetune']
     )
+    if args.use_sgrl_joint_shared:
+        if args.task != 'regression':
+            raise ValueError('joint_shared currently supports regression tasks only.')
+        if args.joint_shared_gnn_layers > args.cl_gnn_layers:
+            raise ValueError(
+                '--joint_shared_gnn_layers cannot exceed --cl_gnn_layers '
+                f'({args.joint_shared_gnn_layers} > {args.cl_gnn_layers}).'
+            )
+        if args.joint_gcl_lambda < 0.0:
+            raise ValueError('--joint_gcl_lambda must be non-negative.')
 
     # Syncronize all random seeds
     random.seed(args.seed)
@@ -224,11 +262,12 @@ if __name__ == "__main__":
     # create log file
     if not os.path.exists(args.log_dir):
         os.makedirs(args.log_dir, exist_ok=True)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     if args.task == 'classification':
         log_filename = os.path.join(args.log_dir, f"{timestamp}_{args.task_level}_{args.task}_{args.dataset}_loss{args.class_loss}_batch{args.batch_size}.txt")
     else: # regression task
         log_filename = os.path.join(args.log_dir, f"{timestamp}_{args.task_level}_{args.task}_{args.dataset}_loss{args.regress_loss}_batch{args.batch_size}.txt")
+    prepare_run_artifacts(args, log_filename)
     log_file = open(log_filename, 'w')
     
     # Redirect standard output to both file and console
