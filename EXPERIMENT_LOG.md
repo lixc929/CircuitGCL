@@ -1593,3 +1593,80 @@ least 8 GB free and utilization is at most 80%, so no external process is
 stopped and two CircuitGCL runs are never placed on the same GPU concurrently.
 P3 rank/layer screening starts only after this queue identifies the best P2
 optimization setting; P4 multi-seed and P5 rebalancing remain gated on P3.
+
+### Pre-Registered P2-P5 Selection and Reporting Rules
+
+These rules were fixed before observing any corrected P1/P2 result:
+
+1. P2 selects `joint_backbone_lr` using seed-0 source-validation raw MSE only.
+   Transfer-circuit metrics and representations are not selection criteria.
+2. If two P2 candidates differ by at most `2e-5` raw validation MSE, prefer the
+   candidate with lower source-validation base-representation drift at the
+   restored best checkpoint.
+3. P3 applies the selected P2 optimization setting to LoRA rank `4/8/16` and
+   GNN layer `0/1`. It again selects on source-validation raw MSE only. Within
+   `2e-5`, prefer the lower rank because it uses fewer train-time adapter values;
+   merged deployment size is unchanged.
+4. P4 compares `static`, `init_reuse`, best-LoRA `lambda=0`, and best-LoRA
+   positive lambda on paired seeds `0-4`. Report population mean/std and paired
+   candidate-minus-static differences. No method is dropped because of one
+   transfer circuit after the matrix begins.
+5. P5 keeps the P4 architecture fixed and compares MSE/GAI/BMC. Primary
+   selection remains source-validation raw MSE. Overall and ten fixed label-bin
+   MSE/MAE/bias are reported for validation and every transfer circuit so tail
+   improvements cannot be hidden by aggregate MSE.
+
+Protocol tooling:
+
+- `scripts/summarize_experiments.py` reads isolated JSON artifacts, selects one
+  canonical completed artifact per scientific configuration and seed, detects
+  duplicate/missing/inconsistent runs, and computes grouped and paired stats.
+- `--joint_shared_audit 1` records source-validation base/task drift every five
+  epochs. Transfer representations are recorded only after restoring the best
+  checkpoint.
+- `scripts/audit_label_distribution.py` records fixed-bin circuit label
+  distributions, source-to-target Jensen-Shannon shift, source-tail coverage,
+  and optional binned prediction errors without requiring a GPU.
+
+#### CPU Label-Distribution and Artifact Audit
+
+The pre-P5 CPU audit used the same normalized edge labels as downstream
+training. Outputs are under `logs/label_distribution_audit_20260711`.
+
+| Circuit | Labels | Mean | Std | Q10 | Median | Q90 | 10-bin JS from SSRAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ssram | 175,413 | 0.5716 | 0.1472 | 0.3677 | 0.6086 | 0.7234 | 0.0000 |
+| digtime | 2,814 | 0.5644 | 0.1448 | 0.3301 | 0.5892 | 0.7236 | 0.0186 |
+| timing_ctrl | 3,333 | 0.6374 | 0.1777 | 0.3612 | 0.6388 | 0.8575 | 0.0787 |
+| array_128_32_8t | 73,569 | 0.5691 | 0.1412 | 0.3897 | 0.6063 | 0.7250 | 0.0093 |
+
+Relative to SSRAM's Q10/Q90, `12.19%/10.80%` of digtime labels fall below/above
+the thresholds, `10.11%/31.59%` of timing_ctrl labels do so, and
+`9.30%/14.40%` of array labels do so. Timing control therefore has the largest
+and most asymmetric label shift, concentrated in the high-label region. This
+supports reporting fixed-bin errors in P5 and helps explain why timing_ctrl has
+been the most sensitive transfer circuit. It does not by itself prove that
+reweighting will improve timing_ctrl, because covariate/graph shift remains.
+
+The generic artifact audit found 14 selected S5/S6 artifacts: 13 completed and
+one stale `running` record from the interrupted non-LoRA lambda-0.05 run. Six
+artifacts were marked anomalous because LoRA lambda-0.05 seeds 1/2 were each
+launched three times. The summarizer keeps one canonical completed artifact per
+scientific configuration and seed, so duplicates do not enter group means.
+
+#### Rebalancing Protocol Corrections Before P5
+
+Three additional issues were corrected before running P5:
+
+- GAI's GMM now reads source circuit labels only. The old function fitted only
+  on source labels but still inspected transfer labels to print KL diagnostics.
+  Distribution comparison is now an explicit offline audit instead of a
+  training-time test-label access.
+- Each GAI run writes its GMM inside its isolated artifact directory using an
+  atomic replacement, eliminating the shared `pkl/gmm/gmm.pkl` race between
+  parallel seeds.
+- GAI/BMC/BNI `noise_sigma` parameters now enter the task-learning-rate optimizer
+  group and their criterion state is saved/restored with the best checkpoint.
+  Earlier local GAI/BMC results used a fixed initial sigma despite the parameter
+  being declared trainable; they remain measurements of that fixed-sigma
+  implementation but are not the final paper-faithful P5 comparison.

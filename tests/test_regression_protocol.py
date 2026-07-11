@@ -12,6 +12,7 @@ from downstream_train import (
     regress_train,
     validation_improved,
 )
+from balanced_mse import BMCLoss
 from model import JointSharedGraphHead
 from run_artifacts import prepare_run_artifacts
 from test_joint_shared import make_args
@@ -62,7 +63,8 @@ class RegressionProtocolTest(unittest.TestCase):
         }
         model.load_online_encoder_state(encoder_state)
 
-        optimizer = build_optimizer(args, model)
+        criterion = BMCLoss(init_noise_sigma=0.2, device='cpu')
+        optimizer = build_optimizer(args, model, criterion=criterion)
         groups_by_lr = {
             group['lr']: {id(parameter) for parameter in group['params']}
             for group in optimizer.param_groups
@@ -84,6 +86,15 @@ class RegressionProtocolTest(unittest.TestCase):
         self.assertTrue(lora_ids <= groups_by_lr[1e-4])
         self.assertTrue(base_ids <= groups_by_lr[1e-5])
         self.assertTrue(lora_ids.isdisjoint(groups_by_lr[1e-5]))
+        self.assertIn(id(criterion.noise_sigma), groups_by_lr[1e-4])
+        sigma_before = criterion.noise_sigma.detach().clone()
+        optimizer.zero_grad()
+        criterion(
+            torch.tensor([[0.1], [0.8]]),
+            torch.tensor([[0.2], [0.7]]),
+        ).backward()
+        optimizer.step()
+        self.assertFalse(torch.equal(sigma_before, criterion.noise_sigma))
 
     def test_transfer_sets_are_evaluated_once_after_best_reload(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -116,6 +127,8 @@ class RegressionProtocolTest(unittest.TestCase):
                 splits.append(split)
                 if split == 'val':
                     return next(validation_results)
+                if split == 'val:best':
+                    return {'loss': 0.1, 'mse': 0.1, 'mse_raw': 0.1}
                 return {'loss': 0.3, 'mse': 0.3, 'mse_raw': 0.3}
 
             with patch('downstream_train.eval_epoch', side_effect=fake_eval):
@@ -131,7 +144,10 @@ class RegressionProtocolTest(unittest.TestCase):
                     device=torch.device('cpu'),
                 )
 
-            self.assertEqual(splits, ['val', 'val', 'test:target'])
+            self.assertEqual(
+                splits,
+                ['val', 'val', 'val:best', 'test:target'],
+            )
             self.assertEqual(results['best_epoch'], 0)
             checkpoint = torch.load(
                 Path(args.run_artifact_dir) / 'best_model.pt',
@@ -145,6 +161,10 @@ class RegressionProtocolTest(unittest.TestCase):
             self.assertEqual(
                 checkpoint['metrics']['test_results']['target']['mse_raw'],
                 0.3,
+            )
+            self.assertEqual(
+                checkpoint['metrics']['validation_results']['mse_raw'],
+                0.1,
             )
 
 

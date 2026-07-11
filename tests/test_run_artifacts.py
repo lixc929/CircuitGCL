@@ -24,6 +24,7 @@ class RunArtifactsTest(unittest.TestCase):
             artifact_dir = prepare_run_artifacts(args, root / 'run_a.txt')
 
             model = torch.nn.Linear(2, 1)
+            criterion = torch.nn.PReLU(init=0.25)
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
             loss = model(torch.ones(1, 2)).sum()
             loss.backward()
@@ -35,6 +36,7 @@ class RunArtifactsTest(unittest.TestCase):
                 optimizer,
                 epoch=3,
                 metrics={'best_val_mse': 0.1},
+                criterion=criterion,
             )
             write_run_metrics(args, {'status': 'completed'})
             finalize_run_artifacts(args, status='completed')
@@ -53,10 +55,15 @@ class RunArtifactsTest(unittest.TestCase):
 
             with torch.no_grad():
                 model.weight.add_(10.0)
-            load_best_checkpoint(args, model)
+                criterion.weight.fill_(2.0)
+            load_best_checkpoint(args, model, criterion=criterion)
             self.assertTrue(torch.equal(
                 model.weight,
                 checkpoint['model_state_dict']['weight'],
+            ))
+            self.assertTrue(torch.equal(
+                criterion.weight,
+                checkpoint['criterion_state_dict']['weight'],
             ))
 
             updated_metrics = {

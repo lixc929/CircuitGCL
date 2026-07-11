@@ -1,4 +1,6 @@
 import copy
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 
@@ -6,6 +8,10 @@ import torch
 from torch_geometric.data import Data
 
 from model import JointSharedGraphHead, MergeableLoRALinear
+from downstream_train import (
+    build_joint_shared_audit_context,
+    record_joint_shared_representation_audit,
+)
 
 
 def make_args(**overrides):
@@ -31,6 +37,9 @@ def make_args(**overrides):
         'class_boundaries': [0.2, 0.4, 0.6, 0.8],
         'num_head_layers': 2,
         'act_fn': 'prelu',
+        'use_sgrl_joint_shared': 1,
+        'joint_shared_audit': 0,
+        'joint_shared_audit_interval': 5,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -189,6 +198,60 @@ class JointSharedTest(unittest.TestCase):
         self.assertTrue(torch.allclose(first_base, second_base, atol=1e-7))
         self.assertFalse(torch.allclose(first_task, second_task))
         self.assertFalse(torch.allclose(first_task, first_base))
+
+    def test_joint_audit_defers_transfer_until_best_checkpoint(self):
+        model = self.make_lora_model(rank=2)
+        args = make_args(
+            joint_lora_rank=2,
+            joint_shared_audit=1,
+            joint_shared_audit_interval=2,
+        )
+        source = make_batch()
+        transfer = make_batch()
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            args.run_artifact_dir = temporary_dir
+            context = build_joint_shared_audit_context(
+                args,
+                model,
+                [source],
+                {'transfer': [transfer]},
+                torch.device('cpu'),
+            )
+            initial = record_joint_shared_representation_audit(
+                args, model, context, epoch=-1
+            )
+            with torch.no_grad():
+                next(model.shared_backbone.gnn.parameters()).add_(0.01)
+                for module in model.shared_backbone._lora_modules():
+                    module.lora_b.weight.fill_(0.02)
+            skipped = record_joint_shared_representation_audit(
+                args, model, context, epoch=1
+            )
+            trained = record_joint_shared_representation_audit(
+                args, model, context, epoch=2
+            )
+            final = record_joint_shared_representation_audit(
+                args,
+                model,
+                context,
+                epoch=2,
+                phase='best',
+                force=True,
+            )
+
+            self.assertEqual([row['split'] for row in initial], ['source_val'])
+            self.assertEqual(skipped, [])
+            self.assertEqual([row['split'] for row in trained], ['source_val'])
+            self.assertEqual(
+                {row['split'] for row in final},
+                {'source_val', 'transfer'},
+            )
+            self.assertGreater(trained[0]['base_weight_relative_l2'], 0.0)
+            self.assertGreater(trained[0]['lora_relative_delta'], 0.0)
+            audit_path = Path(temporary_dir) / (
+                'joint_shared_representation_audit.jsonl'
+            )
+            self.assertEqual(len(audit_path.read_text().splitlines()), 4)
 
 
 if __name__ == '__main__':

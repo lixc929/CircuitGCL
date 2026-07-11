@@ -52,6 +52,8 @@ COMMON_ARGS=(
     --epochs 80
     --early_stopping_patience 12
     --early_stopping_min_delta 1e-6
+    --joint_shared_audit 1
+    --joint_shared_audit_interval 5
     --batch_size 512
     --lr 0.0001
     --sgrl 1
@@ -66,6 +68,12 @@ COMMON_ARGS=(
     --regress_loss mse
     --seed 0
 )
+
+summarize_available_runs() {
+    "${PYTHON_BIN}" scripts/summarize_experiments.py \
+        "${LOG_ROOT}" \
+        --output_dir "${LOG_ROOT}" || true
+}
 
 run_experiment() {
     local lane="$1"
@@ -111,6 +119,7 @@ case "${lane}" in
             --sgrl_mode joint_shared --joint_shared_gnn_layers 2 \
             --joint_lora_rank 8 --joint_lora_layer -1 \
             --joint_gcl_lambda 0 --joint_backbone_lr 1e-5 --hid_dim 64
+        summarize_available_runs
         status "${lane}" "queue_finished"
         ;;
     gpu4)
@@ -126,6 +135,7 @@ case "${lane}" in
             --sgrl_mode joint_shared --joint_shared_gnn_layers 2 \
             --joint_lora_rank 8 --joint_lora_layer -1 \
             --joint_gcl_lambda 0.05 --joint_backbone_lr 1e-5 --hid_dim 64
+        summarize_available_runs
         status "${lane}" "queue_finished"
         ;;
     *)

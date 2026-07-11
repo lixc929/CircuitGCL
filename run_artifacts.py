@@ -80,7 +80,8 @@ def _state_to_cpu(value):
     return value
 
 
-def save_best_checkpoint(args, model, optimizer, epoch, metrics):
+def save_best_checkpoint(
+        args, model, optimizer, epoch, metrics, criterion=None):
     artifact_dir = Path(args.run_artifact_dir)
     checkpoint_path = artifact_dir / 'best_model.pt'
     temporary_path = artifact_dir / 'best_model.pt.tmp'
@@ -92,12 +93,17 @@ def save_best_checkpoint(args, model, optimizer, epoch, metrics):
         'model_state_dict': _state_to_cpu(model.state_dict()),
         'optimizer_state_dict': _state_to_cpu(optimizer.state_dict()),
     }
+    if criterion is not None and hasattr(criterion, 'state_dict'):
+        payload['criterion_state_dict'] = _state_to_cpu(
+            criterion.state_dict()
+        )
     torch.save(payload, temporary_path)
     os.replace(temporary_path, checkpoint_path)
     return checkpoint_path
 
 
-def load_best_checkpoint(args, model, map_location='cpu'):
+def load_best_checkpoint(
+        args, model, map_location='cpu', criterion=None):
     checkpoint_path = Path(args.run_artifact_dir) / 'best_model.pt'
     checkpoint = torch.load(
         checkpoint_path,
@@ -105,6 +111,8 @@ def load_best_checkpoint(args, model, map_location='cpu'):
         weights_only=True,
     )
     model.load_state_dict(checkpoint['model_state_dict'])
+    if criterion is not None and 'criterion_state_dict' in checkpoint:
+        criterion.load_state_dict(checkpoint['criterion_state_dict'])
     return checkpoint
 
 

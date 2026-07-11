@@ -73,37 +73,27 @@ def kl_divergence(p: torch.Tensor, q: torch.Tensor, bins: int = 10,
     
     return kl
 
-def train_gmm(dataset):
+def train_gmm(dataset, output_path='pkl/gmm/gmm.pkl'):
     start = time.time()
     graph_idx = 0
     train_labels = dataset[graph_idx].edge_label
     if train_labels.ndim == 2:
         train_labels = train_labels[:, 0]
 
-    for i in range(graph_idx+1, len(dataset.names)):
-        test_labels = dataset[i].edge_label
-        if test_labels.ndim == 2:
-            test_labels = test_labels[:, 0]
-        # Compute KL divergence and save histograms
-        kl_value = kl_divergence(
-            test_labels, train_labels, bins=20, 
-            save_path=f"logs/{dataset.names[i]}_distribution_comparison.png"
-        )
-        print(f"KL Divergence for {dataset.names[i]}: {kl_value:.4f}")
-
     print('Training labels curated')
     print('Fitting GMM...')
-    gmm = GaussianMixture(n_components=8, random_state=0, verbose=2).fit(
+    gmm = GaussianMixture(n_components=8, random_state=0).fit(
         train_labels.reshape(-1, 1).cpu().numpy())
     
     gmm_dict = {}
     gmm_dict['means'] = gmm.means_
     gmm_dict['weights'] = gmm.weights_
     gmm_dict['variances'] = gmm.covariances_
-    gmm_path = 'pkl/gmm/gmm.pkl'
+    gmm_path = output_path
     os.makedirs(os.path.dirname(gmm_path), exist_ok=True)
-
-    joblib.dump(gmm_dict, gmm_path)
+    temporary_path = f'{gmm_path}.tmp'
+    joblib.dump(gmm_dict, temporary_path)
+    os.replace(temporary_path, gmm_path)
 
     elapsed = time.time() - start
     timestr = time.strftime('%H:%M:%S', time.gmtime(elapsed))

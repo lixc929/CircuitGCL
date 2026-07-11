@@ -109,11 +109,50 @@ class Logger (object):
                 'mse_raw': mse_raw,
                 'rmse': reformat(root_mean_squared_error(true, pred_score)),
                 'r2': reformat(r2_score(true, pred_score)),
+                'label_bin_metrics': regression_bin_metrics(true, pred_score),
             }
 
         # Just print the results to screen
-        print(split, res)
+        printable = {
+            key: value for key, value in res.items()
+            if key != 'label_bin_metrics'
+        }
+        print(split, printable)
         return res
+
+
+def regression_bin_metrics(true, prediction, bin_edges=None):
+    true = np.asarray(true, dtype=np.float64).reshape(-1)
+    prediction = np.asarray(prediction, dtype=np.float64).reshape(-1)
+    if true.shape != prediction.shape:
+        raise ValueError('True and predicted regression values must have equal shape.')
+    if bin_edges is None:
+        bin_edges = np.linspace(0.0, 1.0, 11)
+    bin_edges = np.asarray(bin_edges, dtype=np.float64)
+    records = []
+    for index, (lower, upper) in enumerate(zip(bin_edges[:-1], bin_edges[1:])):
+        mask = (true >= lower) & (
+            true <= upper if index == len(bin_edges) - 2 else true < upper
+        )
+        count = int(mask.sum())
+        record = {
+            'lower': float(lower),
+            'upper': float(upper),
+            'count': count,
+            'fraction': float(count / max(true.size, 1)),
+            'mse': None,
+            'mae': None,
+            'bias': None,
+        }
+        if count:
+            error = prediction[mask] - true[mask]
+            record.update({
+                'mse': float(np.mean(error ** 2)),
+                'mae': float(np.mean(np.abs(error))),
+                'bias': float(np.mean(error)),
+            })
+        records.append(record)
+    return records
 
 def compute_loss(args, pred, true, criterion):
     """Compute loss and prediction score. 
@@ -298,11 +337,15 @@ def maybe_unfreeze_partial_shared_backbone(args, model, optimizer, epoch):
 
 
 def _partial_shared_weight_drift(model, reference_backbone):
+    return _module_weight_drift(model.shared_backbone, reference_backbone)
+
+
+def _module_weight_drift(current_module, reference_module):
     squared_delta = 0.0
     squared_reference = 0.0
     for current, reference in zip(
-        model.shared_backbone.parameters(),
-        reference_backbone.parameters(),
+        current_module.parameters(),
+        reference_module.parameters(),
     ):
         current_value = current.detach().float()
         reference_value = reference.detach().float()
@@ -313,19 +356,7 @@ def _partial_shared_weight_drift(model, reference_backbone):
     return (squared_delta ** 0.5) / max(squared_reference ** 0.5, 1e-12)
 
 
-def build_partial_shared_audit_context(
-        args, model, val_loader, test_loaders, device):
-    if not (
-        getattr(args, 'partial_shared_audit', 0)
-        and has_partial_shared_backbone(args, model)
-    ):
-        return None
-
-    reference_backbone = copy.deepcopy(model.shared_backbone).to(device)
-    reference_backbone.eval()
-    for parameter in reference_backbone.parameters():
-        parameter.requires_grad = False
-
+def _capture_fixed_audit_batches(val_loader, test_loaders):
     python_rng_state = random.getstate()
     numpy_rng_state = np.random.get_state()
     torch_rng_state = torch.get_rng_state()
@@ -342,6 +373,23 @@ def build_partial_shared_audit_context(
         torch.set_rng_state(torch_rng_state)
         if cuda_rng_states is not None:
             torch.cuda.set_rng_state_all(cuda_rng_states)
+    return fixed_batches
+
+
+def build_partial_shared_audit_context(
+        args, model, val_loader, test_loaders, device):
+    if not (
+        getattr(args, 'partial_shared_audit', 0)
+        and has_partial_shared_backbone(args, model)
+    ):
+        return None
+
+    reference_backbone = copy.deepcopy(model.shared_backbone).to(device)
+    reference_backbone.eval()
+    for parameter in reference_backbone.parameters():
+        parameter.requires_grad = False
+
+    fixed_batches = _capture_fixed_audit_batches(val_loader, test_loaders)
 
     audit_path = os.path.join(
         args.run_artifact_dir,
@@ -444,6 +492,165 @@ def record_partial_shared_representation_audit(
     model.shared_backbone.train(current_training)
     return records
 
+
+def build_joint_shared_audit_context(
+        args, model, val_loader, test_loaders, device):
+    if not (
+        getattr(args, 'joint_shared_audit', 0)
+        and getattr(args, 'use_sgrl_joint_shared', 0)
+        and hasattr(model, 'shared_backbone')
+    ):
+        return None
+
+    reference_backbone = copy.deepcopy(model.shared_backbone).to(device)
+    reference_backbone.eval()
+    for parameter in reference_backbone.parameters():
+        parameter.requires_grad = False
+    fixed_batches = _capture_fixed_audit_batches(val_loader, test_loaders)
+    audit_path = os.path.join(
+        args.run_artifact_dir,
+        'joint_shared_representation_audit.jsonl',
+    )
+    print(
+        'Joint-shared representation audit enabled: '
+        f'source_interval={args.joint_shared_audit_interval}, '
+        f'final_splits={list(fixed_batches)}, output={audit_path}'
+    )
+    return {
+        'reference_backbone': reference_backbone,
+        'fixed_batches': fixed_batches,
+        'device': device,
+        'path': audit_path,
+    }
+
+
+def _joint_lora_delta_summary(backbone):
+    squared_delta = 0.0
+    squared_base = 0.0
+    modules = backbone._lora_modules() if hasattr(backbone, '_lora_modules') else []
+    for module in modules:
+        delta = module.scaling * (
+            module.lora_b.weight.detach().float()
+            @ module.lora_a.weight.detach().float()
+        )
+        base = module.base.weight.detach().float()
+        squared_delta += delta.square().sum().item()
+        squared_base += base.square().sum().item()
+    delta_norm = squared_delta ** 0.5
+    base_norm = squared_base ** 0.5
+    return {
+        'lora_modules': len(modules),
+        'lora_delta_norm': delta_norm,
+        'lora_base_weight_norm': base_norm,
+        'lora_relative_delta': delta_norm / max(base_norm, 1e-12),
+    }
+
+
+def _joint_base_weight_drift(current_gnn, reference_gnn):
+    reference_parameters = dict(reference_gnn.named_parameters())
+    squared_delta = 0.0
+    squared_reference = 0.0
+    for name, current in current_gnn.named_parameters():
+        if '.lora_a.' in name or '.lora_b.' in name:
+            continue
+        reference = reference_parameters[name]
+        current_value = current.detach().float()
+        reference_value = reference.detach().float()
+        squared_delta += (current_value - reference_value).square().sum().item()
+        squared_reference += reference_value.square().sum().item()
+    return (squared_delta ** 0.5) / max(squared_reference ** 0.5, 1e-12)
+
+
+@torch.no_grad()
+def record_joint_shared_representation_audit(
+        args, model, context, epoch, phase='train', force=False):
+    if context is None:
+        return []
+    interval = getattr(args, 'joint_shared_audit_interval', 5)
+    if not force and epoch >= 0 and epoch % interval != 0:
+        return []
+
+    current_training = model.shared_backbone.training
+    model.shared_backbone.eval()
+    reference = context['reference_backbone']
+    reference.eval()
+    base_weight_drift = _joint_base_weight_drift(
+        model.shared_backbone.gnn,
+        reference.gnn,
+    )
+    lora_summary = _joint_lora_delta_summary(model.shared_backbone)
+    split_names = (
+        list(context['fixed_batches'])
+        if phase == 'best'
+        else ['source_val']
+    )
+    records = []
+    for split in split_names:
+        batch = context['fixed_batches'][split].clone().to(context['device'])
+        current_base = model.shared_backbone(batch, task_path=False)
+        reference_base = reference(batch, task_path=False)
+        current_task = model.shared_backbone(batch, task_path=True)
+        root_count = (
+            2 * batch.edge_label.size(0)
+            if args.task_level == 'edge'
+            else getattr(batch, 'batch_size', batch.num_nodes)
+        )
+        current_base = current_base[:root_count]
+        reference_base = reference_base[:root_count]
+        current_task = current_task[:root_count]
+        base_delta = current_base - reference_base
+        task_delta = current_task - current_base
+        base_relative_l2 = base_delta.norm(dim=-1) / reference_base.norm(
+            dim=-1
+        ).clamp_min(1e-12)
+        task_relative_l2 = task_delta.norm(dim=-1) / current_base.norm(
+            dim=-1
+        ).clamp_min(1e-12)
+        record = {
+            'epoch': epoch,
+            'phase': phase,
+            'split': split,
+            'root_count': int(root_count),
+            'base_weight_relative_l2': base_weight_drift,
+            'base_cosine_to_initial': F.cosine_similarity(
+                current_base,
+                reference_base,
+                dim=-1,
+                eps=1e-12,
+            ).mean().item(),
+            'base_relative_l2_to_initial': base_relative_l2.mean().item(),
+            'task_cosine_to_base': F.cosine_similarity(
+                current_task,
+                current_base,
+                dim=-1,
+                eps=1e-12,
+            ).mean().item(),
+            'task_relative_l2_to_base': task_relative_l2.mean().item(),
+            'base_norm_mean': current_base.norm(dim=-1).mean().item(),
+            'task_norm_mean': current_task.norm(dim=-1).mean().item(),
+            'stats_residual_scale': (
+                model.shared_backbone.stats_residual_scale.item()
+                if hasattr(model.shared_backbone, 'stats_residual_scale')
+                else None
+            ),
+            **lora_summary,
+        }
+        records.append(record)
+        print(
+            'Joint-shared audit '
+            f'phase={phase} epoch={epoch} split={split} '
+            f"base_cos={record['base_cosine_to_initial']:.6f} "
+            f"base_weight_rel_l2={base_weight_drift:.6f} "
+            f"task_base_rel_l2={record['task_relative_l2_to_base']:.6f} "
+            f"lora_rel={record['lora_relative_delta']:.6f}"
+        )
+
+    with open(context['path'], 'a', encoding='utf-8') as output:
+        for record in records:
+            output.write(json.dumps(record, sort_keys=True) + '\n')
+    model.shared_backbone.train(current_training)
+    return records
+
 def regress_train(args, regressor, optimizier, criterion,
           train_loader, val_loader, test_loaders, max_label,
           device):
@@ -480,6 +687,19 @@ def regress_train(args, regressor, optimizier, criterion,
         args,
         regressor,
         audit_context,
+        epoch=-1,
+    )
+    joint_audit_context = build_joint_shared_audit_context(
+        args,
+        regressor,
+        val_loader,
+        test_loaders,
+        device,
+    )
+    record_joint_shared_representation_audit(
+        args,
+        regressor,
+        joint_audit_context,
         epoch=-1,
     )
     
@@ -577,6 +797,7 @@ def regress_train(args, regressor, optimizier, criterion,
                 optimizier,
                 epoch,
                 artifact_metrics,
+                criterion=criterion,
             )
             artifact_metrics['best_checkpoint'] = str(checkpoint_path)
             write_run_metrics(args, artifact_metrics)
@@ -588,6 +809,12 @@ def regress_train(args, regressor, optimizier, criterion,
             args,
             regressor,
             audit_context,
+            epoch=epoch,
+        )
+        record_joint_shared_representation_audit(
+            args,
+            regressor,
+            joint_audit_context,
             epoch=epoch,
         )
 
@@ -607,10 +834,31 @@ def regress_train(args, regressor, optimizier, criterion,
             break
 
     checkpoint_path = os.path.join(args.run_artifact_dir, 'best_model.pt')
-    load_best_checkpoint(args, regressor, map_location=device)
+    load_best_checkpoint(
+        args,
+        regressor,
+        map_location=device,
+        criterion=criterion,
+    )
     print(
         f"Loaded best checkpoint from epoch {best_results['best_epoch']} "
         'for final transfer evaluation.'
+    )
+    record_joint_shared_representation_audit(
+        args,
+        regressor,
+        joint_audit_context,
+        epoch=best_results['best_epoch'],
+        phase='best',
+        force=True,
+    )
+    best_validation_result = eval_epoch(
+        args,
+        val_loader,
+        regressor,
+        device,
+        split='val:best',
+        criterion=criterion,
     )
     test_results = []
     test_results_by_name = {}
@@ -636,6 +884,7 @@ def regress_train(args, regressor, optimizier, criterion,
         'best_epoch': best_results['best_epoch'],
         'best_val_mse': best_results['best_val_mse'],
         'best_val_loss': best_results['best_val_loss'],
+        'validation_results': best_validation_result,
         'test_results': test_results_by_name,
         'best_checkpoint': checkpoint_path,
     }
@@ -843,14 +1092,19 @@ def print_parameter_summary(model):
         print("Top-level parameter summary: " + "; ".join(child_summaries))
 
 
-def build_optimizer(args, model):
+def build_optimizer(args, model, criterion=None):
+    criterion_params = (
+        trainable_parameters(criterion)
+        if criterion is not None and hasattr(criterion, 'parameters')
+        else []
+    )
     joint_backbone_lr = getattr(args, 'joint_backbone_lr', None)
     if (
         getattr(args, 'use_sgrl_joint_shared', 0)
         and joint_backbone_lr is not None
     ):
         base_backbone_params = []
-        task_params = []
+        task_params = list(criterion_params)
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
@@ -888,7 +1142,7 @@ def build_optimizer(args, model):
         downstream_params = [
             param for name, param in model.named_parameters()
             if param.requires_grad and not name.startswith('shared_backbone.')
-        ]
+        ] + criterion_params
         print(
             "Using separate optimizer groups for partial-shared backbone "
             f"(backbone_lr={partial_shared_backbone_lr}, "
@@ -912,7 +1166,7 @@ def build_optimizer(args, model):
         downstream_params = [
             param for name, param in model.named_parameters()
             if param.requires_grad and not name.startswith('online_encoder.')
-        ]
+        ] + criterion_params
         print(
             "Using separate optimizer groups for online feature finetuning "
             f"(online_lr={args.sgrl_online_lr}, downstream_lr={args.lr})."
@@ -925,7 +1179,10 @@ def build_optimizer(args, model):
             lr=args.lr,
         )
 
-    return torch.optim.Adam(trainable_parameters(model), lr=args.lr)
+    return torch.optim.Adam(
+        trainable_parameters(model) + criterion_params,
+        lr=args.lr,
+    )
 
 
 def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=None):
@@ -955,7 +1212,10 @@ def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=No
     if args.task == 'regression':
         # set the loss function for regression
         if args.regress_loss == 'gai':
-            gmm_path = train_gmm(dataset)
+            gmm_path = train_gmm(
+                dataset,
+                output_path=os.path.join(args.run_artifact_dir, 'gmm.pkl'),
+            )
             criterion = GAILoss(init_noise_sigma=args.noise_sigma, gmm=gmm_path, device=device)
         elif args.regress_loss == 'bmc':
             criterion = BMCLoss(init_noise_sigma=args.noise_sigma, device=device)
@@ -983,7 +1243,7 @@ def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=No
         if getattr(args, 'partial_shared_freeze_epochs', 0) > 0:
             set_partial_shared_backbone_trainable(args, model, False)
         print_parameter_summary(model)
-        optimizier = build_optimizer(args, model)
+        optimizier = build_optimizer(args, model, criterion=criterion)
         
         regress_train(args, model, optimizier, criterion,
               train_loader, val_loader, test_loaders, max_label,

@@ -167,6 +167,23 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        '--joint_shared_audit',
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            'Record fixed-batch base/task representation drift for '
+            'joint_shared runs. Transfer representations are evaluated only '
+            'after the best checkpoint is restored.'
+        ),
+    )
+    parser.add_argument(
+        '--joint_shared_audit_interval',
+        type=int,
+        default=5,
+        help='Epoch interval for source-validation joint_shared audit records.',
+    )
+    parser.add_argument(
         '--joint_lora_rank',
         type=int,
         default=0,
@@ -304,6 +321,8 @@ if __name__ == "__main__":
         raise ValueError('--early_stopping_patience must be non-negative.')
     if args.early_stopping_min_delta < 0.0:
         raise ValueError('--early_stopping_min_delta must be non-negative.')
+    if args.joint_shared_audit_interval <= 0:
+        raise ValueError('--joint_shared_audit_interval must be positive.')
 
     # Syncronize all random seeds
     random.seed(args.seed)

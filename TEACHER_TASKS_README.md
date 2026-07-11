@@ -139,6 +139,18 @@ Use the current `test` branch for all implementation and experiment commits. Do 
 | S6. Joint shared backbone | P0 fixed; P1/P2 queued | Train one online backbone with both GCL and supervised losses. | Added `joint_shared`, mergeable LoRA, raw-MSE checkpoint selection, final-only transfer evaluation, and an independent base-GNN learning rate. Earlier LoRA results remain exploratory until the corrected 80-epoch queue finishes. | P1 fair convergence, then P2 low backbone LR |
 | S7. Label rebalancing integration | Current sweep done | Test whether rebalancing helps after reuse is architecturally correct. | Ran GAI/BMC on `gate+freeze3`, `vector_gate+freeze3`, and `gate+freeze2`; single-seed gains did not close the static gap in the multi-seed audit. | best reuse + `MSE/GAI/BMC` |
 
+P2-P5 selection is pre-registered in `EXPERIMENT_LOG.md`: P2/P3 use only raw
+source-validation MSE, P4 uses paired seeds 0-4, and P5 reports fixed-bin tail
+errors in addition to aggregate MSE. Transfer-circuit metrics do not choose
+P2/P3 candidates.
+
+The CPU label audit shows that timing_ctrl has the largest target-label shift
+from SSRAM (10-bin Jensen-Shannon `0.0787`; `31.59%` of labels above the SSRAM
+Q90), while digtime and array shifts are `0.0186` and `0.0093`. P5 will report
+ten fixed label-bin errors. GAI training now fits a run-isolated GMM from source
+labels only, and trainable GAI/BMC noise parameters are included in the
+optimizer and best checkpoint.
+
 ### 4.3 First Implementation Target
 
 The S2 implementation target was:
