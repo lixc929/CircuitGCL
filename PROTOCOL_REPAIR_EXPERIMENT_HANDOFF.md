@@ -464,6 +464,21 @@ seed = 0
 7. 使用 tmux 或可靠队列保存任务；断线后通过 artifact status、PID 和日志更新时间核验，不凭 tmux 名称推断结果。
 8. 不因 GPU 利用率高而终止任何其他用户进程。
 
+### E0 预算快照
+
+| 项目 | Seed0 首轮 | 完整 tuning seeds 0-2 |
+| --- | ---: | ---: |
+| Static topology x normalization | 4 runs | 12 runs |
+| Strict target-update contrast | 1 additional run | 3 additional runs |
+| no-GCL normalization contrast | 2 runs | 6 runs |
+| 合计 downstream cells | 7 | 21 |
+
+按旧 80-epoch运行估算，单 cell 约 25-40 分钟，聚合 GPU 时间约 9-14
+小时；GPU4 上 5-7 路并发时 seed0 首轮预计约 1-1.5 小时墙钟时间。
+Static A/B 共享 all-graph SGRL cache，C/D 共享 source-only dual cache，必须先让
+A/C 完成预训练和 cache 写入，再启动 B/D，禁止并发竞争同一 cache。EMA-only 和
+no-GCL 单元相互独立。若触发统一 160-epoch 延长规则，预算近似翻倍。
+
 ## 8. 正式 artifact 最低字段
 
 每个新协议运行至少记录：

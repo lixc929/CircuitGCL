@@ -22,7 +22,6 @@ def state_dict_to_cpu(state_dict):
 def sgrl_cache_fingerprint(args, train_graph_names):
     fields = {
         'train_graph_names': list(train_graph_names),
-        'protocol': args.protocol,
         'graph_scope': args.sgrl_graph_scope,
         'seed': args.seed,
         'target_update': args.sgrl_pretrain_target_update,
