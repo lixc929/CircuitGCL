@@ -1,6 +1,5 @@
 import copy
 from contextlib import contextmanager
-import hashlib
 import json
 from pathlib import Path
 import random
@@ -36,6 +35,15 @@ from run_artifacts import (
     update_best_checkpoint_metrics,
     write_run_metrics,
 )
+from rng_utils import (
+    SamplerFingerprint,
+    batch_fingerprint,
+    fixed_rng,
+    seed_all,
+    split_fingerprint,
+    stable_seed,
+    state_dict_fingerprint,
+)
 
 # from torch.utils.data.sampler import SubsetRandomSampler
 # from sram_dataset import LinkPredictionDataset
@@ -51,26 +59,37 @@ PIN = 2
 
 def _stable_eval_seed(base_seed, split):
     canonical_split = 'val' if split.startswith('val') else split
-    digest = hashlib.sha256(canonical_split.encode('utf-8')).digest()
-    offset = int.from_bytes(digest[:4], byteorder='little')
-    return (int(base_seed) + offset) % (2 ** 31)
+    return stable_seed(base_seed, canonical_split)
 
 
 @contextmanager
 def fixed_evaluation_rng(args, split):
     """Make neighbor sampling repeatable without perturbing training RNG."""
-    python_state = random.getstate()
-    numpy_state = np.random.get_state()
     seed = _stable_eval_seed(getattr(args, 'eval_seed', 0), split)
-    with torch.random.fork_rng(devices=[]):
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        try:
-            yield seed
-        finally:
-            random.setstate(python_state)
-            np.random.set_state(numpy_state)
+    with fixed_rng(seed):
+        yield seed
+
+
+def _record_sampler_fingerprint(args, category, name, fingerprint):
+    """Record available sampler fingerprints and reject view drift."""
+    fingerprints = getattr(args, '_sampler_fingerprints', {})
+    category_fingerprints = fingerprints.setdefault(category, {})
+    previous = category_fingerprints.get(name)
+    if previous is not None and previous != fingerprint:
+        raise RuntimeError(
+            f'{category} sampler view changed for {name}: '
+            f'{previous} != {fingerprint}'
+        )
+    category_fingerprints[name] = fingerprint
+    args._sampler_fingerprints = fingerprints
+    if not hasattr(args, 'run_artifact_dir'):
+        return
+    metadata = {'sampler_fingerprints': fingerprints}
+    if category == 'training' and name == 'first_batch':
+        metadata['train_sampler_fingerprint'] = fingerprint
+    if category == 'evaluation':
+        metadata['eval_sampler_fingerprints'] = category_fingerprints
+    update_run_config(args, metadata)
 
 class Logger (object):
     """ 
@@ -253,9 +272,11 @@ def eval_epoch(args, loader, model, device,
     model.eval()
     time_start = time.time()
     logger = Logger(task=args.task)
+    sampler_fingerprint = SamplerFingerprint()
 
     with fixed_evaluation_rng(args, split):
         for i, batch in enumerate(tqdm(loader, desc="eval_"+split, leave=False)):
+            sampler_fingerprint.update(batch)
             pred, class_true, label_true = model(batch.to(device))
             if args.task == 'regression':
                 loss, pred_score, true = compute_loss(
@@ -279,7 +300,12 @@ def eval_epoch(args, loader, model, device,
                                     batch_size=_true.size(0),
                                     loss=loss.detach().cpu().item(),
                                     )
-    return logger.write_epoch(split)
+        result = logger.write_epoch(split)
+    result['sampler_fingerprint'] = sampler_fingerprint.hexdigest()
+    _record_sampler_fingerprint(
+        args, 'evaluation', split, result['sampler_fingerprint']
+    )
+    return result
 
 
 def validation_mse(result):
@@ -750,6 +776,11 @@ def regress_train(args, regressor, optimizier, criterion,
         joint_gcl_batches = 0
 
         for i, batch in enumerate(tqdm(train_loader, desc=f'Epoch:{epoch}')):
+            if epoch == 0 and i == 0:
+                _record_sampler_fingerprint(
+                    args, 'training', 'first_batch',
+                    batch_fingerprint(batch),
+                )
             optimizier.zero_grad()
             batch = batch.to(device)
 
@@ -966,6 +997,11 @@ def class_train(args, classifier,optimizer_classifier,
         apply_partial_shared_backbone_eval_policy(args, classifier, epoch)
 
         for i, batch in enumerate(tqdm(train_loader, desc=f'Epoch:{epoch}')):
+            if epoch == 0 and i == 0:
+                _record_sampler_fingerprint(
+                    args, 'training', 'first_batch',
+                    batch_fingerprint(batch),
+                )
             # Move batch to device
             batch = batch.to(device)
             optimizer_classifier.zero_grad()
@@ -1036,8 +1072,9 @@ def class_train(args, classifier,optimizer_classifier,
             for test_name in test_loaders.keys():
                 print(test_name)
                 test_class_res = eval_epoch(
-                    args, test_loaders[test_name], 
-                    classifier, device, split='test', criterion=criterion
+                    args, test_loaders[test_name],
+                    classifier, device, split=f'test:{test_name}',
+                    criterion=criterion
                 )
                 test_class_results[test_name] = test_class_res
         
@@ -1230,6 +1267,7 @@ def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=No
         all_node_embeds (torch.tensor): The node embeddings come from the contrastive learning
         device (torch.device): The device to train the model on
     """
+    seed_all(getattr(args, 'downstream_seed', args.seed))
     if getattr(args, 'use_sgrl_embeds', args.sgrl):
         dataset.set_cl_embeds(cl_embeds)
 
@@ -1259,10 +1297,19 @@ def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=No
         'normalization_state_sha256': file_sha256(normalization_path),
         'split_indices_path': str(split_path),
         'split_indices_sha256': file_sha256(split_path),
+        'split_fingerprint': split_fingerprint(split_indices),
         'split_seed': split_indices['seed'],
         'source_graph_names': [dataset.names[0]],
         'transfer_graph_names': list(dataset.names[1:]),
         'eval_seed': getattr(args, 'eval_seed', 0),
+        'pretraining_seed': getattr(args, 'pretraining_seed', args.seed),
+        'embedding_inference_seed': getattr(
+            args, 'embedding_inference_seed', args.seed
+        ),
+        'downstream_seed': getattr(args, 'downstream_seed', args.seed),
+        'train_sampler_seed': getattr(
+            args, 'train_sampler_seed', args.seed
+        ),
     })
 
     class_weights = None
@@ -1308,8 +1355,14 @@ def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=No
             class_weights=class_weights,
         )
         start = time.time()
+        seed_all(getattr(args, 'downstream_seed', args.seed))
         model = build_downstream_model(args, sgrl_online_state)
         model = model.to(device)
+        update_run_config(args, {
+            'downstream_initial_model_fingerprint': (
+                state_dict_fingerprint(model.state_dict())
+            ),
+        })
         if getattr(args, 'partial_shared_freeze_epochs', 0) > 0:
             set_partial_shared_backbone_trainable(args, model, False)
         print_parameter_summary(model)
@@ -1323,9 +1376,15 @@ def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=No
         (
             train_loader, val_loader, test_loaders, max_label, split_indices
         ) = dataset_sampling(args, dataset, split_indices=split_indices)
+        seed_all(getattr(args, 'downstream_seed', args.seed))
         model = build_downstream_model(args, sgrl_online_state)
         start = time.time()
         model = model.to(device)
+        update_run_config(args, {
+            'downstream_initial_model_fingerprint': (
+                state_dict_fingerprint(model.state_dict())
+            ),
+        })
         if getattr(args, 'partial_shared_freeze_epochs', 0) > 0:
             set_partial_shared_backbone_trainable(args, model, False)
         print_parameter_summary(model)

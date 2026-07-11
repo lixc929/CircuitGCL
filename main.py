@@ -1,19 +1,25 @@
 import argparse
 import torch
-import numpy as np
 from sram_dataset import performat_SramDataset, adaption_for_sgrl
 from downstream_train import downstream_train
 import os
-import random
-from sgrl_train import sgrl_cache_fingerprint, sgrl_train
+import json
+from sgrl_train import (
+    embedding_cache_fingerprint,
+    sgrl_cache_fingerprint,
+    sgrl_train,
+)
 import datetime
 import sys
+
+from rng_utils import resolve_stage_seeds, seed_all
 
 from run_artifacts import (
     file_sha256,
     finalize_run_artifacts,
     prepare_run_artifacts,
     update_run_config,
+    write_json_atomic,
 )
 
 if __name__ == "__main__":
@@ -55,6 +61,36 @@ if __name__ == "__main__":
     
     # Training setting
     parser.add_argument('--seed', type=int, default=42, help='Random seed.')
+    parser.add_argument(
+        '--pretraining_seed',
+        type=int,
+        default=None,
+        help='SGRL pretraining seed. Default: --seed.',
+    )
+    parser.add_argument(
+        '--embedding_inference_seed',
+        type=int,
+        default=None,
+        help='Frozen-embedding neighbor-sampling seed. Default: --seed.',
+    )
+    parser.add_argument(
+        '--downstream_seed',
+        type=int,
+        default=None,
+        help='Downstream model/criterion initialization seed. Default: --seed.',
+    )
+    parser.add_argument(
+        '--train_sampler_seed',
+        type=int,
+        default=None,
+        help='Downstream training neighbor-sampling seed. Default: --seed.',
+    )
+    parser.add_argument(
+        '--relation_sample_seed',
+        type=int,
+        default=None,
+        help='Processed relation-balanced sampling seed. Default: --seed.',
+    )
     parser.add_argument(
         '--split_seed',
         type=int,
@@ -325,8 +361,7 @@ if __name__ == "__main__":
     parser.add_argument('--log_dir', type=str, default='logs', help='The directory to save the log file.')
 
     args = parser.parse_args()
-    if args.split_seed is None:
-        args.split_seed = args.seed
+    resolved_seeds = resolve_stage_seeds(args)
     if args.sgrl_graph_scope == 'auto':
         args.sgrl_graph_scope = (
             'source' if args.protocol == 'strict_inductive' else 'all'
@@ -388,12 +423,8 @@ if __name__ == "__main__":
     if args.joint_shared_audit_interval <= 0:
         raise ValueError('--joint_shared_audit_interval must be positive.')
 
-    # Syncronize all random seeds
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    # Preserve legacy dataset/setup behavior before stage-specific boundaries.
+    seed_all(args.seed)
 
     ##set log file
     
@@ -406,6 +437,7 @@ if __name__ == "__main__":
     else: # regression task
         log_filename = os.path.join(args.log_dir, f"{timestamp}_{args.task_level}_{args.task}_{args.dataset}_loss{args.regress_loss}_batch{args.batch_size}.txt")
     prepare_run_artifacts(args, log_filename)
+    update_run_config(args, {'resolved_seeds': resolved_seeds})
     log_file = open(log_filename, 'w')
     
     # Redirect standard output to both file and console
@@ -456,8 +488,13 @@ if __name__ == "__main__":
         large_dataset_sample_rates=args.large_dataset_sample_rates,
         task_level=args.task_level,
         net_only=args.net_only,
-        class_boundaries=args.class_boundaries
+        class_boundaries=args.class_boundaries,
+        relation_sample_seed=args.relation_sample_seed,
     )
+    update_run_config(args, {
+        'relation_sample_seed': args.relation_sample_seed,
+        'processed_caches': dataset.processed_cache_provenance,
+    })
 
     # STEP 2-3: If you do graph contrastive learning, you should add the code here =========== #
     cl_embeds = None
@@ -472,16 +509,35 @@ if __name__ == "__main__":
         if args.sgrl_mode == 'static':
             embedding_dir = './embeddings/'
             os.makedirs(embedding_dir, exist_ok=True)
+            embedding_key = embedding_cache_fingerprint(args, sgrl_key)
             embedding_path = os.path.join(
                 embedding_dir,
-                f'embeddings_{args.dataset}_{sgrl_key}.pt',
+                f'embeddings_{args.dataset}_{embedding_key}.pt',
             )
+            embedding_metadata_path = embedding_path + '.metadata.json'
+            embedding_sampler_fingerprint = None
             if os.path.exists(embedding_path):
                 cl_embeds = torch.load(
                     embedding_path,
                     map_location='cpu',
                     weights_only=True,
                 )
+                if os.path.exists(embedding_metadata_path):
+                    with open(
+                        embedding_metadata_path, encoding='utf-8'
+                    ) as metadata_file:
+                        embedding_metadata = json.load(metadata_file)
+                    cached_seed = int(
+                        embedding_metadata['embedding_inference_seed']
+                    )
+                    if cached_seed != args.embedding_inference_seed:
+                        raise RuntimeError(
+                            'Embedding cache inference-seed mismatch: '
+                            f'{cached_seed} != {args.embedding_inference_seed}.'
+                        )
+                    embedding_sampler_fingerprint = embedding_metadata.get(
+                        'embedding_sampler_fingerprint'
+                    )
             else:
                 sgrl_result = sgrl_train(
                     args,
@@ -491,11 +547,28 @@ if __name__ == "__main__":
                     return_online_state=True,
                 )
                 cl_embeds = sgrl_result['embeddings']
+                embedding_sampler_fingerprint = sgrl_result[
+                    'embedding_sampler_fingerprint'
+                ]
                 torch.save(cl_embeds, embedding_path)
+                write_json_atomic(embedding_metadata_path, {
+                    'embedding_cache_key': embedding_key,
+                    'sgrl_cache_key': sgrl_key,
+                    'embedding_inference_seed': args.embedding_inference_seed,
+                    'embedding_sampler_fingerprint': (
+                        embedding_sampler_fingerprint
+                    ),
+                })
             update_run_config(args, {
                 'sgrl_cache_key': sgrl_key,
+                'embedding_cache_key': embedding_key,
                 'sgrl_train_graph_names': train_graph_names,
                 'sgrl_pretrain_target_update': args.sgrl_pretrain_target_update,
+                'pretraining_seed': args.pretraining_seed,
+                'embedding_inference_seed': args.embedding_inference_seed,
+                'embedding_sampler_fingerprint': (
+                    embedding_sampler_fingerprint
+                ),
                 'embedding_path': os.path.abspath(embedding_path),
                 'embedding_sha256': file_sha256(embedding_path),
             })
@@ -513,6 +586,7 @@ if __name__ == "__main__":
                 'sgrl_cache_key': sgrl_result['cache_key'],
                 'sgrl_train_graph_names': sgrl_result['train_graph_names'],
                 'sgrl_pretrain_target_update': sgrl_result['target_update'],
+                'pretraining_seed': args.pretraining_seed,
                 'sgrl_checkpoint_path': os.path.abspath(
                     sgrl_result['online_model_path']
                 ),
@@ -522,6 +596,9 @@ if __name__ == "__main__":
             })
     # STEP 4: Training Epochs ================================================================ #
 
+    # This boundary makes cache hit/miss and inference graph size irrelevant to
+    # downstream construction and model randomness.
+    seed_all(args.downstream_seed)
     try:
         downstream_train(args, dataset, device, cl_embeds, sgrl_online_state)
     except BaseException:

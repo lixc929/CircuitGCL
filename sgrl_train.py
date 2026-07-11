@@ -10,6 +10,7 @@ import os
 
 from sram_dataset import adaption_for_sgrl
 from torch_geometric.loader import NeighborLoader, ShaDowKHopSampler, LinkNeighborLoader
+from rng_utils import SamplerFingerprint, fixed_rng, seed_all
 
 
 def state_dict_to_cpu(state_dict):
@@ -23,7 +24,7 @@ def sgrl_cache_fingerprint(args, train_graph_names):
     fields = {
         'train_graph_names': list(train_graph_names),
         'graph_scope': args.sgrl_graph_scope,
-        'seed': args.seed,
+        'pretraining_seed': getattr(args, 'pretraining_seed', args.seed),
         'target_update': args.sgrl_pretrain_target_update,
         'model': args.cl_model,
         'layers': args.cl_gnn_layers,
@@ -37,6 +38,18 @@ def sgrl_cache_fingerprint(args, train_graph_names):
         'target_lr': args.e2_lr,
         'momentum': args.momentum,
         'weight_decay': args.weight_decay,
+    }
+    serialized = json.dumps(fields, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(serialized.encode('utf-8')).hexdigest()[:20]
+
+
+def embedding_cache_fingerprint(args, sgrl_cache_key):
+    """Identify a frozen-embedding view independently of its checkpoint."""
+    fields = {
+        'sgrl_cache_key': sgrl_cache_key,
+        'embedding_inference_seed': getattr(
+            args, 'embedding_inference_seed', args.seed
+        ),
     }
     serialized = json.dumps(fields, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(serialized.encode('utf-8')).hexdigest()[:20]
@@ -140,7 +153,8 @@ def adj_norm(data):
 def get_all_contrastive_embed(
         online_model, pkl_path, 
         train_graph, loader, 
-        hidden_dim, num_hop, device
+        hidden_dim, num_hop, device,
+        inference_seed=0, return_sampler_fingerprint=False,
     ):
     """
     Get all node embeddings from the online encoder of SGRL model.
@@ -155,30 +169,39 @@ def get_all_contrastive_embed(
     Returns:
         torch.Tensor: The embeddings of all nodes in the graph
     """
-    print(f"Loading model from {pkl_path}")
-    online_model.load_state_dict(torch.load(pkl_path))
-    online_model.eval()
+    with fixed_rng(inference_seed):
+        print(f"Loading model from {pkl_path}")
+        online_model.load_state_dict(torch.load(
+            pkl_path, map_location=device, weights_only=True
+        ))
+        online_model.eval()
 
-    # Initialize all CL embeddings
-    embeds = torch.zeros((train_graph.num_nodes, hidden_dim), requires_grad=False)
-    
-    for batch in tqdm(iterable=loader, desc='Getting CL embeddings', leave=False):
-        # slsp_adj = graph_adj.index_select(0, batch.n_id)
-        # batch.slsp_adj = slsp_adj.index_select(1, batch.n_id)
-        # assert batch.input_id.size(0) == batch.batch_size, \
-        #   f"input_id size {batch.input_id.size(0)} != batch_size {batch.batch_size}"
-        batch = batch.to(device)
+        # Initialize all CL embeddings
+        embeds = torch.zeros(
+            (train_graph.num_nodes, hidden_dim), requires_grad=False
+        )
+        sampler_fingerprint = SamplerFingerprint()
 
-        ## We only record the embeddings of the sampled (specified by batch.input_id) 
-        ## nodes in this batch, even though the model return all neighbors' embeddings in the batch.
-        ## The first batch_size embeddings are the embeddings of the sampled nodes. 
-        ## See docs about pyg loader.
-        embeds[batch.input_id] = \
-            online_model.embed(batch, num_hop).detach().cpu()[:batch.input_id.size(0)]
-    
-    ## Assign the embeddings to the batched big training graph
-    # train_graph.cl_embed = embeds
-    online_model = online_model.cpu()
+        for batch in tqdm(
+                iterable=loader, desc='Getting CL embeddings', leave=False):
+            sampler_fingerprint.update(batch)
+            # slsp_adj = graph_adj.index_select(0, batch.n_id)
+            # batch.slsp_adj = slsp_adj.index_select(1, batch.n_id)
+            # assert batch.input_id.size(0) == batch.batch_size, \
+            #   f"input_id size {batch.input_id.size(0)} != batch_size {batch.batch_size}"
+            batch = batch.to(device)
+
+            ## We only record the embeddings of the sampled (specified by batch.input_id)
+            ## nodes in this batch, even though the model return all neighbors' embeddings in the batch.
+            ## The first batch_size embeddings are the embeddings of the sampled nodes.
+            ## See docs about pyg loader.
+            embeds[batch.input_id] = online_model.embed(
+                batch, num_hop
+            ).detach().cpu()[:batch.input_id.size(0)]
+
+        ## Assign the embeddings to the batched big training graph
+        # train_graph.cl_embed = embeds
+        online_model = online_model.cpu()
 
     # ## We slice node embeds in the large `train_graph` 
     # ## and map them back to the corresponding each dataset
@@ -188,6 +211,8 @@ def get_all_contrastive_embed(
     # ]
 
     # return cl_embeds_for_dataset
+    if return_sampler_fingerprint:
+        return embeds, sampler_fingerprint.hexdigest()
     return embeds
 
 def sgrl_train(args, dataset, device, return_embeddings=True, return_online_state=False):
@@ -202,6 +227,7 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
         If return_embeddings is False and return_online_state is True, returns the
         online encoder checkpoint path and state_dict for downstream reuse.
     """
+    seed_all(getattr(args, 'pretraining_seed', args.seed))
     e1_lr = args.e1_lr
     e2_lr = args.e2_lr
     weight_decay = args.weight_decay
@@ -307,7 +333,9 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
                 cnt_wait += 1
 
     if return_online_state:
-        online_model.load_state_dict(torch.load(model_name, map_location=device))
+        online_model.load_state_dict(torch.load(
+            model_name, map_location=device, weights_only=True
+        ))
         if not return_embeddings:
             return {
                 'online_model_path': model_name,
@@ -325,9 +353,11 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
     inference_loader = make_sgrl_loader(
         args, inference_graph, num_layers, shuffle=False
     )
-    embeds = get_all_contrastive_embed(
+    embeds, embedding_sampler_fingerprint = get_all_contrastive_embed(
         online_model, model_name, inference_graph,
-        inference_loader, hidden_dim, num_hop, device
+        inference_loader, hidden_dim, num_hop, device,
+        inference_seed=getattr(args, 'embedding_inference_seed', args.seed),
+        return_sampler_fingerprint=True,
     )
 
     if return_online_state:
@@ -338,6 +368,7 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
             'cache_key': cache_key,
             'train_graph_names': train_graph_names,
             'target_update': target_update,
+            'embedding_sampler_fingerprint': embedding_sampler_fingerprint,
         }
 
     return embeds

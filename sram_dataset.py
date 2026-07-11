@@ -7,6 +7,16 @@ from torch_geometric.utils import to_undirected
 import logging
 import time
 from pathlib import Path
+from processed_cache import (
+    build_processed_cache_inputs,
+    load_validated_processed_cache,
+    processed_cache_filename,
+    processed_cache_manifest_path,
+    publish_processed_cache_manifest,
+    validate_processed_cache,
+)
+from rng_utils import fixed_rng, stable_seed
+from run_artifacts import file_sha256
 from utils import (
     get_pos_neg_edges, add_tar_edges_to_g, get_balanced_edges, 
     collated_data_separate)
@@ -26,7 +36,8 @@ class SealSramDataset(InMemoryDataset):
         net_only=True,
         transform=None, 
         pre_transform=None,
-        class_boundaries=[0.2, 0.4, 0.6, 0.8]
+        class_boundaries=[0.2, 0.4, 0.6, 0.8],
+        relation_sample_seed=0,
     ) -> None:
         """ The SRAM dataset. 
         It can be a combination of several large circuit graphs or millions of sampled subgraphs.
@@ -41,7 +52,10 @@ class SealSramDataset(InMemoryDataset):
             class_boundaries (list): The boundaries of the classes.
         """
         self.name = 'sram'
-        self.class_boundaries = torch.tensor(class_boundaries)
+        self.class_boundaries_config = [
+            float(value) for value in class_boundaries
+        ]
+        self.class_boundaries = torch.tensor(self.class_boundaries_config)
         print("self.class_boundaries", self.class_boundaries)
         ## split the dataset according to '+' in the name
         if '+' in name:
@@ -65,6 +79,11 @@ class SealSramDataset(InMemoryDataset):
 
         self.task_level = task_level
         self.net_only = net_only
+        # Existing non-main callers retain a deterministic documented default.
+        self.relation_sample_seed = int(relation_sample_seed)
+        self._raw_sha256_cache = {}
+        self._processed_inputs_cache = {}
+        self.processed_cache_provenance = []
     
         self.max_net_node_feat = torch.ones((1, 17)) # the max feature dimension of net and dev nodes
         self.max_dev_node_feat = torch.ones((1, 17))
@@ -73,8 +92,14 @@ class SealSramDataset(InMemoryDataset):
         data_list = []
 
         for i, name in enumerate(self.names):
-            ## If a processed data file exsit, we load it directly
-            loaded_data, loaded_slices = torch.load(self.processed_paths[i])
+            (
+                (loaded_data, loaded_slices),
+                cache_provenance,
+            ) = load_validated_processed_cache(
+                self.processed_paths[i],
+                self._processed_cache_inputs(i),
+            )
+            self.processed_cache_provenance.append(cache_provenance)
             # print("loaded_data", loaded_data)
             # print("loaded_slices", loaded_slices)
 
@@ -357,19 +382,10 @@ class SealSramDataset(InMemoryDataset):
         graph = self.sram_graph_load(self.names[idx], self.raw_paths[idx])
         print(f"loaded graph {graph}")
         
-        ## generate negative edges for the loaded graph
-        neg_edge_index, neg_edge_type = get_pos_neg_edges(
-            graph, neg_ratio=self.neg_edge_ratio)
-        
-        
-        ## sample a portion of pos/neg edges
         (
             pos_edge_index, pos_edge_type, pos_edge_y,
-            neg_edge_index, neg_edge_type
-        ) = get_balanced_edges(
-            graph, neg_edge_index, neg_edge_type, 
-            self.neg_edge_ratio, self.sample_rates[idx]
-        )
+            neg_edge_index, neg_edge_type,
+        ) = self._sample_relation_edges(graph, idx)
 
 
         if self.task_level == 'edge' :
@@ -391,6 +407,10 @@ class SealSramDataset(InMemoryDataset):
         
         if self.task_level == 'node':
             torch.save((graph, None), self.processed_paths[idx])
+            publish_processed_cache_manifest(
+                self.processed_paths[idx],
+                self._processed_cache_inputs(idx),
+            )
             return graph.y.size(0)
         elif self.task_level == 'edge':
             ## To use LinkNeighborLoader, the target links rename to edge_label_index
@@ -398,6 +418,10 @@ class SealSramDataset(InMemoryDataset):
             graph.edge_label_index = links
             graph.edge_label = labels
             torch.save((graph, None), self.processed_paths[idx])
+            publish_processed_cache_manifest(
+                self.processed_paths[idx],
+                self._processed_cache_inputs(idx),
+            )
             return graph.edge_label.size(0)
         else:
             raise ValueError(f"No defination of task {self.task_type} in this version!")
@@ -407,10 +431,24 @@ class SealSramDataset(InMemoryDataset):
         p = Path(self.processed_dir)
         ## we can have multiple graphs
         for i, name in enumerate(self.names):
-            ## if there is a processed file, we skip the self.single_g_process()
             if os.path.exists(self.processed_paths[i]):
-                logging.info(f"Found process file of {name} in {self.processed_paths[i]}, skipping process()")
+                validate_processed_cache(
+                    self.processed_paths[i],
+                    self._processed_cache_inputs(i),
+                )
+                logging.info(
+                    f"Found validated process file of {name} in "
+                    f"{self.processed_paths[i]}, skipping process()"
+                )
                 continue 
+            manifest_path = processed_cache_manifest_path(
+                self.processed_paths[i]
+            )
+            if os.path.exists(manifest_path):
+                raise RuntimeError(
+                    'Refusing to overwrite an orphaned processed-cache '
+                    f'manifest: {manifest_path}'
+                )
                         
             data_lens_for_split.append(
                 self.single_g_process(i)
@@ -435,15 +473,64 @@ class SealSramDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        processed_names = []
-        for i, name in enumerate(self.names):
-            if self.sample_rates[i] < 1.0:
-                name += f"_s{self.sample_rates[i]}"
+        return [
+            processed_cache_filename(
+                name,
+                self._processed_cache_inputs(index),
+            )
+            for index, name in enumerate(self.names)
+        ]
 
-            if self.neg_edge_ratio < 1.0:
-                name += f"_nr{self.neg_edge_ratio:.1f}"
-            processed_names.append(name+"_processed.pt")
-        return processed_names
+    def _raw_path(self, index):
+        return os.path.abspath(os.path.join(
+            self.folder,
+            'raw',
+            self.raw_file_names[index],
+        ))
+
+    def _raw_sha256(self, index):
+        raw_path = self._raw_path(index)
+        if raw_path not in self._raw_sha256_cache:
+            self._raw_sha256_cache[raw_path] = file_sha256(raw_path)
+        return self._raw_sha256_cache[raw_path]
+
+    def _graph_relation_sample_seed(self, index):
+        return stable_seed(
+            self.relation_sample_seed,
+            f'processed-relation-sampling:{self.names[index]}',
+        )
+
+    def _processed_cache_inputs(self, index):
+        if index not in self._processed_inputs_cache:
+            self._processed_inputs_cache[index] = build_processed_cache_inputs(
+                graph_name=self.names[index],
+                raw_sha256=self._raw_sha256(index),
+                sample_rate=self.sample_rates[index],
+                negative_edge_ratio=self.neg_edge_ratio,
+                to_undirected=self.to_undirected,
+                task_level=self.task_level,
+                net_only=self.net_only,
+                class_boundaries=self.class_boundaries_config,
+                relation_sample_seed=self.relation_sample_seed,
+                graph_relation_sample_seed=(
+                    self._graph_relation_sample_seed(index)
+                ),
+            )
+        return self._processed_inputs_cache[index]
+
+    def _sample_relation_edges(self, graph, index):
+        with fixed_rng(self._graph_relation_sample_seed(index)):
+            neg_edge_index, neg_edge_type = get_pos_neg_edges(
+                graph,
+                neg_ratio=self.neg_edge_ratio,
+            )
+            return get_balanced_edges(
+                graph,
+                neg_edge_index,
+                neg_edge_type,
+                self.neg_edge_ratio,
+                self.sample_rates[index],
+            )
 
 def adaption_for_sgrl(dataset, graph_indices=None):
     """
@@ -484,8 +571,10 @@ def performat_SramDataset(dataset_dir, name,
                           small_dataset_sample_rates, large_dataset_sample_rates,
                           task_level,
                           net_only,
-                          class_boundaries
+                          class_boundaries,
+                          relation_sample_seed=0,
                           ):
+    """Build SRAM graphs; non-main callers default relation sampling to seed 0."""
     start = time.perf_counter()
     names = name.split('+')
     sr_list = [
@@ -500,7 +589,8 @@ def performat_SramDataset(dataset_dir, name,
             sample_rates=sr_list,
             task_level=task_level,              
             net_only=net_only,
-            class_boundaries=class_boundaries
+            class_boundaries=class_boundaries,
+            relation_sample_seed=relation_sample_seed,
         )
 
     elapsed = time.perf_counter() - start

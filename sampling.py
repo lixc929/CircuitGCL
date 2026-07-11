@@ -10,9 +10,37 @@ import os
 import pickle
 from collections import Counter
 from torch_geometric.data import HeteroData
+from rng_utils import (
+    IsolatedRNGDataLoader,
+    fixed_rng,
+    stable_seed,
+)
 NET = 0
 DEV = 1
 PIN = 2
+
+
+def _loader_with_seed(loader_type, seed, *args, **kwargs):
+    """Construct a loader without consuming its caller's RNG stream."""
+    with fixed_rng(seed, include_cuda=False):
+        return loader_type(*args, **kwargs)
+
+
+def _training_loader(args, loader_type, *loader_args, **loader_kwargs):
+    seed = int(getattr(args, 'train_sampler_seed', args.seed))
+    loader = _loader_with_seed(
+        loader_type, seed, *loader_args, **loader_kwargs
+    )
+    return IsolatedRNGDataLoader(loader, seed)
+
+
+def _evaluation_loader(
+        args, split, loader_type, *loader_args, **loader_kwargs):
+    seed = stable_seed(getattr(args, 'eval_seed', args.seed), split)
+    return _loader_with_seed(
+        loader_type, seed, *loader_args, **loader_kwargs
+    )
+
 
 def build_split_indices(args, dataset):
     """Build deterministic source train/validation indices."""
@@ -65,7 +93,9 @@ def dataset_sampling(args, dataset, split_indices=None, class_weights=None):
         val_node_ind = split_indices['val']
         class_labels = train_graph.y[train_node_ind, 1]
     
-        train_loader = NeighborLoader(
+        train_loader = _training_loader(
+            args,
+            NeighborLoader,
             train_graph,
             num_neighbors=args.num_hops * [args.num_neighbors],
             input_nodes=train_node_ind,
@@ -73,7 +103,10 @@ def dataset_sampling(args, dataset, split_indices=None, class_weights=None):
             shuffle=True,
             num_workers=args.num_workers,
         )
-        val_loader = NeighborLoader(
+        val_loader = _evaluation_loader(
+            args,
+            'val',
+            NeighborLoader,
             train_graph,
             num_neighbors=args.num_hops * [args.num_neighbors],
             input_nodes=val_node_ind,
@@ -93,14 +126,29 @@ def dataset_sampling(args, dataset, split_indices=None, class_weights=None):
             if graph_name == 'sandwich' or graph_name == 'ultra8t':
                 # random sample all test nodes
                 sampled_size = max(1, int(test_graph.num_nodes *args.large_dataset_sample_rates))
-                perm = torch.randperm(test_graph.num_nodes)
+                generator = torch.Generator().manual_seed(stable_seed(
+                    getattr(args, 'eval_seed', args.seed),
+                    f'test:{graph_name}:roots',
+                ))
+                perm = torch.randperm(
+                    test_graph.num_nodes, generator=generator
+                )
                 test_input_nodes = all_test_nodes[perm[:sampled_size]]
             else:
                 sampled_size = max(1, int(test_graph.num_nodes *args.small_dataset_sample_rates))
-                perm = torch.randperm(test_graph.num_nodes)
+                generator = torch.Generator().manual_seed(stable_seed(
+                    getattr(args, 'eval_seed', args.seed),
+                    f'test:{graph_name}:roots',
+                ))
+                perm = torch.randperm(
+                    test_graph.num_nodes, generator=generator
+                )
                 test_input_nodes = all_test_nodes[perm[:sampled_size]]
 
-            test_loaders[graph_name] = NeighborLoader(
+            test_loaders[graph_name] = _evaluation_loader(
+                args,
+                f'test:{graph_name}',
+                NeighborLoader,
                 test_graph,
                 num_neighbors=args.num_hops * [args.num_neighbors],
                 input_nodes=test_input_nodes,
@@ -120,7 +168,9 @@ def dataset_sampling(args, dataset, split_indices=None, class_weights=None):
         )
 
         ## Create the dataloaders for training dataset
-        train_loader = LinkNeighborLoader(
+        train_loader = _training_loader(
+            args,
+            LinkNeighborLoader,
             train_graph,
             num_neighbors=args.num_hops * [args.num_neighbors],
             edge_label_index=train_edge_label_index,
@@ -138,7 +188,10 @@ def dataset_sampling(args, dataset, split_indices=None, class_weights=None):
         )
 
         ## Create the dataloaders for validation dataset
-        val_loader = LinkNeighborLoader(
+        val_loader = _evaluation_loader(
+            args,
+            'val',
+            LinkNeighborLoader,
             train_graph,
             num_neighbors=args.num_hops * [args.num_neighbors],
             edge_label_index=val_edge_label_index,
@@ -166,18 +219,20 @@ def dataset_sampling(args, dataset, split_indices=None, class_weights=None):
             )
 
             ## Create the dataloaders for each test dataset
-            test_loaders[graph_name] = \
-                LinkNeighborLoader(
-                    test_graph,
-                    num_neighbors=args.num_hops * [args.num_neighbors],
-                    edge_label_index=test_edge_label_index,
-                    edge_label=test_edge_label,
-                    subgraph_type='bidirectional',
-                    disjoint=True,
-                    batch_size=args.batch_size,
-            shuffle=False, 
-            num_workers=args.num_workers,
-        )
+            test_loaders[graph_name] = _evaluation_loader(
+                args,
+                f'test:{graph_name}',
+                LinkNeighborLoader,
+                test_graph,
+                num_neighbors=args.num_hops * [args.num_neighbors],
+                edge_label_index=test_edge_label_index,
+                edge_label=test_edge_label,
+                subgraph_type='bidirectional',
+                disjoint=True,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+            )
             
     else:
         raise ValueError(f"Invalid task level: {args.task_level}")
@@ -191,4 +246,3 @@ def dataset_sampling(args, dataset, split_indices=None, class_weights=None):
     print(f"The most common label in the training set is: {max_label}, with {label_counts[max_label]} samples")
 
     return (train_loader, val_loader, test_loaders, max_label, split_indices)
-
