@@ -1,5 +1,8 @@
 import copy
+from contextlib import contextmanager
+import hashlib
 import json
+from pathlib import Path
 import random
 
 import torch
@@ -20,14 +23,16 @@ from model import (
     PartialSharedGraphHead,
     SgrlBackboneHead,
 )
-from sampling import dataset_sampling
-from balanced_mse import GAILoss, BMCLoss, BNILoss, train_gmm, WeightedMSE, get_lds_weights, BalancedSoftmax, FocalLoss, compute_class_weights
+from sampling import build_split_indices, dataset_sampling
+from balanced_mse import GAILoss, BMCLoss, BNILoss, train_gmm, WeightedMSE, get_lds_statistics, BalancedSoftmax, FocalLoss, compute_class_weights
 import os
 import matplotlib.pyplot as plt
 
 from run_artifacts import (
+    file_sha256,
     load_best_checkpoint,
     save_best_checkpoint,
+    update_run_config,
     update_best_checkpoint_metrics,
     write_run_metrics,
 )
@@ -42,6 +47,30 @@ from run_artifacts import (
 NET = 0
 DEV = 1
 PIN = 2
+
+
+def _stable_eval_seed(base_seed, split):
+    canonical_split = 'val' if split.startswith('val') else split
+    digest = hashlib.sha256(canonical_split.encode('utf-8')).digest()
+    offset = int.from_bytes(digest[:4], byteorder='little')
+    return (int(base_seed) + offset) % (2 ** 31)
+
+
+@contextmanager
+def fixed_evaluation_rng(args, split):
+    """Make neighbor sampling repeatable without perturbing training RNG."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    seed = _stable_eval_seed(getattr(args, 'eval_seed', 0), split)
+    with torch.random.fork_rng(devices=[]):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        try:
+            yield seed
+        finally:
+            random.setstate(python_state)
+            np.random.set_state(numpy_state)
 
 class Logger (object):
     """ 
@@ -182,15 +211,17 @@ def compute_loss(args, pred, true, criterion):
         assert pred.ndim == 1 or pred.size(1) == 1
         pred = pred.view(-1, 1)
 
-        assert (true.size(1) == 2), \
-            "true label has two columns [continuous label, discrete label or label weights]!"
+        assert true.ndim == 2 and true.size(1) >= 2, \
+            "true label requires continuous and discrete-label columns"
         
         ## for LDS loss, the second column of `true` is the weights
         if args.regress_loss == 'lds':
+            assert true.size(1) >= 3, \
+                "LDS labels require [continuous, discrete, sample_weight]."
             loss = criterion(
                 pred, 
                 true[:, 0].view(-1, 1),
-                true[:, 1].view(-1, 1) # the weight for each label
+                true[:, 2].view(-1, 1)
             )
             return loss, pred, true[:, 0].view(pred.size())
 
@@ -223,26 +254,31 @@ def eval_epoch(args, loader, model, device,
     time_start = time.time()
     logger = Logger(task=args.task)
 
-    for i, batch in enumerate(tqdm(loader, desc="eval_"+split, leave=False)):
-        pred, class_true, label_true = model(batch.to(device))
-        if args.task == 'regression':
-            loss, pred_score, true = compute_loss(args, pred, label_true, criterion=criterion)
-            _true = true.detach().to('cpu', non_blocking=True)
-            _pred = pred_score.detach().to('cpu', non_blocking=True)
-            logger.update_stats(true=_true,
-                                pred=_pred,
-                                batch_size=_true.size(0),
-                                loss=loss.detach().cpu().item(),
-                                )
-        elif args.task == 'classification':
-            loss, predict_class, true = compute_loss(args, pred, class_true, criterion=criterion)
-            _true = true.detach().to('cpu', non_blocking=True)
-            _pred = predict_class.detach().to('cpu', non_blocking=True)
-            logger.update_stats(true=_true,
-                                pred=_pred,
-                                batch_size=_true.size(0),
-                                loss=loss.detach().cpu().item(),
-                                )
+    with fixed_evaluation_rng(args, split):
+        for i, batch in enumerate(tqdm(loader, desc="eval_"+split, leave=False)):
+            pred, class_true, label_true = model(batch.to(device))
+            if args.task == 'regression':
+                loss, pred_score, true = compute_loss(
+                    args, pred, label_true, criterion=criterion
+                )
+                _true = true.detach().to('cpu', non_blocking=True)
+                _pred = pred_score.detach().to('cpu', non_blocking=True)
+                logger.update_stats(true=_true,
+                                    pred=_pred,
+                                    batch_size=_true.size(0),
+                                    loss=loss.detach().cpu().item(),
+                                    )
+            elif args.task == 'classification':
+                loss, predict_class, true = compute_loss(
+                    args, pred, class_true, criterion=criterion
+                )
+                _true = true.detach().to('cpu', non_blocking=True)
+                _pred = predict_class.detach().to('cpu', non_blocking=True)
+                logger.update_stats(true=_true,
+                                    pred=_pred,
+                                    batch_size=_true.size(0),
+                                    loss=loss.detach().cpu().item(),
+                                    )
     return logger.write_epoch(split)
 
 
@@ -1197,46 +1233,80 @@ def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=No
     if getattr(args, 'use_sgrl_embeds', args.sgrl):
         dataset.set_cl_embeds(cl_embeds)
 
-    dataset.norm_nfeat([NET, DEV])
+    normalization_scope = getattr(args, 'normalization_scope', 'all')
+    fit_graph_indices = [0] if normalization_scope == 'source' else None
+    normalization_state = dataset.norm_nfeat(
+        [NET, DEV],
+        fit_graph_indices=fit_graph_indices,
+    )
+    artifact_dir = Path(args.run_artifact_dir)
+    normalization_path = artifact_dir / 'normalization_state.pt'
+    torch.save(normalization_state, normalization_path)
 
-    
+    split_indices = build_split_indices(args, dataset)
+    split_path = artifact_dir / 'split_indices.pt'
+    torch.save(split_indices, split_path)
+    source_graph = dataset[0]
+    train_indices = split_indices['train']
+    train_edge_labels = (
+        source_graph.edge_label[train_indices]
+        if args.task_level == 'edge'
+        else None
+    )
+    update_run_config(args, {
+        'normalization_scope': normalization_scope,
+        'normalization_state_path': str(normalization_path),
+        'normalization_state_sha256': file_sha256(normalization_path),
+        'split_indices_path': str(split_path),
+        'split_indices_sha256': file_sha256(split_path),
+        'split_seed': split_indices['seed'],
+        'source_graph_names': [dataset.names[0]],
+        'transfer_graph_names': list(dataset.names[1:]),
+        'eval_seed': getattr(args, 'eval_seed', 0),
+    })
 
-    
-    
-    # Subgraph sampling for each dataset graph & PE calculation
-    (
-        train_loader, val_loader, test_loaders, max_label
-    ) = dataset_sampling(args, dataset)
-
-
+    class_weights = None
     if args.task == 'regression':
         # set the loss function for regression
         if args.regress_loss == 'gai':
             gmm_path = train_gmm(
-                dataset,
+                train_labels=train_edge_labels[:, 0],
                 output_path=os.path.join(args.run_artifact_dir, 'gmm.pkl'),
             )
             criterion = GAILoss(init_noise_sigma=args.noise_sigma, gmm=gmm_path, device=device)
         elif args.regress_loss == 'bmc':
             criterion = BMCLoss(init_noise_sigma=args.noise_sigma, device=device)
         elif args.regress_loss == 'bni':
-            _, bin_edges, bin_count = get_lds_weights(
-                dataset._data.edge_label[:, 1], 
-                args.lds_kernel, args.lds_ks, args.lds_sigma
+            _, bin_edges, bin_count, _ = get_lds_statistics(
+                train_edge_labels[:, 1],
+                args.lds_kernel,
+                args.lds_ks,
+                args.lds_sigma,
+                num_classes=args.num_classes,
             )
             criterion = BNILoss(args.noise_sigma, bin_edges, bin_count,  device=device)
         elif args.regress_loss == 'mse':
             criterion = torch.nn.MSELoss(reduction='mean')
         elif args.regress_loss == 'lds':
-            weights, _, _ = get_lds_weights(
-                dataset._data.edge_label[:, 1], 
-                args.lds_kernel, args.lds_ks, args.lds_sigma
+            _, _, _, class_weights = get_lds_statistics(
+                train_edge_labels[:, 1],
+                args.lds_kernel,
+                args.lds_ks,
+                args.lds_sigma,
+                num_classes=args.num_classes,
             )
-            dataset._data.edge_label[:, 1] = weights
             criterion = WeightedMSE()
         else:
             raise ValueError(f"Loss func {args.regress_loss} not supported!")
         
+        (
+            train_loader, val_loader, test_loaders, max_label, split_indices
+        ) = dataset_sampling(
+            args,
+            dataset,
+            split_indices=split_indices,
+            class_weights=class_weights,
+        )
         start = time.time()
         model = build_downstream_model(args, sgrl_online_state)
         model = model.to(device)
@@ -1250,6 +1320,9 @@ def downstream_train(args, dataset, device, cl_embeds=None, sgrl_online_state=No
               device)
         
     elif args.task == 'classification':
+        (
+            train_loader, val_loader, test_loaders, max_label, split_indices
+        ) = dataset_sampling(args, dataset, split_indices=split_indices)
         model = build_downstream_model(args, sgrl_online_state)
         start = time.time()
         model = model.to(device)

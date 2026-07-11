@@ -73,10 +73,12 @@ def kl_divergence(p: torch.Tensor, q: torch.Tensor, bins: int = 10,
     
     return kl
 
-def train_gmm(dataset, output_path='pkl/gmm/gmm.pkl'):
+def train_gmm(dataset=None, output_path='pkl/gmm/gmm.pkl', train_labels=None):
     start = time.time()
-    graph_idx = 0
-    train_labels = dataset[graph_idx].edge_label
+    if train_labels is None:
+        if dataset is None:
+            raise ValueError('Either dataset or train_labels must be provided.')
+        train_labels = dataset[0].edge_label
     if train_labels.ndim == 2:
         train_labels = train_labels[:, 0]
 
@@ -204,6 +206,36 @@ def get_lds_kernel_window(kernel, ks, sigma):
 
     return kernel_window
 
+def get_lds_statistics(
+        discrete_labels: torch.Tensor, lds_kernel: str, lds_ks: int,
+        lds_sigma: float, num_classes=None):
+    """Fit LDS class statistics and return sample/class weights."""
+    discrete_labels = discrete_labels.detach().cpu().long().view(-1)
+    if discrete_labels.numel() == 0:
+        raise ValueError('LDS requires at least one source-training label.')
+    if num_classes is None:
+        num_classes = int(discrete_labels.max().item()) + 1
+    counts = torch.bincount(discrete_labels, minlength=num_classes).float()
+    lds_kernel_window = get_lds_kernel_window(lds_kernel, lds_ks, lds_sigma)
+    print(f'Using LDS: [{lds_kernel.upper()}] ({lds_ks}/{lds_sigma})')
+    smoothed = torch.tensor(
+        convolve1d(
+            counts.numpy(), weights=lds_kernel_window, mode='constant'
+        ),
+        dtype=torch.float32,
+    ).clamp_min(torch.finfo(torch.float32).eps)
+    class_weights = smoothed.reciprocal()
+    sample_weights = class_weights[discrete_labels]
+    scaling = sample_weights.numel() / sample_weights.sum()
+    class_weights *= scaling
+    sample_weights *= scaling
+    centers = torch.arange(num_classes, dtype=torch.float32)
+    if num_classes > 1:
+        centers /= num_classes - 1
+    distribution = counts / counts.sum()
+    return sample_weights, centers, distribution, class_weights
+
+
 def get_lds_weights(discrete_labels: torch.Tensor, lds_kernel: str, lds_ks: int, lds_sigma: float):
     """ Calculate the weights for LDS loss based on the discrete labels.
     Args:
@@ -216,28 +248,13 @@ def get_lds_weights(discrete_labels: torch.Tensor, lds_kernel: str, lds_ks: int,
         torch.Tensor: The empirical bin edges.
         torch.Tensor: The empirical label distribution.
     """
-    discrete_labels = discrete_labels.detach().cpu().long()
-
-    # Calculate empirical (original) label distribution: [Nb,]
-    emp_bins, emp_label_dist = discrete_labels.unique(return_counts=True)
-    
-
-    # lds_kernel_window: [ks,], here for example, we use gaussian, ks=5, sigma=2
-    lds_kernel_window = get_lds_kernel_window(lds_kernel, lds_ks, lds_sigma)
-    print(f'Using LDS: [{lds_kernel.upper()}] ({lds_ks}/{lds_sigma})')
-
-    # Calcualte smoothed label distribution: [Nb,]
-    smoothed_value = convolve1d(
-        emp_label_dist.numpy(), weights=lds_kernel_window, mode='constant')
-    
-    # Use re-weighting based on effective label distribution, sample-wise weights: [Ns,]
-    eff_num_per_label = [smoothed_value[bin_index] for bin_index in discrete_labels]
-    weights = [np.float32(1 / x) for x in eff_num_per_label]
-
-    # Scaling weights
-    scaling = len(weights) / np.sum(weights)
-    weights = [scaling * x for x in weights]
-    return torch.tensor(weights), emp_bins / emp_bins.max(), emp_label_dist / emp_label_dist.sum()
+    sample_weights, centers, distribution, _ = get_lds_statistics(
+        discrete_labels,
+        lds_kernel,
+        lds_ks,
+        lds_sigma,
+    )
+    return sample_weights, centers, distribution
 
 class BalancedSoftmax(_Loss):
     """

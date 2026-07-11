@@ -1,5 +1,7 @@
 from sklearn.multiclass import OneVsRestClassifier
 from sgrl_models import CustomConv, CustomOnline, Target
+import hashlib
+import json
 import torch
 import time
 from tqdm import tqdm
@@ -15,6 +17,76 @@ def state_dict_to_cpu(state_dict):
         key: value.detach().cpu() if torch.is_tensor(value) else value
         for key, value in state_dict.items()
     }
+
+
+def sgrl_cache_fingerprint(args, train_graph_names):
+    fields = {
+        'train_graph_names': list(train_graph_names),
+        'protocol': args.protocol,
+        'graph_scope': args.sgrl_graph_scope,
+        'seed': args.seed,
+        'target_update': args.sgrl_pretrain_target_update,
+        'model': args.cl_model,
+        'layers': args.cl_gnn_layers,
+        'hidden_dim': args.cl_hid_dim,
+        'activation': args.cl_act_fn,
+        'dropout': args.cl_dropout,
+        'batch_size': args.cl_batch_size,
+        'num_neighbors': args.cl_num_neighbors,
+        'epochs': args.cl_epochs,
+        'online_lr': args.e1_lr,
+        'target_lr': args.e2_lr,
+        'momentum': args.momentum,
+        'weight_decay': args.weight_decay,
+    }
+    serialized = json.dumps(fields, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(serialized.encode('utf-8')).hexdigest()[:20]
+
+
+def make_sgrl_loader(args, graph, num_layers, shuffle):
+    return NeighborLoader(
+        graph,
+        num_neighbors=[args.cl_num_neighbors] * num_layers,
+        batch_size=args.cl_batch_size,
+        shuffle=shuffle,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+
+def build_sgrl_training_state(args, device):
+    """Construct SGRL models and non-overlapping optimizer parameter sets."""
+    online_conv = CustomConv(args).to(device)
+    target_conv = CustomConv(args).to(device)
+    target_update = args.sgrl_pretrain_target_update
+    if target_update == 'circuitgcl_text_ema_only':
+        target_conv.load_state_dict(online_conv.state_dict())
+
+    online_model = CustomOnline(
+        online_conv,
+        target_conv,
+        args.cl_hid_dim,
+        args.num_hops,
+        args.momentum,
+    ).to(device)
+    target_model = Target(target_conv).to(device)
+    online_parameters = list(online_model.online_encoder.parameters()) + list(
+        online_model.predictor.parameters()
+    )
+    online_optimizer = torch.optim.Adam(
+        online_parameters,
+        lr=args.e1_lr,
+        weight_decay=args.weight_decay,
+    )
+    target_optimizer = None
+    if target_update == 'sgrl_dual_rsm_ema':
+        target_optimizer = torch.optim.Adam(
+            target_model.parameters(),
+            lr=args.e2_lr,
+            weight_decay=args.weight_decay,
+        )
+    return online_model, target_model, online_optimizer, target_optimizer
 
 def train_online_encoder(online: CustomOnline, optimizer, loader, graph_adj, device):
     tot_loss = 0.0
@@ -140,42 +212,30 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
     num_epochs = args.cl_epochs
     dropout = args.cl_dropout
     momentum = args.momentum
-    train_graph = adaption_for_sgrl(dataset)
+    graph_scope = getattr(args, 'sgrl_graph_scope', 'all')
+    train_graph_indices = (
+        [0] if graph_scope == 'source' else list(range(len(dataset.names)))
+    )
+    train_graph_names = [dataset.names[index] for index in train_graph_indices]
+    train_graph = adaption_for_sgrl(dataset, train_graph_indices)
     train_adj = adj_norm(train_graph)
 
     #========== model construction ==========#
     num_hop = args.num_hops
-    input_dim = train_graph.x.size(1)
-    online_conv = CustomConv(
-        args#.cl_model, input_dim,hidden_dim,hidden_dim,activation,num_layers, 
-        #drop_out=dropout,
-    ).to(device)
-    target_conv = CustomConv(
-        args#.cl_model, input_dim,hidden_dim,hidden_dim,activation,num_layers, 
-        #drop_out=dropout,
-    ).to(device)
-
-    # online_model = Online(online_conv,target_conv,hidden_dim,slsp_adj,num_hop,momentum).to(device)
-    online_model = CustomOnline(online_conv,target_conv,hidden_dim,num_hop,momentum).to(device)
-    target_model = Target(target_conv).to(device)
-    
-    online_optimizer = torch.optim.Adam(online_model.parameters(), lr=e1_lr, weight_decay=weight_decay)
-    target_optimizer = torch.optim.Adam(target_model.parameters(), lr=e2_lr, weight_decay=weight_decay)
+    target_update = args.sgrl_pretrain_target_update
+    (
+        online_model,
+        target_model,
+        online_optimizer,
+        target_optimizer,
+    ) = build_sgrl_training_state(args, device)
 
     best_online_loss = 1e9
     best_target_loss = 1e9
 
     #========== contrastive learning ==========#
-    batch_size=args.cl_batch_size #4096
-    train_graph_loader = NeighborLoader(
-        train_graph,
-        num_neighbors=[args.cl_num_neighbors,] * num_layers,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=False,
-        # directed=False,
+    train_graph_loader = make_sgrl_loader(
+        args, train_graph, num_layers, shuffle=True
     )
     # kwargs = {
     # 'batch_size': batch_size, 'shuffle': True, 'num_workers': 8, 
@@ -190,9 +250,12 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
     best_epoch = 0
     cnt_wait = 0
 
-    model_name = f"pkl/pkl_online/best_online_{args.dataset}_" + \
-        f"{args.cl_model}_layer{num_layers}_" + \
-        f"dim{hidden_dim}_{activation}_dr{dropout:.1f}_small.pkl" # small g SGRL
+    cache_key = sgrl_cache_fingerprint(args, train_graph_names)
+    model_name = os.path.join(
+        'pkl',
+        'pkl_online',
+        f'best_online_{cache_key}.pkl',
+    )
     target_model_name = model_name.replace('online', 'target')
     os.makedirs(os.path.dirname(model_name), exist_ok=True)
     os.makedirs(os.path.dirname(target_model_name), exist_ok=True)
@@ -203,7 +266,8 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
 
         for epoch in range(num_epochs):
             online_optimizer.zero_grad()
-            target_optimizer.zero_grad()
+            if target_optimizer is not None:
+                target_optimizer.zero_grad()
             
             # online_loss = train_online(online_model,online_optimizer,data)  
             # online_loss = train_customonline(online_model, online_optimizer, train_graph)        
@@ -216,17 +280,28 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
                 torch.save(online_model.state_dict(), model_name)
                 cnt_wait = 0
             
-            # target_loss = train_target(target_model,target_optimizer,train_graph)
-            target_loss = train_target_encoder(
-                target_model, target_optimizer, train_graph_loader, device)
-            
-            if target_loss < best_target_loss:
-                best_target_loss = target_loss
-                torch.save(target_model.state_dict(), target_model_name)
+            target_loss = None
+            if target_optimizer is not None:
+                target_loss = train_target_encoder(
+                    target_model, target_optimizer, train_graph_loader, device
+                )
+                if target_loss < best_target_loss:
+                    best_target_loss = target_loss
+                    torch.save(target_model.state_dict(), target_model_name)
 
-            print(f"Epoch:{epoch} online_loss={online_loss:.6f} target_loss={target_loss:.6f}")
+            target_loss_text = (
+                f'{target_loss:.6f}' if target_loss is not None else 'ema_only'
+            )
+            print(
+                f"Epoch:{epoch} online_loss={online_loss:.6f} "
+                f"target_loss={target_loss_text}"
+            )
 
-            if (online_loss < -0.99 and target_loss < -0.99) or cnt_wait == 20:
+            losses_converged = (
+                online_loss < -0.99
+                and (target_loss is None or target_loss < -0.99)
+            )
+            if losses_converged or cnt_wait == 20:
                 print("Do early stop")
                 break
             else:
@@ -238,12 +313,22 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
             return {
                 'online_model_path': model_name,
                 'online_state_dict': state_dict_to_cpu(online_model.state_dict()),
+                'cache_key': cache_key,
+                'train_graph_names': train_graph_names,
+                'target_update': target_update,
             }
 
     #========== get all node embeddings learnt by SGRL ==========#
+    inference_graph = adaption_for_sgrl(
+        dataset,
+        list(range(len(dataset.names))),
+    )
+    inference_loader = make_sgrl_loader(
+        args, inference_graph, num_layers, shuffle=False
+    )
     embeds = get_all_contrastive_embed(
-        online_model, model_name, train_graph, 
-        train_graph_loader, hidden_dim, num_hop, device
+        online_model, model_name, inference_graph,
+        inference_loader, hidden_dim, num_hop, device
     )
 
     if return_online_state:
@@ -251,6 +336,9 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
             'embeddings': embeds,
             'online_model_path': model_name,
             'online_state_dict': state_dict_to_cpu(online_model.state_dict()),
+            'cache_key': cache_key,
+            'train_graph_names': train_graph_names,
+            'target_update': target_update,
         }
 
     return embeds

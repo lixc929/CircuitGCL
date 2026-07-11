@@ -98,54 +98,82 @@ class SealSramDataset(InMemoryDataset):
         ## combine multiple graphs into data list
         self.data, self.slices = self.collate(data_list)
 
-    def norm_nfeat(self, ntypes):
+    def _ensure_collated_data(self):
+        if self._data is None and self._data_list is not None:
+            self.data, self.slices = self.collate(self._data_list)
+            self._data_list = None
+
+    def fit_node_feature_normalizer(self, ntypes, graph_indices=None):
+        """Fit node-feature maxima without mutating the dataset."""
+        self._ensure_collated_data()
+        graphs = (
+            [self._data]
+            if graph_indices is None
+            else [self[index] for index in graph_indices]
+        )
+        state = {}
+        for ntype in ntypes:
+            values = [
+                graph.node_attr[graph.node_type == ntype]
+                for graph in graphs
+                if bool((graph.node_type == ntype).any())
+            ]
+            if not values:
+                raise ValueError(f'No nodes found for normalization type {ntype}.')
+            maximum = torch.cat(values, dim=0).max(dim=0, keepdim=True).values
+            maximum[maximum == 0.0] = 1.0
+            state[int(ntype)] = maximum.detach().cpu()
+        return state
+
+    def apply_node_feature_normalizer(self, state):
+        self._ensure_collated_data()
+        for ntype, maximum in state.items():
+            node_mask = self._data.node_type == int(ntype)
+            denominator = maximum.to(
+                device=self._data.node_attr.device,
+                dtype=self._data.node_attr.dtype,
+            )
+            print(f"normalizing node_attr {ntype}: {denominator} ...")
+            self._data.node_attr[node_mask] /= denominator
+        self._data_list = None
+
+    def normalize_targets(self):
+        self._ensure_collated_data()
+        if self.task_level == 'edge':
+            self._data.edge_label = torch.log10(self._data.edge_label * 1e21)
+            self._data.edge_label /= 6
+            self._data.edge_label[self._data.edge_label < 0] = 0.0
+            self._data.edge_label[self._data.edge_label > 1] = 1.0
+            edge_label_c = torch.bucketize(
+                self._data.edge_label, self.class_boundaries
+            )
+            self._data.edge_label = torch.stack(
+                [self._data.edge_label, edge_label_c], dim=1
+            )
+        elif self.task_level == 'node':
+            self._data.y = torch.log10(self._data.y * 1e20) / 6
+            self._data.y[self._data.y < 0] = 0.0
+            self._data.y[self._data.y > 1] = 1.0
+            node_label_c = torch.bucketize(self._data.y, self.class_boundaries)
+            self._data.y = torch.stack([self._data.y, node_label_c], dim=1)
+            print("self._data.y", self._data.y)
+        else:
+            raise ValueError(f'Unsupported task level: {self.task_level}')
+        self._data_list = None
+
+    def norm_nfeat(self, ntypes, fit_graph_indices=None):
         """
          Only `DEVICE` and `NET` nodes have circuit statistics.
         Args:
             ntypes (list): The node types {0, 1} to be normalized
         """
-        if self._data is None and self._data_list is not None:
-            self.data, self.slices = self.collate(self._data_list)
-            self._data_list = None
-
-
-        # normalize the node features
-        for ntype in ntypes:
-            node_mask = self._data.node_type == ntype
-            max_node_feat, _ = self._data.node_attr[node_mask].max(dim=0, keepdim=True)
-            max_node_feat[max_node_feat == 0.0] = 1.0
-
-            print(f"normalizing node_attr {ntype}: {max_node_feat} ...")
-            self._data.node_attr[node_mask] /= max_node_feat
-
-        if self.task_level == 'edge':
-            ## normalize edge_label i.e., coupling capacitance
-            self._data.edge_label = torch.log10(self._data.edge_label * 1e21) 
-            self._data.edge_label /= 6
-            self._data.edge_label[self._data.edge_label < 0] = 0.0
-            self._data.edge_label[self._data.edge_label > 1] = 1.0
-            edge_label_c = torch.bucketize(self._data.edge_label, self.class_boundaries)
-            self._data.edge_label = torch.stack(
-                [self._data.edge_label, edge_label_c], dim=1
-            )
-            self._data_list = None
-          
-
-
-        elif self.task_level == 'node':
-            ## normalize the node label i.e., lumped ground capacitance
-            self._data.y = torch.log10(self._data.y * 1e20) / 6
-            self._data.y[self._data.y < 0] = 0.0
-            self._data.y[self._data.y > 1] = 1.0
-            node_label_c = torch.bucketize(self._data.y, self.class_boundaries)
-            self._data.y = torch.stack(
-                [self._data.y, node_label_c], dim=1
-            )
-            print("self._data.y", self._data.y)
-            self._data_list = None
-
-       
-           
+        state = self.fit_node_feature_normalizer(
+            ntypes,
+            graph_indices=fit_graph_indices,
+        )
+        self.apply_node_feature_normalizer(state)
+        self.normalize_targets()
+        return state
 
     def set_cl_embeds(self, embeds):
         """
@@ -417,13 +445,16 @@ class SealSramDataset(InMemoryDataset):
             processed_names.append(name+"_processed.pt")
         return processed_names
 
-def adaption_for_sgrl(dataset):
+def adaption_for_sgrl(dataset, graph_indices=None):
     """
     It is only used for contrastive learning (SGRL).
     """
     data_list = []
 
-    for i, name in enumerate(dataset.names):
+    if graph_indices is None:
+        graph_indices = range(len(dataset.names))
+
+    for i in graph_indices:
         single_graph = Data(
             x=dataset[i].node_type, 
             edge_index=dataset[i].edge_index, 

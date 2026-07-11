@@ -5,11 +5,16 @@ from sram_dataset import performat_SramDataset, adaption_for_sgrl
 from downstream_train import downstream_train
 import os
 import random
-from sgrl_train import sgrl_train
+from sgrl_train import sgrl_cache_fingerprint, sgrl_train
 import datetime
 import sys
 
-from run_artifacts import finalize_run_artifacts, prepare_run_artifacts
+from run_artifacts import (
+    file_sha256,
+    finalize_run_artifacts,
+    prepare_run_artifacts,
+    update_run_config,
+)
 
 if __name__ == "__main__":
     # STEP 0: Parse Arguments ======================================================================= #
@@ -22,6 +27,24 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="ssram+digtime+timing_ctrl+array_128_32_8t", help="Names of datasets.") # the first dataset is the training dataset
     parser.add_argument('--neg_edge_ratio',type=float,default=0.0,help='The ratio of negative edges.') # 0.0 for classification, 0.5 for regression
     parser.add_argument('--net_only',type=bool,default=True,help='Only use net nodes for node level task or not.')
+    parser.add_argument(
+        '--protocol',
+        choices=['strict_inductive', 'transductive_legacy'],
+        default='transductive_legacy',
+        help='Scientific data-visibility protocol for this run.',
+    )
+    parser.add_argument(
+        '--sgrl_graph_scope',
+        choices=['auto', 'source', 'all'],
+        default='auto',
+        help='Graphs used to fit SGRL; auto follows --protocol.',
+    )
+    parser.add_argument(
+        '--normalization_scope',
+        choices=['auto', 'source', 'all'],
+        default='auto',
+        help='Graphs used to fit node-feature normalization; auto follows --protocol.',
+    )
 
     # Graph sampling setting
     parser.add_argument("--small_dataset_sample_rates", type=float, default=1.0, help="The sample rate for small dataset.")
@@ -32,6 +55,18 @@ if __name__ == "__main__":
     
     # Training setting
     parser.add_argument('--seed', type=int, default=42, help='Random seed.')
+    parser.add_argument(
+        '--split_seed',
+        type=int,
+        default=None,
+        help='Source train/validation split seed. Default: --seed.',
+    )
+    parser.add_argument(
+        '--eval_seed',
+        type=int,
+        default=0,
+        help='Fixed validation/test neighbor-sampling seed.',
+    )
     parser.add_argument("--num_workers", type=int, default=8, help="The number of workers in data loaders.")
     parser.add_argument("--gpu", type=int, default=0, help="GPU index. Default: -1, using cpu.")
     parser.add_argument("--epochs", type=int, default=200, help="Training epochs.")
@@ -228,6 +263,16 @@ if __name__ == "__main__":
     parser.add_argument('--e1_lr', type=float, default=1e-6, help='Learning rate for online encoder in SGRL.')
     parser.add_argument('--e2_lr', type=float, default=2e-7, help='Learning rate for target encoder in SGRL.')
     parser.add_argument(
+        '--sgrl_pretrain_target_update',
+        choices=['sgrl_dual_rsm_ema', 'circuitgcl_text_ema_only'],
+        default='sgrl_dual_rsm_ema',
+        help=(
+            'Target update used only during SGRL pretraining. The dual mode '
+            'matches the SGRL author implementation; ema_only is a matched '
+            'CircuitGCL-text interpretation ablation.'
+        ),
+    )
+    parser.add_argument(
         '--sgrl_online_lr',
         type=float,
         default=1e-6,
@@ -280,6 +325,25 @@ if __name__ == "__main__":
     parser.add_argument('--log_dir', type=str, default='logs', help='The directory to save the log file.')
 
     args = parser.parse_args()
+    if args.split_seed is None:
+        args.split_seed = args.seed
+    if args.sgrl_graph_scope == 'auto':
+        args.sgrl_graph_scope = (
+            'source' if args.protocol == 'strict_inductive' else 'all'
+        )
+    if args.normalization_scope == 'auto':
+        args.normalization_scope = (
+            'source' if args.protocol == 'strict_inductive' else 'all'
+        )
+    if args.protocol == 'strict_inductive':
+        if args.sgrl_graph_scope != 'source':
+            raise ValueError(
+                'strict_inductive requires --sgrl_graph_scope source.'
+            )
+        if args.normalization_scope != 'source':
+            raise ValueError(
+                'strict_inductive requires --normalization_scope source.'
+            )
     if args.sgrl == 0 and args.sgrl_mode != 'static':
         print(f"[Warning] --sgrl_mode {args.sgrl_mode} is ignored because --sgrl is 0.")
         args.sgrl_mode = 'static'
@@ -399,20 +463,42 @@ if __name__ == "__main__":
     cl_embeds = None
     sgrl_online_state = None
     if args.sgrl == 1:
+        train_graph_names = (
+            [dataset.names[0]]
+            if args.sgrl_graph_scope == 'source'
+            else list(dataset.names)
+        )
+        sgrl_key = sgrl_cache_fingerprint(args, train_graph_names)
         if args.sgrl_mode == 'static':
             embedding_dir = './embeddings/'
             os.makedirs(embedding_dir, exist_ok=True)
             embedding_path = os.path.join(
                 embedding_dir,
-                f'embeddings_{args.dataset}_{args.cl_model}_'
-                f'layer{args.cl_gnn_layers}_dim{args.cl_hid_dim}_'
-                f'{args.cl_act_fn}.pkl'
+                f'embeddings_{args.dataset}_{sgrl_key}.pt',
             )
             if os.path.exists(embedding_path):
-                cl_embeds = torch.load(embedding_path)
+                cl_embeds = torch.load(
+                    embedding_path,
+                    map_location='cpu',
+                    weights_only=True,
+                )
             else:
-                cl_embeds = sgrl_train(args, dataset, device)
+                sgrl_result = sgrl_train(
+                    args,
+                    dataset,
+                    device,
+                    return_embeddings=True,
+                    return_online_state=True,
+                )
+                cl_embeds = sgrl_result['embeddings']
                 torch.save(cl_embeds, embedding_path)
+            update_run_config(args, {
+                'sgrl_cache_key': sgrl_key,
+                'sgrl_train_graph_names': train_graph_names,
+                'sgrl_pretrain_target_update': args.sgrl_pretrain_target_update,
+                'embedding_path': os.path.abspath(embedding_path),
+                'embedding_sha256': file_sha256(embedding_path),
+            })
         else:
             sgrl_result = sgrl_train(
                 args,
@@ -423,6 +509,17 @@ if __name__ == "__main__":
             )
             sgrl_online_state = sgrl_result['online_state_dict']
             print(f"Using SGRL online encoder from {sgrl_result['online_model_path']}")
+            update_run_config(args, {
+                'sgrl_cache_key': sgrl_result['cache_key'],
+                'sgrl_train_graph_names': sgrl_result['train_graph_names'],
+                'sgrl_pretrain_target_update': sgrl_result['target_update'],
+                'sgrl_checkpoint_path': os.path.abspath(
+                    sgrl_result['online_model_path']
+                ),
+                'sgrl_checkpoint_sha256': file_sha256(
+                    sgrl_result['online_model_path']
+                ),
+            })
     # STEP 4: Training Epochs ================================================================ #
 
     try:

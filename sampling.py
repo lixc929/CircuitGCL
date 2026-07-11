@@ -14,7 +14,38 @@ NET = 0
 DEV = 1
 PIN = 2
 
-def dataset_sampling(args, dataset):
+def build_split_indices(args, dataset):
+    """Build deterministic source train/validation indices."""
+    train_graph = dataset[0]
+    split_seed = getattr(args, 'split_seed', args.seed)
+    if args.task_level == 'node':
+        indices = np.arange(train_graph.y.size(0))
+    elif args.task_level == 'edge':
+        indices = np.arange(train_graph.edge_label.size(0))
+    else:
+        raise ValueError(f"Invalid task level: {args.task_level}")
+    train_indices, val_indices = train_test_split(
+        indices,
+        test_size=0.2,
+        shuffle=True,
+        random_state=split_seed,
+    )
+    return {
+        'train': torch.tensor(train_indices, dtype=torch.long),
+        'val': torch.tensor(val_indices, dtype=torch.long),
+        'seed': int(split_seed),
+    }
+
+
+def _append_regression_weights(labels, class_weights):
+    if class_weights is None:
+        return labels
+    classes = labels[:, 1].long()
+    weights = class_weights.to(labels.device)[classes].to(labels.dtype)
+    return torch.cat((labels, weights.view(-1, 1)), dim=1)
+
+
+def dataset_sampling(args, dataset, split_indices=None, class_weights=None):
     """ 
     Sampling subgraphs for each graph in dataset
     Args:
@@ -27,22 +58,12 @@ def dataset_sampling(args, dataset):
     ## default training data come from the first dataset
     graph_idx = 0
     train_graph = dataset[graph_idx]
+    if split_indices is None:
+        split_indices = build_split_indices(args, dataset)
     if args.task_level == 'node':
-        if args.net_only:
-            mask = train_graph.node_type == NET 
-            class_labels = train_graph.y[mask, 1]
-        else:
-            class_labels = train_graph.y[:, 1]
-        # get all node indices
-        all_nodes = np.arange(train_graph.y.size(0))
-                
-        # split training and validation set
-        train_node_ind, val_node_ind = train_test_split(
-            all_nodes, test_size=0.2, shuffle=True
-        )
-        # convert to tensor
-        train_node_ind = torch.tensor(train_node_ind, dtype=torch.long)
-        val_node_ind = torch.tensor(val_node_ind, dtype=torch.long)
+        train_node_ind = split_indices['train']
+        val_node_ind = split_indices['val']
+        class_labels = train_graph.y[train_node_ind, 1]
     
         train_loader = NeighborLoader(
             train_graph,
@@ -89,17 +110,14 @@ def dataset_sampling(args, dataset):
             )
     
     elif args.task_level == 'edge':
-        class_labels = train_graph.edge_label[:,1]
-        ## get split for validation
-        train_ind, val_ind = train_test_split(
-            np.arange(train_graph.edge_label.size(0)), 
-            test_size=0.2, shuffle=True, #stratify=stratify,
-        )
-        train_ind = torch.tensor(train_ind, dtype=torch.long)
-        val_ind = torch.tensor(val_ind, dtype=torch.long)
+        train_ind = split_indices['train']
+        val_ind = split_indices['val']
+        class_labels = train_graph.edge_label[train_ind, 1]
 
         train_edge_label_index = train_graph.edge_label_index[:, train_ind]
-        train_edge_label = train_graph.edge_label[train_ind]
+        train_edge_label = _append_regression_weights(
+            train_graph.edge_label[train_ind], class_weights
+        )
 
         ## Create the dataloaders for training dataset
         train_loader = LinkNeighborLoader(
@@ -115,7 +133,9 @@ def dataset_sampling(args, dataset):
         )
 
         val_edge_label_index = train_graph.edge_label_index[:, val_ind]
-        val_edge_label = train_graph.edge_label[val_ind]
+        val_edge_label = _append_regression_weights(
+            train_graph.edge_label[val_ind], class_weights
+        )
 
         ## Create the dataloaders for validation dataset
         val_loader = LinkNeighborLoader(
@@ -141,7 +161,9 @@ def dataset_sampling(args, dataset):
             test_input_edge_labels = test_graph.edge_label
             test_edge_label_index = test_graph.edge_label_index
 
-            test_edge_label = test_input_edge_labels
+            test_edge_label = _append_regression_weights(
+                test_input_edge_labels, class_weights
+            )
 
             ## Create the dataloaders for each test dataset
             test_loaders[graph_name] = \
@@ -168,6 +190,5 @@ def dataset_sampling(args, dataset):
     max_label = max(label_counts, key=label_counts.get)
     print(f"The most common label in the training set is: {max_label}, with {label_counts[max_label]} samples")
 
-    return (train_loader, val_loader, test_loaders, max_label)
+    return (train_loader, val_loader, test_loaders, max_label, split_indices)
 
-  

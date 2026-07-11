@@ -1670,3 +1670,31 @@ Three additional issues were corrected before running P5:
   Earlier local GAI/BMC results used a fixed initial sigma despite the parameter
   being declared trainable; they remain measurements of that fixed-sigma
   implementation but are not the final paper-faithful P5 comparison.
+
+### Legacy P1/P2/P4 Completion and Protocol Boundary
+
+The corrected 80-epoch P1/P2 queue and four additional static downstream seeds
+completed on 2026-07-11. Structured outputs are under
+`logs/s6_p1_p2_protocol_20260711`; the summarizer reports 11 completed runs, no
+running runs, and no artifact-schema anomalies.
+
+These runs are frozen as `legacy-transductive-v1`, not as strict zero-shot
+evidence. SGRL fitted a concatenation of source and transfer graph topology,
+node-feature normalization fitted all loaded circuits, evaluation used the
+relation-balanced processed edge subsets, and static seeds 0-4 shared one
+pretraining/embedding realization. The five static runs therefore measure
+downstream-only variation.
+
+The completed seed-0 results are recorded in
+`logs/s6_p1_p2_protocol_20260711/experiment_runs.tsv`. Static has the best
+source-validation MSE (`0.00784496`). The best positive-lambda LoRA row uses
+the default unified learning rate `1e-4` and reaches validation MSE
+`0.00911473`; it improves digtime relative to seed-0 static but does not beat
+static simultaneously on validation and all transfer circuits. This supports
+continued single-backbone research, not a stable superiority claim.
+
+Formal follow-up is gated on a unified protocol harness with independently
+controlled SGRL graph scope and normalization scope, source-train-only label
+priors, persisted splits and normalization state, fixed evaluation views, and
+matched `sgrl_dual_rsm_ema` versus `circuitgcl_text_ema_only` target-update
+experiments. Legacy and strict results must not be pooled in one group mean.

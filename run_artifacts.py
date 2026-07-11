@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -34,6 +35,15 @@ def _git_commit():
         return None
 
 
+def file_sha256(path, chunk_size=1024 * 1024):
+    path = Path(path)
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        while chunk := source.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def write_json_atomic(path, payload):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,6 +76,17 @@ def prepare_run_artifacts(args, log_filename):
     }
     write_json_atomic(artifact_dir / 'run_config.json', config)
     return artifact_dir
+
+
+def update_run_config(args, metadata):
+    """Atomically merge runtime provenance into the run config."""
+    config_path = Path(args.run_artifact_dir) / 'run_config.json'
+    with config_path.open(encoding='utf-8') as config_file:
+        config = json.load(config_file)
+    config.setdefault('runtime_metadata', {}).update(_json_safe(metadata))
+    config['args'] = _json_safe(vars(args))
+    write_json_atomic(config_path, config)
+    return config_path
 
 
 def _state_to_cpu(value):
