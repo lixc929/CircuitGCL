@@ -11,6 +11,11 @@ import os
 from sram_dataset import adaption_for_sgrl
 from torch_geometric.loader import NeighborLoader, ShaDowKHopSampler, LinkNeighborLoader
 from rng_utils import SamplerFingerprint, fixed_rng, seed_all
+from run_artifacts import file_sha256, write_json_atomic
+
+
+SGRL_CACHE_SCHEMA_VERSION = 1
+EMBEDDING_CACHE_SCHEMA_VERSION = 1
 
 
 def state_dict_to_cpu(state_dict):
@@ -20,9 +25,36 @@ def state_dict_to_cpu(state_dict):
     }
 
 
-def sgrl_cache_fingerprint(args, train_graph_names):
-    fields = {
+def canonical_processed_cache_refs(processed_caches, graph_names=None):
+    """Keep only immutable graph-data identity fields used by SGRL."""
+    if not processed_caches:
+        return []
+    selected_names = set(graph_names) if graph_names is not None else None
+    refs = []
+    for cache in processed_caches:
+        graph_name = cache.get('graph_name')
+        if selected_names is not None and graph_name not in selected_names:
+            continue
+        refs.append({
+            'graph_name': graph_name,
+            'cache_key': cache.get('cache_key'),
+            'raw_sha256': cache.get('raw_sha256'),
+            'processed_sha256': cache.get('processed_sha256'),
+            'relation_sample_seed': cache.get('relation_sample_seed'),
+            'graph_relation_sample_seed': cache.get(
+                'graph_relation_sample_seed'
+            ),
+        })
+    return sorted(refs, key=lambda value: str(value['graph_name']))
+
+
+def sgrl_cache_identity(args, train_graph_names, processed_caches=None):
+    return {
+        'cache_schema_version': SGRL_CACHE_SCHEMA_VERSION,
         'train_graph_names': list(train_graph_names),
+        'processed_caches': canonical_processed_cache_refs(
+            processed_caches, train_graph_names
+        ),
         'graph_scope': args.sgrl_graph_scope,
         'pretraining_seed': getattr(args, 'pretraining_seed', args.seed),
         'target_update': args.sgrl_pretrain_target_update,
@@ -33,26 +65,174 @@ def sgrl_cache_fingerprint(args, train_graph_names):
         'dropout': args.cl_dropout,
         'batch_size': args.cl_batch_size,
         'num_neighbors': args.cl_num_neighbors,
+        'num_hops': getattr(args, 'num_hops', None),
+        'num_workers': getattr(args, 'num_workers', 0),
+        'use_bn': getattr(args, 'use_bn', 0),
         'epochs': args.cl_epochs,
         'online_lr': args.e1_lr,
         'target_lr': args.e2_lr,
         'momentum': args.momentum,
         'weight_decay': args.weight_decay,
     }
+
+
+def sgrl_cache_fingerprint(
+        args, train_graph_names, processed_caches=None):
+    fields = sgrl_cache_identity(
+        args, train_graph_names, processed_caches
+    )
     serialized = json.dumps(fields, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(serialized.encode('utf-8')).hexdigest()[:20]
 
 
-def embedding_cache_fingerprint(args, sgrl_cache_key):
-    """Identify a frozen-embedding view independently of its checkpoint."""
-    fields = {
+def embedding_cache_identity(
+        args, sgrl_cache_key, processed_caches=None):
+    return {
+        'cache_schema_version': EMBEDDING_CACHE_SCHEMA_VERSION,
         'sgrl_cache_key': sgrl_cache_key,
+        'processed_caches': canonical_processed_cache_refs(processed_caches),
         'embedding_inference_seed': getattr(
             args, 'embedding_inference_seed', args.seed
         ),
+        'num_layers': args.cl_gnn_layers,
+        'hidden_dim': args.cl_hid_dim,
+        'batch_size': args.cl_batch_size,
+        'num_neighbors': args.cl_num_neighbors,
+        'num_workers': getattr(args, 'num_workers', 0),
     }
+
+
+def embedding_cache_fingerprint(
+        args, sgrl_cache_key, processed_caches=None):
+    """Identify a frozen-embedding view independently of its checkpoint."""
+    fields = embedding_cache_identity(
+        args, sgrl_cache_key, processed_caches
+    )
     serialized = json.dumps(fields, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(serialized.encode('utf-8')).hexdigest()[:20]
+
+
+def sgrl_checkpoint_paths(cache_key):
+    online_path = os.path.join(
+        'pkl', 'pkl_online', f'best_online_{cache_key}.pkl'
+    )
+    return online_path, online_path.replace('online', 'target')
+
+
+def _cache_metadata_path(cache_path):
+    return f'{cache_path}.metadata.json'
+
+
+def _read_cache_metadata(cache_path, cache_kind):
+    metadata_path = _cache_metadata_path(cache_path)
+    if not os.path.isfile(metadata_path):
+        raise RuntimeError(
+            f'{cache_kind} cache metadata is missing: {metadata_path}'
+        )
+    try:
+        with open(metadata_path, encoding='utf-8') as source:
+            return json.load(source), metadata_path
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f'{cache_kind} cache metadata is malformed: {metadata_path}'
+        ) from error
+
+
+def publish_sgrl_checkpoint_metadata(
+        online_path, cache_key, identity, target_path=None):
+    metadata_path = _cache_metadata_path(online_path)
+    if os.path.exists(metadata_path):
+        raise RuntimeError(
+            f'Refusing to overwrite SGRL metadata: {metadata_path}'
+        )
+    payload = {
+        'cache_schema_version': SGRL_CACHE_SCHEMA_VERSION,
+        'cache_key': cache_key,
+        'identity': identity,
+        'online_checkpoint_sha256': file_sha256(online_path),
+        'target_checkpoint_sha256': (
+            file_sha256(target_path)
+            if target_path and os.path.isfile(target_path)
+            else None
+        ),
+    }
+    write_json_atomic(metadata_path, payload)
+    return validate_sgrl_checkpoint(online_path, cache_key, identity)
+
+
+def validate_sgrl_checkpoint(online_path, cache_key, identity):
+    if not os.path.isfile(online_path):
+        raise RuntimeError(f'SGRL checkpoint is missing: {online_path}')
+    metadata, metadata_path = _read_cache_metadata(
+        online_path, 'SGRL checkpoint'
+    )
+    if metadata.get('cache_schema_version') != SGRL_CACHE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f'SGRL checkpoint schema mismatch: {online_path}'
+        )
+    if metadata.get('cache_key') != cache_key:
+        raise RuntimeError(f'SGRL checkpoint key mismatch: {online_path}')
+    if metadata.get('identity') != identity:
+        raise RuntimeError(f'SGRL checkpoint identity mismatch: {online_path}')
+    actual_sha256 = file_sha256(online_path)
+    if metadata.get('online_checkpoint_sha256') != actual_sha256:
+        raise RuntimeError(f'SGRL checkpoint SHA256 mismatch: {online_path}')
+    return {
+        **metadata,
+        'online_checkpoint_path': os.path.abspath(online_path),
+        'metadata_path': os.path.abspath(metadata_path),
+        'metadata_sha256': file_sha256(metadata_path),
+    }
+
+
+def publish_embedding_metadata(
+        embedding_path, cache_key, identity, checkpoint_sha256,
+        sampler_fingerprint):
+    metadata_path = _cache_metadata_path(embedding_path)
+    if os.path.exists(metadata_path):
+        raise RuntimeError(
+            f'Refusing to overwrite embedding metadata: {metadata_path}'
+        )
+    write_json_atomic(metadata_path, {
+        'cache_schema_version': EMBEDDING_CACHE_SCHEMA_VERSION,
+        'cache_key': cache_key,
+        'identity': identity,
+        'checkpoint_sha256': checkpoint_sha256,
+        'embedding_sha256': file_sha256(embedding_path),
+        'embedding_sampler_fingerprint': sampler_fingerprint,
+    })
+    return validate_embedding_cache(
+        embedding_path, cache_key, identity, checkpoint_sha256
+    )
+
+
+def validate_embedding_cache(
+        embedding_path, cache_key, identity, checkpoint_sha256):
+    if not os.path.isfile(embedding_path):
+        raise RuntimeError(f'Embedding cache is missing: {embedding_path}')
+    metadata, metadata_path = _read_cache_metadata(
+        embedding_path, 'Embedding'
+    )
+    if metadata.get(
+            'cache_schema_version') != EMBEDDING_CACHE_SCHEMA_VERSION:
+        raise RuntimeError(f'Embedding cache schema mismatch: {embedding_path}')
+    if metadata.get('cache_key') != cache_key:
+        raise RuntimeError(f'Embedding cache key mismatch: {embedding_path}')
+    if metadata.get('identity') != identity:
+        raise RuntimeError(f'Embedding cache identity mismatch: {embedding_path}')
+    if metadata.get('checkpoint_sha256') != checkpoint_sha256:
+        raise RuntimeError(
+            f'Embedding checkpoint provenance mismatch: {embedding_path}'
+        )
+    actual_sha256 = file_sha256(embedding_path)
+    if metadata.get('embedding_sha256') != actual_sha256:
+        raise RuntimeError(f'Embedding cache SHA256 mismatch: {embedding_path}')
+    return {
+        **metadata,
+        'embedding_path': os.path.abspath(embedding_path),
+        'metadata_path': os.path.abspath(metadata_path),
+        'metadata_sha256': file_sha256(metadata_path),
+    }
 
 
 def make_sgrl_loader(args, graph, num_layers, shuffle):
@@ -275,16 +455,16 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
     best_epoch = 0
     cnt_wait = 0
 
-    cache_key = sgrl_cache_fingerprint(args, train_graph_names)
-    model_name = os.path.join(
-        'pkl',
-        'pkl_online',
-        f'best_online_{cache_key}.pkl',
+    processed_caches = getattr(dataset, 'processed_cache_provenance', None)
+    cache_identity = sgrl_cache_identity(
+        args, train_graph_names, processed_caches
     )
-    target_model_name = model_name.replace('online', 'target')
+    cache_key = sgrl_cache_fingerprint(
+        args, train_graph_names, processed_caches
+    )
+    model_name, target_model_name = sgrl_checkpoint_paths(cache_key)
     os.makedirs(os.path.dirname(model_name), exist_ok=True)
     os.makedirs(os.path.dirname(target_model_name), exist_ok=True)
-  
 
     if not os.path.exists(model_name):
         print(f"Training SGRL model with name {model_name}...")
@@ -332,6 +512,17 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
             else:
                 cnt_wait += 1
 
+        checkpoint_provenance = publish_sgrl_checkpoint_metadata(
+            model_name,
+            cache_key,
+            cache_identity,
+            target_path=target_model_name,
+        )
+    else:
+        checkpoint_provenance = validate_sgrl_checkpoint(
+            model_name, cache_key, cache_identity
+        )
+
     if return_online_state:
         online_model.load_state_dict(torch.load(
             model_name, map_location=device, weights_only=True
@@ -341,6 +532,8 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
                 'online_model_path': model_name,
                 'online_state_dict': state_dict_to_cpu(online_model.state_dict()),
                 'cache_key': cache_key,
+                'cache_identity': cache_identity,
+                'checkpoint_provenance': checkpoint_provenance,
                 'train_graph_names': train_graph_names,
                 'target_update': target_update,
             }
@@ -366,6 +559,8 @@ def sgrl_train(args, dataset, device, return_embeddings=True, return_online_stat
             'online_model_path': model_name,
             'online_state_dict': state_dict_to_cpu(online_model.state_dict()),
             'cache_key': cache_key,
+            'cache_identity': cache_identity,
+            'checkpoint_provenance': checkpoint_provenance,
             'train_graph_names': train_graph_names,
             'target_update': target_update,
             'embedding_sampler_fingerprint': embedding_sampler_fingerprint,

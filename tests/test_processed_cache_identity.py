@@ -188,7 +188,8 @@ class ProcessedCacheIdentityTest(unittest.TestCase):
         self.assertIsNone(slices)
         self.assertEqual(provenance, loaded_provenance)
         for field in (
-                'processed_path', 'cache_key', 'cache_schema_version',
+                'graph_name', 'processed_path', 'cache_key',
+                'cache_schema_version',
                 'manifest_path', 'manifest_sha256', 'raw_sha256',
                 'processed_sha256', 'sampling_distribution',
                 'relation_sample_seed', 'graph_relation_sample_seed'):

@@ -115,6 +115,7 @@ def validate_processed_cache(processed_path, expected_inputs):
         raise _validation_error('processed SHA256 mismatch', processed_path)
 
     return {
+        'graph_name': expected_inputs['graph_name'],
         'processed_path': str(processed_path),
         'cache_key': expected_key,
         'cache_schema_version': expected_inputs['cache_schema_version'],

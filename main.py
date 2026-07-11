@@ -3,11 +3,16 @@ import torch
 from sram_dataset import performat_SramDataset, adaption_for_sgrl
 from downstream_train import downstream_train
 import os
-import json
 from sgrl_train import (
+    embedding_cache_identity,
     embedding_cache_fingerprint,
+    publish_embedding_metadata,
+    sgrl_cache_identity,
     sgrl_cache_fingerprint,
+    sgrl_checkpoint_paths,
     sgrl_train,
+    validate_embedding_cache,
+    validate_sgrl_checkpoint,
 )
 import datetime
 import sys
@@ -19,7 +24,6 @@ from run_artifacts import (
     finalize_run_artifacts,
     prepare_run_artifacts,
     update_run_config,
-    write_json_atomic,
 )
 
 if __name__ == "__main__":
@@ -505,39 +509,46 @@ if __name__ == "__main__":
             if args.sgrl_graph_scope == 'source'
             else list(dataset.names)
         )
-        sgrl_key = sgrl_cache_fingerprint(args, train_graph_names)
+        processed_caches = dataset.processed_cache_provenance
+        sgrl_identity = sgrl_cache_identity(
+            args, train_graph_names, processed_caches
+        )
+        sgrl_key = sgrl_cache_fingerprint(
+            args, train_graph_names, processed_caches
+        )
+        sgrl_checkpoint_path, _ = sgrl_checkpoint_paths(sgrl_key)
         if args.sgrl_mode == 'static':
             embedding_dir = './embeddings/'
             os.makedirs(embedding_dir, exist_ok=True)
-            embedding_key = embedding_cache_fingerprint(args, sgrl_key)
+            embedding_identity = embedding_cache_identity(
+                args, sgrl_key, processed_caches
+            )
+            embedding_key = embedding_cache_fingerprint(
+                args, sgrl_key, processed_caches
+            )
             embedding_path = os.path.join(
                 embedding_dir,
                 f'embeddings_{args.dataset}_{embedding_key}.pt',
             )
-            embedding_metadata_path = embedding_path + '.metadata.json'
             embedding_sampler_fingerprint = None
             if os.path.exists(embedding_path):
+                checkpoint_provenance = validate_sgrl_checkpoint(
+                    sgrl_checkpoint_path, sgrl_key, sgrl_identity
+                )
+                embedding_provenance = validate_embedding_cache(
+                    embedding_path,
+                    embedding_key,
+                    embedding_identity,
+                    checkpoint_provenance['online_checkpoint_sha256'],
+                )
                 cl_embeds = torch.load(
                     embedding_path,
                     map_location='cpu',
                     weights_only=True,
                 )
-                if os.path.exists(embedding_metadata_path):
-                    with open(
-                        embedding_metadata_path, encoding='utf-8'
-                    ) as metadata_file:
-                        embedding_metadata = json.load(metadata_file)
-                    cached_seed = int(
-                        embedding_metadata['embedding_inference_seed']
-                    )
-                    if cached_seed != args.embedding_inference_seed:
-                        raise RuntimeError(
-                            'Embedding cache inference-seed mismatch: '
-                            f'{cached_seed} != {args.embedding_inference_seed}.'
-                        )
-                    embedding_sampler_fingerprint = embedding_metadata.get(
-                        'embedding_sampler_fingerprint'
-                    )
+                embedding_sampler_fingerprint = embedding_provenance.get(
+                    'embedding_sampler_fingerprint'
+                )
             else:
                 sgrl_result = sgrl_train(
                     args,
@@ -550,15 +561,17 @@ if __name__ == "__main__":
                 embedding_sampler_fingerprint = sgrl_result[
                     'embedding_sampler_fingerprint'
                 ]
+                checkpoint_provenance = sgrl_result[
+                    'checkpoint_provenance'
+                ]
                 torch.save(cl_embeds, embedding_path)
-                write_json_atomic(embedding_metadata_path, {
-                    'embedding_cache_key': embedding_key,
-                    'sgrl_cache_key': sgrl_key,
-                    'embedding_inference_seed': args.embedding_inference_seed,
-                    'embedding_sampler_fingerprint': (
-                        embedding_sampler_fingerprint
-                    ),
-                })
+                embedding_provenance = publish_embedding_metadata(
+                    embedding_path,
+                    embedding_key,
+                    embedding_identity,
+                    checkpoint_provenance['online_checkpoint_sha256'],
+                    embedding_sampler_fingerprint,
+                )
             update_run_config(args, {
                 'sgrl_cache_key': sgrl_key,
                 'embedding_cache_key': embedding_key,
@@ -571,6 +584,24 @@ if __name__ == "__main__":
                 ),
                 'embedding_path': os.path.abspath(embedding_path),
                 'embedding_sha256': file_sha256(embedding_path),
+                'embedding_metadata_path': embedding_provenance[
+                    'metadata_path'
+                ],
+                'embedding_metadata_sha256': embedding_provenance[
+                    'metadata_sha256'
+                ],
+                'sgrl_checkpoint_path': checkpoint_provenance[
+                    'online_checkpoint_path'
+                ],
+                'sgrl_checkpoint_sha256': checkpoint_provenance[
+                    'online_checkpoint_sha256'
+                ],
+                'sgrl_checkpoint_metadata_path': checkpoint_provenance[
+                    'metadata_path'
+                ],
+                'sgrl_checkpoint_metadata_sha256': checkpoint_provenance[
+                    'metadata_sha256'
+                ],
             })
         else:
             sgrl_result = sgrl_train(
@@ -593,6 +624,12 @@ if __name__ == "__main__":
                 'sgrl_checkpoint_sha256': file_sha256(
                     sgrl_result['online_model_path']
                 ),
+                'sgrl_checkpoint_metadata_path': sgrl_result[
+                    'checkpoint_provenance'
+                ]['metadata_path'],
+                'sgrl_checkpoint_metadata_sha256': sgrl_result[
+                    'checkpoint_provenance'
+                ]['metadata_sha256'],
             })
     # STEP 4: Training Epochs ================================================================ #
 
