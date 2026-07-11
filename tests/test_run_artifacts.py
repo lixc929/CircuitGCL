@@ -8,8 +8,10 @@ import torch
 
 from run_artifacts import (
     finalize_run_artifacts,
+    load_best_checkpoint,
     prepare_run_artifacts,
     save_best_checkpoint,
+    update_best_checkpoint_metrics,
     write_run_metrics,
 )
 
@@ -48,6 +50,27 @@ class RunArtifactsTest(unittest.TestCase):
             self.assertEqual(checkpoint['epoch'], 3)
             self.assertIn('model_state_dict', checkpoint)
             self.assertIn('optimizer_state_dict', checkpoint)
+
+            with torch.no_grad():
+                model.weight.add_(10.0)
+            load_best_checkpoint(args, model)
+            self.assertTrue(torch.equal(
+                model.weight,
+                checkpoint['model_state_dict']['weight'],
+            ))
+
+            updated_metrics = {
+                'status': 'completed',
+                'best_val_mse': 0.05,
+                'test_results': {'target': {'mse_raw': 0.2}},
+            }
+            update_best_checkpoint_metrics(args, updated_metrics)
+            updated_checkpoint = torch.load(
+                checkpoint_path,
+                map_location='cpu',
+                weights_only=True,
+            )
+            self.assertEqual(updated_checkpoint['metrics'], updated_metrics)
 
             config = json.loads(
                 (artifact_dir / 'run_config.json').read_text(encoding='utf-8')

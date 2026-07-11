@@ -26,7 +26,7 @@ if __name__ == "__main__":
     # Graph sampling setting
     parser.add_argument("--small_dataset_sample_rates", type=float, default=1.0, help="The sample rate for small dataset.")
     parser.add_argument("--large_dataset_sample_rates", type=float, default=0.1, 
-                        help='Target edge num of large dataset. 20% for large G')
+                        help='Target edge num of large dataset. 20 percent for large G')
     parser.add_argument("--num_hops", type=int, default=4, help="Number of hops in subgraph sampling.")
     parser.add_argument('--num_neighbors',type=int,default=64,help='The number of neighbors in subgraph sampling.')
     
@@ -37,6 +37,18 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=200, help="Training epochs.")
     parser.add_argument("--batch_size", type=int, default=128, help="The batch size.")
     parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate.")
+    parser.add_argument(
+        '--early_stopping_patience',
+        type=int,
+        default=0,
+        help='Stop after this many epochs without raw validation-MSE improvement. Zero disables.',
+    )
+    parser.add_argument(
+        '--early_stopping_min_delta',
+        type=float,
+        default=0.0,
+        help='Minimum raw validation-MSE decrease required to reset early stopping.',
+    )
 
     # SGRL arguments
     parser.add_argument('--sgrl', type=int, default=0, help='Enable contrastive learning, i.e., SGRL.')
@@ -144,6 +156,15 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help='Weight of the EMA-target GCL loss in joint_shared mode.',
+    )
+    parser.add_argument(
+        '--joint_backbone_lr',
+        type=float,
+        default=None,
+        help=(
+            'Optional learning rate for pretrained joint-shared base GNN '
+            'parameters. LoRA, statistics, predictor, and head keep --lr.'
+        ),
     )
     parser.add_argument(
         '--joint_lora_rank',
@@ -270,6 +291,8 @@ if __name__ == "__main__":
             )
         if args.joint_gcl_lambda < 0.0:
             raise ValueError('--joint_gcl_lambda must be non-negative.')
+        if args.joint_backbone_lr is not None and args.joint_backbone_lr < 0.0:
+            raise ValueError('--joint_backbone_lr must be non-negative.')
         if args.joint_lora_rank < 0:
             raise ValueError('--joint_lora_rank must be non-negative.')
         if args.joint_lora_rank > 0 and args.cl_model != 'clustergcn':
@@ -277,6 +300,10 @@ if __name__ == "__main__":
                 'Mergeable joint LoRA currently supports --cl_model '
                 'clustergcn only.'
             )
+    if args.early_stopping_patience < 0:
+        raise ValueError('--early_stopping_patience must be non-negative.')
+    if args.early_stopping_min_delta < 0.0:
+        raise ValueError('--early_stopping_min_delta must be non-negative.')
 
     # Syncronize all random seeds
     random.seed(args.seed)

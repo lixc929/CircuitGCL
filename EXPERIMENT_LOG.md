@@ -1551,3 +1551,45 @@ validation-loss ranges are only `0.01003465-0.01004999` and
 which duplicate is selected. The non-LoRA `lambda=0.05` seed-0 process under
 `logs/s6_convergence40_seed0_gpu_parallel_20260711/lambda_005` stopped during
 epoch 37 and retains `running` artifact metadata; it is incomplete and excluded.
+
+### P0 Corrected Selection Protocol and P1/P2 Queue
+
+The S6 audit exposed a protocol issue: regression metrics were displayed after
+rounding MSE to four decimals, and the same rounded value was also used to
+select the best checkpoint. Four of the nine canonical 40-epoch S6 runs had a
+later epoch with a lower raw validation MSE that was not saved because both
+epochs occupied the same four-decimal bin. The largest observed raw-MSE gap was
+`5.922e-5`, which is comparable to the small differences among S6 candidates.
+
+P0 changes the protocol as follows:
+
+- `Logger` retains `mse_raw` while preserving rounded metrics for display.
+- Checkpoints and early stopping use raw validation MSE plus an explicit
+  `early_stopping_min_delta`.
+- Transfer test sets are not evaluated whenever validation improves. Training
+  first finishes, reloads `best_model.pt`, and evaluates each transfer set once.
+- Final transfer metrics are written to both `metrics.json` and the checkpoint.
+
+P2 adds `--joint_backbone_lr`. When set, pretrained
+`shared_backbone.gnn.*` parameters use this learning rate, while LoRA,
+statistics adapters, predictor, and supervised head retain `--lr`. EMA-target
+parameters remain frozen.
+
+The staged seed-0 queue is versioned in `scripts/run_s6_p1_p2.sh`. Every run
+uses at most 80 epochs, raw-MSE early stopping with patience 12 and minimum
+delta `1e-6`, and the corrected final-only transfer protocol.
+
+| Stage | Candidate | Purpose |
+| --- | --- | --- |
+| P1 | static + MSE | Matched 80-epoch reference |
+| P1 | joint_shared, lambda=0 | No-adapter shared reference |
+| P1 | LoRA r8, lambda=0 | Isolate task adapter |
+| P1 | LoRA r8, lambda=0.05 | Isolate joint GCL contribution |
+| P2 | LoRA r8, lambda=0.05, backbone LR=1e-5/1e-6 | Limit pretrained-backbone drift |
+| P2 | LoRA r8, lambda=0, backbone LR=1e-5 | Paired low-LR GCL ablation |
+
+GPU3 and GPU4 have independent serial lanes. A lane waits until its GPU has at
+least 8 GB free and utilization is at most 80%, so no external process is
+stopped and two CircuitGCL runs are never placed on the same GPU concurrently.
+P3 rank/layer screening starts only after this queue identifies the best P2
+optimization setting; P4 multi-seed and P5 rebalancing remain gated on P3.

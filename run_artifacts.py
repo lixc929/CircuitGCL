@@ -97,6 +97,32 @@ def save_best_checkpoint(args, model, optimizer, epoch, metrics):
     return checkpoint_path
 
 
+def load_best_checkpoint(args, model, map_location='cpu'):
+    checkpoint_path = Path(args.run_artifact_dir) / 'best_model.pt'
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=map_location,
+        weights_only=True,
+    )
+    model.load_state_dict(checkpoint['model_state_dict'])
+    return checkpoint
+
+
+def update_best_checkpoint_metrics(args, metrics):
+    artifact_dir = Path(args.run_artifact_dir)
+    checkpoint_path = artifact_dir / 'best_model.pt'
+    temporary_path = artifact_dir / 'best_model.pt.tmp'
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location='cpu',
+        weights_only=True,
+    )
+    checkpoint['metrics'] = _json_safe(metrics)
+    torch.save(checkpoint, temporary_path)
+    os.replace(temporary_path, checkpoint_path)
+    return checkpoint_path
+
+
 def write_run_metrics(args, metrics):
     path = Path(args.run_artifact_dir) / 'metrics.json'
     write_json_atomic(path, metrics)

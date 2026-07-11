@@ -25,7 +25,12 @@ from balanced_mse import GAILoss, BMCLoss, BNILoss, train_gmm, WeightedMSE, get_
 import os
 import matplotlib.pyplot as plt
 
-from run_artifacts import save_best_checkpoint, write_run_metrics
+from run_artifacts import (
+    load_best_checkpoint,
+    save_best_checkpoint,
+    update_best_checkpoint_metrics,
+    write_run_metrics,
+)
 
 # from torch.utils.data.sampler import SubsetRandomSampler
 # from sram_dataset import LinkPredictionDataset
@@ -96,10 +101,12 @@ class Logger (object):
             }
 
         else:  # regression task
+            mse_raw = float(mean_squared_error(true, pred_score))
             res = {
                 'loss': round(self._loss / self._size_current, 8),
                 'mae': reformat(mean_absolute_error(true, pred_score)),
-                'mse': reformat(mean_squared_error(true, pred_score)),
+                'mse': reformat(mse_raw),
+                'mse_raw': mse_raw,
                 'rmse': reformat(root_mean_squared_error(true, pred_score)),
                 'r2': reformat(r2_score(true, pred_score)),
             }
@@ -198,6 +205,15 @@ def eval_epoch(args, loader, model, device,
                                 loss=loss.detach().cpu().item(),
                                 )
     return logger.write_epoch(split)
+
+
+def validation_mse(result):
+    """Return the unrounded MSE used for checkpoint selection."""
+    return float(result.get('mse_raw', result['mse']))
+
+
+def validation_improved(best_mse, result, min_delta=0.0):
+    return best_mse - validation_mse(result) > min_delta
 
 
 def has_partial_shared_backbone(args, model):
@@ -446,9 +462,13 @@ def regress_train(args, regressor, optimizier, criterion,
     optimizier.zero_grad()
     
     best_results = {
-        'best_val_mse': 1e9, 'best_val_loss': 1e9, 
-        'best_epoch': 0, 'test_results': []
+        'best_val_mse': 1e9,
+        'best_val_loss': 1e9,
+        'best_epoch': -1,
+        'test_results': [],
+        'test_results_by_name': {},
     }
+    epochs_without_improvement = 0
     audit_context = build_partial_shared_audit_context(
         args,
         regressor,
@@ -532,26 +552,15 @@ def regress_train(args, regressor, optimizier, criterion,
         )
 
         ## update the best results so far
-        if best_results['best_val_mse'] > val_res['mse']:
-            best_results['best_val_mse'] = val_res['mse']
+        if validation_improved(
+            best_results['best_val_mse'],
+            val_res,
+            min_delta=getattr(args, 'early_stopping_min_delta', 0.0),
+        ):
+            best_results['best_val_mse'] = validation_mse(val_res)
             best_results['best_val_loss'] = val_res['loss']
             best_results['best_epoch'] = epoch
-        
-            test_results = []
-            test_results_by_name = {}
-           
-            ## ========== testing on other datasets ========== ##
-            for test_name in test_loaders.keys():
-                res = eval_epoch(
-                    args, test_loaders[test_name], 
-                    regressor, device, split='test', 
-                    criterion=criterion
-                )
-                test_results.append(res)
-                test_results_by_name[test_name] = res
-
-            best_results['test_results'] = test_results
-            best_results['test_results_by_name'] = test_results_by_name
+            epochs_without_improvement = 0
             artifact_metrics = {
                 'status': 'running',
                 'task': args.task,
@@ -560,7 +569,7 @@ def regress_train(args, regressor, optimizier, criterion,
                 'best_epoch': best_results['best_epoch'],
                 'best_val_mse': best_results['best_val_mse'],
                 'best_val_loss': best_results['best_val_loss'],
-                'test_results': test_results_by_name,
+                'test_results': {},
             }
             checkpoint_path = save_best_checkpoint(
                 args,
@@ -572,9 +581,8 @@ def regress_train(args, regressor, optimizier, criterion,
             artifact_metrics['best_checkpoint'] = str(checkpoint_path)
             write_run_metrics(args, artifact_metrics)
             print(f"Saved isolated best checkpoint to {checkpoint_path}")
-
-        if best_results['best_epoch'] == epoch:
-            best_results['test_results'] = test_results
+        else:
+            epochs_without_improvement += 1
 
         record_partial_shared_representation_audit(
             args,
@@ -585,8 +593,40 @@ def regress_train(args, regressor, optimizier, criterion,
 
         print( "=====================================")
         print(f" Best epoch: {best_results['best_epoch']}, mse: {best_results['best_val_mse']}, loss: {best_results['best_val_loss']}")
-        print(f" Test results: {[res for res in best_results['test_results']]}")
+        print(" Test results: deferred until training completes")
         print( "=====================================")
+
+        patience = getattr(args, 'early_stopping_patience', 0)
+        if patience > 0 and epochs_without_improvement >= patience:
+            print(
+                f'Early stopping at epoch {epoch}: no validation-MSE '
+                f'improvement greater than '
+                f'{getattr(args, "early_stopping_min_delta", 0.0):.2e} '
+                f'for {patience} epochs.'
+            )
+            break
+
+    checkpoint_path = os.path.join(args.run_artifact_dir, 'best_model.pt')
+    load_best_checkpoint(args, regressor, map_location=device)
+    print(
+        f"Loaded best checkpoint from epoch {best_results['best_epoch']} "
+        'for final transfer evaluation.'
+    )
+    test_results = []
+    test_results_by_name = {}
+    for test_name, test_loader in test_loaders.items():
+        res = eval_epoch(
+            args,
+            test_loader,
+            regressor,
+            device,
+            split=f'test:{test_name}',
+            criterion=criterion,
+        )
+        test_results.append(res)
+        test_results_by_name[test_name] = res
+    best_results['test_results'] = test_results
+    best_results['test_results_by_name'] = test_results_by_name
 
     final_metrics = {
         'status': 'completed',
@@ -596,11 +636,10 @@ def regress_train(args, regressor, optimizier, criterion,
         'best_epoch': best_results['best_epoch'],
         'best_val_mse': best_results['best_val_mse'],
         'best_val_loss': best_results['best_val_loss'],
-        'test_results': best_results.get('test_results_by_name', {}),
-        'best_checkpoint': str(
-            os.path.join(args.run_artifact_dir, 'best_model.pt')
-        ),
+        'test_results': test_results_by_name,
+        'best_checkpoint': checkpoint_path,
     }
+    update_best_checkpoint_metrics(args, final_metrics)
     write_run_metrics(args, final_metrics)
     return best_results
 
@@ -805,6 +844,41 @@ def print_parameter_summary(model):
 
 
 def build_optimizer(args, model):
+    joint_backbone_lr = getattr(args, 'joint_backbone_lr', None)
+    if (
+        getattr(args, 'use_sgrl_joint_shared', 0)
+        and joint_backbone_lr is not None
+    ):
+        base_backbone_params = []
+        task_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            is_base_backbone = (
+                name.startswith('shared_backbone.gnn.')
+                and '.lora_a.' not in name
+                and '.lora_b.' not in name
+            )
+            if is_base_backbone:
+                base_backbone_params.append(param)
+            else:
+                task_params.append(param)
+        print(
+            'Using separate optimizer groups for joint-shared base GNN '
+            f'(backbone_lr={joint_backbone_lr}, task_lr={args.lr}, '
+            f'backbone_values={sum(p.numel() for p in base_backbone_params):,}, '
+            f'task_values={sum(p.numel() for p in task_params):,}).'
+        )
+        param_groups = []
+        if base_backbone_params:
+            param_groups.append({
+                'params': base_backbone_params,
+                'lr': joint_backbone_lr,
+            })
+        if task_params:
+            param_groups.append({'params': task_params, 'lr': args.lr})
+        return torch.optim.Adam(param_groups, lr=args.lr)
+
     partial_shared_backbone_lr = getattr(args, 'partial_shared_backbone_lr', None)
     if has_partial_shared_backbone(args, model) and partial_shared_backbone_lr is not None:
         backbone_params = [
