@@ -129,6 +129,8 @@ def _update_tensor_hash(digest, name, tensor):
     digest.update(str(name).encode('utf-8'))
     digest.update(str(tensor.dtype).encode('utf-8'))
     digest.update(str(tuple(tensor.shape)).encode('utf-8'))
+    if tensor.dim() == 0:
+        tensor = tensor.reshape(1)
     digest.update(tensor.view(torch.uint8).numpy().tobytes())
 
 

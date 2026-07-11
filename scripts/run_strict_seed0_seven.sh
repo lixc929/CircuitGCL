@@ -4,7 +4,7 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/lixc/.conda/envs/RCG/bin/python}"
-LOG_ROOT="${LOG_ROOT:-logs/strict_seed0_seven_20260711}"
+LOG_ROOT="${LOG_ROOT:-logs/strict_seed0_seven_20260712_v2}"
 STATUS_FILE="${ROOT_DIR}/${LOG_ROOT}/queue_status.tsv"
 MIN_FREE_MB="${MIN_FREE_MB:-6500}"
 POLL_SECONDS="${POLL_SECONDS:-60}"

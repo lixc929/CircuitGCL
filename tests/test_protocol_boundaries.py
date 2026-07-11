@@ -223,6 +223,17 @@ class ProtocolBoundaryTest(unittest.TestCase):
             embedding_cache_fingerprint(second_view, first_checkpoint),
         )
 
+    def test_state_dict_fingerprint_supports_scalar_integer_buffers(self):
+        state = {
+            'weight': torch.tensor([[1.0, 2.0]]),
+            'num_batches_tracked': torch.tensor(7, dtype=torch.long),
+        }
+        first = state_dict_fingerprint(state)
+        second = state_dict_fingerprint(state)
+        self.assertEqual(first, second)
+        state['num_batches_tracked'] += 1
+        self.assertNotEqual(first, state_dict_fingerprint(state))
+
     def test_cache_hit_and_miss_have_identical_downstream_signature(self):
         dataset = TinyEdgeDataset(
             make_edge_graph('source', 12),
