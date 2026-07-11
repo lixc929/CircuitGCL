@@ -640,3 +640,99 @@ method × confirmation seed × relation-balanced/natural
 ## 20. 一句话交接结论
 
 当前项目最值得继续的是 S6 的单 backbone + LoRA 方向和已经建立的 artifact/审计体系；`PROTOCOL_REPAIR_EXPERIMENT_HANDOFF.md` 的主线合理，但还必须先解决 strict-vs-transductive 边界、SGRL target-update 歧义、source-train-only statistics、LDS 权重链路、E0 因果混杂、独立 tuning/confirmation seeds、E5 可识别性、自然分布评估和一次性 blind reveal。否则即使后续数字更好，也不足以支撑可信的跨电路泛化或算法归因结论。
+
+## 21. `af06131` 实现与 E0 seed0 现场复核（2026-07-11 21:37 CST）
+
+本节是晚于前文的最新增量审计；涉及当前实现和 E0 运行状态时，以本节和主交接文档的对应更新为准。
+
+### 21.1 Git、测试和运行状态
+
+- 当前 `test@af061316193b054dcdd3bc481919bdf77c0bc15d`，与 `lixc929/test` 同步，工作区在写本文档前 clean。
+- `ab1f252` 是核心协议实现；`af06131` 增加 A-G E0 runner，并让科学等价的 source-only C/D 共享 SGRL key。
+- 使用 RCG 环境、隐藏 CUDA 且禁止写 bytecode运行 `python -m unittest tests.test_protocol_boundaries`，现有 5 项测试全部通过。
+- `logs/protocol_e0_20260711` 有且仅有 A-G 七个 seed0 artifact。截至本节快照，7 个 tmux pane/PID 均存活于 GPU4，`run_config.json`/`metrics.json` 全为 `running`、`ended_at` 缺失、`test_results={}`；completed/failed/stale/duplicate 均为 0。不得引用当前中间 best 值。
+- 七个任务未发现 traceback、OOM 或 NaN；本次审计未启动、停止或修改任何训练进程。
+
+### 21.2 WP1-WP7 的真实实现等级
+
+| WP | 当前判断 | 已实现 | 仍缺失 |
+| --- | --- | --- | --- |
+| WP1 | 部分完成 | strict CLI/scope 检查；SGRL 只在 source graph 拟合 | 全数据仍预加载；transfer loaders/labels 和 frozen target embeddings 在 downstream 训练前构造；强 no-access 证明不存在 |
+| WP2 | 主体完成 | source/all fit 分支；state 保存和 hash；极端 transfer feature 单测 | state load-transform round trip；val/test 并非从 artifact 重新加载 state |
+| WP3 | edge 主路径基本完成 | split 持久化；GAI/BNI/LDS 正式路径只用 source-train labels | forbidden source-val/transfer prior 测试；兼容 `train_gmm(dataset=...)` 仍会读取完整 source；node/classification 未修 |
+| WP4 | 核心 LDS bug 已修 | loader 前生成第三列 sample weight | `lds_sigma` 默认/帮助仍矛盾；val/test 也附加 weight；class-0 正权重未显式测试 |
+| WP5 | 实现基本完成 | dual/EMA-only、同步初始化、optimizer 隔离、target mode cache key | 没有真实 online step、EMA 公式/cadence 测试；S6 downstream cadence 仍无独立 CLI |
+| WP6 | 部分完成 | eval seed；Python/NumPy/CPU Torch RNG 保存恢复；final-only transfer | 未验证真实 LinkNeighborLoader 连续重复；无 eval-view fingerprint、多 worker/CUDA 确定性或 SGRL embedding inference view |
+| WP7 | 未完成 | SGRL key 已包含 scope/seed/target/主要超参；split/norm/embedding 有 hash | 缺 raw/processed/code fingerprints、static checkpoint hash、cache lock/原子发布、processed key 修复和完整 artifact 字段 |
+
+因此不能把当前状态表述为“WP1-WP7 已全部完成并验收”。现有 5 项单测是有价值的最小单元测试，不是完整 protocol regression suite。
+
+### 21.3 当前 E0 的 cache-hit/miss RNG 混杂
+
+实际 cache 路径：
+
+- A、C、E：cache miss，在各自进程内先训练 SGRL并生成全部图 embedding。
+- B、D：在 A/C 完成 cache 发布后启动，cache hit；本轮没有并发写同一 cache。
+- A/B 共享 all-graph embedding hash；C/D 共享 source-dual embedding hash；E 为独立 EMA-only embedding。
+
+`main.py` 只在 SGRL 前调用一次全局 seed，同一进程进入 downstream 前没有重置。cache miss 会消耗 SGRL training/inference RNG，cache hit 不会。因此：
+
+- A/B 和 C/D 虽共享 embedding、split，downstream 初始化/采样 RNG 起点仍不同；不是纯 normalization 对照。
+- D/E 同时改变 target update 和 cache hit/miss RNG；不是纯 target-update 对照。
+- A/C 的不同 SGRL 图规模也会消耗不同数量的 RNG，topology effect 与 downstream RNG 路径混合。
+- B/D 都是 cache hit，是当前相对更干净的 topology 指示性对照，但仍没有训练级确定性保证，不能单独承担正式因果结论。
+
+这是当前 formal E0 的首要 blocker。修复方式不是简单重跑，而是拆分 `pretraining_seed`/`downstream_seed`/sampler seeds，在 cache/pretrain 后显式重置 downstream RNG，并增加 cache-hit/miss 等价回归测试。SGRL frozen embedding inference 也需要独立固定 view/seed。
+
+### 21.4 normalization 因子在当前数据上退化为同一状态
+
+七份 `normalization_state.pt` 的 SHA256 完全相同：
+
+```text
+df87fe04822420c6ada72e88a887fb9a840ee1903e42515ce8e397198d380749
+```
+
+七份 split hash 也完全相同：
+
+```text
+fdfa534da0d812b72f8bd6368bef9a14166d6fc8772e476705986eee626b0ff2
+```
+
+这说明 source/all 分支确实分别执行了，但 SSRAM 已经给出当前 max-normalizer 的逐维全局最大值，因而实际变换完全相同。正式机制结论应为：
+
+> 当前代码原先存在 normalization 拟合边界问题，但对本次四电路、当前 max-normalization 定义而言，source/all state 相同，实测数值影响为零。
+
+A/B、C/D、F/G 最终即使出现 MSE 差异，也不得归因 normalization；它们更可能反映 cache RNG 路径或 CUDA/training 非确定性。
+
+### 21.5 strong strict boundary 尚未成立
+
+source-only SGRL 参数拟合确实只使用 SSRAM。可是当前仍会：
+
+1. 在训练前加载并 collate 全部 transfer graph；
+2. 在 downstream 训练前读取 transfer labels 并构造 test loaders；
+3. 在 source-only SGRL 后、downstream 训练前，用冻结 encoder 对全部四图生成 static embedding。
+
+这些操作没有让 transfer 数据参与梯度或 normalization/prior 拟合，所以 parameter-fit strict inductive 基本成立；若主张最强的“目标图、特征、标签只在最终评估阶段访问”，则当前实现和测试都不满足。后续必须明确采用哪一种定义，并让文档、lazy data path 和 forbidden-access 测试一致。
+
+### 21.6 E0 runner 与 artifact 缺口
+
+`scripts/run_protocol_e0.sh` 的 A-G 配置映射正确，但只硬编码 80 epochs：没有 160 模式、`best_epoch >= 72` 触发器、matched-group 闭包、独立 `e80/e160` run tag 或 seeds 0-2 矩阵调度。当前仅完成了 21 个 tuning cells 中的 7 个 seed0 启动。
+
+当前 artifact 还缺：
+
+- raw/processed hashes 和 sampling distribution；
+- 独立 pretraining/downstream/train-sampler/relation-sample seeds；
+- eval sampler/view fingerprint；
+- static SGRL checkpoint path/hash；
+- dirty/source tree、运行库、driver、deterministic flags；
+- target initialization/update cadence。
+
+cache/checkpoint/embedding 仍无实现层锁和原子发布。当前 A/C 先写、B/D 后读，避免了本轮竞争，但人工启动顺序不能替代 WP7。
+
+### 21.7 当前任务处理规则
+
+1. 让 7 个现有任务自然完成，不中断、不覆盖；它们统一标记为 `E0-seed0-calibration-v1`。
+2. 完成后只审计 final status、best epoch、final-only transfer、重复 eval 和 artifact；不把中间值写入结果表。
+3. 以 state hash 直接报告 normalization 数值影响为零，不用随机 MSE 差异估计该因子。
+4. 在修复阶段 RNG、真实 fixed-eval、cache provenance/locking 和 80/160 runner 前，不启动 seeds 1-2 或 E1。
+5. 修复后从固定 cache 和独立 downstream seed 重跑 formal E0 seeds 0-2；当前 calibration 不进入 formal mean、排名或 target-mode 决策。

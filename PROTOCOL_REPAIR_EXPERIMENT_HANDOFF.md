@@ -16,7 +16,8 @@
 
 - 日期：2026-07-11 CST
 - 分支：`test`
-- 当前代码提交：`71bb8829c8c6ba8db3738c4133baac10c0b16fa5`
+- 当前代码提交：`af061316193b054dcdd3bc481919bdf77c0bc15d`
+- 核心协议修复提交：`ab1f252`
 - 远端工作分支：`lixc929/test`
 - Python 环境：`/home/lixc/.conda/envs/RCG/bin/python`
 - 当前成熟任务：edge regression
@@ -205,6 +206,8 @@ EMA-only 模式必须从 online 同步初始化 target，并与 S6 downstream EM
 - [ ] 使用访问 transfer graph 就抛异常的伪数据集，strict SGRL smoke test 必须通过。
 - [ ] transductive legacy 模式仍能复现原有 all-circuit graph 构造。
 
+当前实现审计（`af06131`）：source-only SGRL 的参数拟合边界已经成立，但最强版本的“训练期间完全不访问 transfer 数据”尚未成立。当前程序仍会在训练前加载并 collate 全部图，在 downstream 训练前构造 transfer loaders、读取 transfer labels，并在 source-only SGRL 结束后立即用冻结 encoder 为全部图生成 embedding。以上操作不让 transfer 数据参与梯度或统计量拟合，因此可以称为 parameter-fit strict inductive；在完成 lazy/deferred transfer construction 前，不能声称训练阶段从未访问 transfer graph/features/labels。
+
 ### WP2：source-fit normalization
 
 - [ ] 将 normalization 拆为 `fit_normalizer(source_graph)` 和 `transform(graph, state)`。
@@ -268,11 +271,15 @@ EMA-only 模式必须从 online 同步初始化 target，并与 S6 downstream EM
 - [ ] 评估过程不得改变后续训练 RNG 状态。
 - [ ] artifact 记录 sampler 配置、eval seed 和 fingerprint。
 - [ ] 若 PyG generator 不能可靠固定采样，则使用 RNG-preserving context 或预物化固定 eval batches。
+- [ ] 将 `pretraining_seed`、`downstream_seed`、`split_seed`、`train_sampler_seed`、`eval_seed` 分开，不再让一个全局 RNG 状态串联所有阶段。
+- [ ] 在 SGRL 训练或 cache load 完成后、构建 downstream model/loader 前，显式重置 downstream RNG。
+- [ ] 固定 SGRL frozen-embedding inference 的 sampling seed/view；不同 SGRL 训练条件不得因为此前 RNG 消耗量不同而使用不同的 embedding inference neighborhoods。
 
 验收测试：
 
 - [ ] 同一 checkpoint 连续评估至少 5 次，MSE 完全一致或差异低于预设数值容差。
 - [ ] 不同方法在同一 paired seed 下使用相同 evaluation neighborhoods。
+- [ ] 同一 embedding、normalization state 和 split 在 cache miss 与 cache hit 两条路径下，downstream 初始权重、首批数据和训练轨迹一致。
 
 ### WP7：缓存和 artifact 指纹
 
@@ -282,6 +289,8 @@ EMA-only 模式必须从 online 同步初始化 target，并与 S6 downstream EM
 - [ ] 避免 `neg_edge_ratio=0.04` 与 `0.0` 的一位小数命名冲突。
 - [ ] run config 记录所有实际加载 cache 的绝对路径和 SHA256。
 - [ ] 并行运行不得竞争写同一 checkpoint/cache。
+- [ ] checkpoint/embedding 使用锁或 run-local 临时文件后原子发布；runner 依赖顺序不能替代实现层并发保护。
+- [ ] static artifact 同时记录生成 embedding 的 SGRL online checkpoint 路径和 SHA256，而不只记录 embedding。
 
 ### WP8：relation-aware 与 natural evaluation
 
@@ -329,15 +338,83 @@ EMA-only 模式必须从 online 同步初始化 target，并与 S6 downstream EM
 - E0-D/E 隔离 target update；matched 结果出来前不预设赢家。
 - E0-F/G 单独识别 no-GCL normalization 影响。
 
+#### 2026-07-11 21:37 seed0 现场审计：运行中历史快照
+
+以下内容保留当时的运行中证据；七个任务之后已经全部完成，最终状态和结果以紧随其后的“完成后复核”为准。`logs/protocol_e0_20260711` 当时有 A-G 七个 seed0 运行，全部来自 commit `af06131`，位于 GPU4，对应 tmux pane 均存活。截至 2026-07-11 21:37 CST：
+
+```text
+completed = 0
+running_active = 7
+failed = 0
+stale = 0
+test_results = {}
+```
+
+不得把其中间 best epoch/MSE 写入正式结果。七个运行先自然完成，不中断、不覆盖；但即使完成，也只能标记为 `E0-seed0-calibration-v1`，原因如下：
+
+1. 七份 `normalization_state.pt` 的 SHA256 完全相同：`df87fe04822420c6ada72e88a887fb9a840ee1903e42515ce8e397198d380749`。SSRAM 已提供当前 max-normalizer 的逐维全局最大值，因此 source/all 拟合域虽然不同，实际变换数值相同。A/B、C/D、F/G 的 MSE 差不得解释为 normalization effect；当前可审计的机制结论是该 leakage 在这批数据和此 normalizer 下的实测数值影响为零。
+2. A、C、E 是 SGRL cache miss，会先训练 SGRL并生成 embedding；B、D 是 cache hit。`main.py` 只在 SGRL 前设置一次随机种子，进入 downstream 前没有重置 RNG。因此 A/B、C/D、D/E，以及不同图规模的 A/C，downstream RNG 起点不匹配，当前不是纯 normalization/topology/target-update 因子对照。
+3. A/B 实际共享同一 all-graph embedding hash，C/D 共享同一 source-dual embedding hash，所有 split hash 也相同；启动顺序已避免本轮 cache 并发写。但 cache 文件仍无锁、非原子发布，不能依赖人工启动顺序作为正式并发保证。
+4. 当前五项 `tests.test_protocol_boundaries` CPU 单测通过，但它们没有覆盖真实 LinkNeighborLoader 连续五次评估、cache hit/miss downstream 等价性、target EMA 数值公式、完整 forbidden-transfer training smoke 或 artifact 最低字段。
+
+因此当前 seed0 结束后禁止直接启动 seeds 1-2 或 E1。先完成 WP6/WP7 的 RNG/cache 修复和缺失验收，再从固定 cache、独立 downstream seed 的干净状态重跑 formal E0。
+
+#### 2026-07-11 完成后复核：`E0-seed0-calibration-v1`
+
+七个任务均在约 21:46 CST 正常完成。最终审计结果为：
+
+```text
+completed = 7
+failed = 0
+OOM / traceback / NaN = 0
+final transfer evaluation = 7/7 在重新加载各自 best checkpoint 后执行
+our GPU4 training processes = 全部正常退出
+```
+
+产物目录：`logs/protocol_e0_20260711`。下表报告 raw MSE，越低越好；“迁移均值”是 `digtime`、`timing_ctrl` 和 `array_128_32_8t` 的算术平均。
+
+| ID | 配置 | Best epoch | Source Val | digtime | timing_ctrl | array | 迁移均值 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | static, all graph, all norm, dual | 76 | 0.007846 | 0.018416 | 0.011085 | 0.009738 | 0.013080 |
+| B | static, all graph, source norm, dual | 76 | 0.007883 | 0.016833 | 0.010045 | 0.010059 | 0.012312 |
+| C | static, source graph, all norm, dual | 77 | 0.007887 | 0.016569 | 0.010114 | 0.010818 | 0.012500 |
+| D | static, source graph, source norm, dual | 77 | 0.007880 | 0.015616 | 0.010174 | 0.009998 | 0.011929 |
+| E | static, source graph, source norm, EMA-only | 79 | 0.007853 | 0.015033 | 0.010582 | 0.009892 | 0.011836 |
+| F | no-GCL, all norm | 79 | 0.007853 | 0.014833 | 0.010474 | 0.010354 | 0.011887 |
+| G | no-GCL, source norm | 77 | 0.007854 | 0.014516 | 0.010228 | 0.010048 | **0.011597** |
+
+完成后能够直接成立的事实：
+
+1. 这一个 calibration seed 中，G 的迁移均值最低；static GCL 没有显示出相对 no-GCL 的稳定优势，A 在 `digtime` 上尤其差。但 calibration 不进入正式均值或方法排名。
+2. E 的迁移均值比 D 低约 0.79%，不能据此选择 EMA-only，因为 D 是 cache hit、E 是 cache miss，target update 与 downstream RNG 路径同时变化。
+3. B/D 都是 cache hit、使用相同 source normalization，B 比 D 的迁移均值高约 3.21%；这只能作为 source-only topology 可能更好的指示性证据，单 seed 和未锁定的 CUDA/training determinism 不足以形成结论。
+4. A/B 共享同一个 all-graph embedding，C/D 共享同一个 source-dual embedding；七份 normalization state 和 split 分别完全相同。A/B 仍相差约 6.23%，C/D 相差约 4.79%，F/G 在无 cache 差异时也相差约 2.50%。这些差异不能归因 normalization，并说明 cache RNG 不是唯一噪声源，训练级 CUDA/采样确定性也必须审计。
+5. 七个 best epoch 全部位于 76-79，A-E 与 F-G 两个 matched group 均触发最后 10% 刷新规则。calibration 已足以在 formal run 前统一预注册 160 epochs；无需先正式跑一遍 80 epochs 再重复到 160。
+
+#### 对现场分析的修正与边界
+
+另一个 agent 对 cache/RNG、normalization、artifact 和 runner 缺口的诊断总体正确，后续沿用这些证据，但采用以下更精确的表述：
+
+1. 当前已建立 source-only gradient/statistics 边界：SGRL 参数、normalizer 和 rebalancing prior 不使用 transfer labels 拟合。端到端 target-independent training 尚未建立，因为 cache miss 会在 downstream 前对全部迁移图执行随机邻居 embedding inference，并且没有随后重置 downstream RNG；目标图可能通过 RNG 消耗间接改变 downstream 轨迹。
+2. `parameter-fit strict inductive` 与强时间边界 `no-access` 是两种不同协议。E0-E5 至少要证明 transfer 数据不参与参数拟合、模型选择或训练 RNG；E6 blind 才要求目标图和标签在最终一次性评估前完全不可访问。推理时读取未见图的特征/拓扑本身可以属于 inductive GNN inference，不应自动定性为泄漏。
+3. formal E0 的硬阻塞项是：独立阶段 seed、cache/pretraining 后重置 downstream RNG、固定 SGRL embedding inference/eval view、真实 loader 重复评估、cache hit/miss 等价测试，以及实际 embedding/checkpoint hash。cache locking、完整环境/数据指纹、lazy transfer loading 和 processed-key 修复仍须完成，但若 runner 保证单写者和依赖顺序，可放在 confirmation/blind 阶段前闭环，不必全部阻塞早期 E1 探索。
+4. WP5 中“没有真实 online step”应理解为“缺少覆盖真实 online step 的 EMA 公式和 cadence 测试”；当前代码本身存在 online training step。
+5. `tests.test_protocol_boundaries` 的 5 项测试通过；完整 `tests/` suite 同时复核为 22/22 通过。前者仍不等于完整 protocol regression suite。
+
 通过条件：
 
-- [ ] 所有 strict artifact 证明训练阶段未访问 transfer graph/labels。
+- [ ] E0-E5 strict artifact 证明 transfer 数据不参与参数拟合、模型选择或训练 RNG。
+- [ ] E6 blind artifact 证明最终揭盲前未访问 transfer graph/labels。
 - [ ] 重复 eval 结果稳定。
 - [ ] 所有 cache 和 split 都可通过 artifact 恢复。
 - [ ] 能解释 legacy 与 strict 的主要性能差异来源。
+- [ ] cache hit/miss 不改变 downstream 初始化、训练采样或评估视图。
+- [ ] normalization state 相同的 cell 不依据随机 MSE 差异宣称 normalization effect。
+- [ ] 明确区分 parameter-fit strict inductive 与强时间边界 no-access，并按最终采用的定义提供测试证据。
 
 统一延长规则：若任一主要 matched 候选在最后 10% epoch 内刷新 best，
 则同组全部候选从 80 epoch 统一延长到 160 epoch；不得只延长表现较好的方法。
+当前 `scripts/run_protocol_e0.sh` 只硬编码 80 epochs，没有 160 参数、组级触发器或独立 run tag。calibration 的 A-G 全部满足 `best_epoch >= 72`，因此 formal E0 应统一从头运行 160 epochs，并使用独立 formal log root；不得从 calibration 的 best checkpoint 接续。
 
 ### E1：严格协议最小复用基线
 
@@ -479,14 +556,18 @@ Static A/B 共享 all-graph SGRL cache，C/D 共享 source-only dual cache，必
 A/C 完成预训练和 cache 写入，再启动 B/D，禁止并发竞争同一 cache。EMA-only 和
 no-GCL 单元相互独立。若触发统一 160-epoch 延长规则，预算近似翻倍。
 
+当前 7 个 seed0 任务已经启动并作为 calibration sunk cost 运行。由于 cache-dependent downstream RNG 混杂，它们不能替代修复后的 formal seed0；预算重算时应把“已消耗 calibration GPU-hours”和“仍需 formal E0 GPU-hours”分开列出。
+
 ## 8. 正式 artifact 最低字段
 
 每个新协议运行至少记录：
 
 ```text
 git_commit
+git_dirty / source_tree_hash
 full_command
 python_path
+host / OS / torch / PyG / CUDA / cuDNN / driver / GPU
 protocol
 source_graph_names
 transfer_graph_names
@@ -494,13 +575,16 @@ sampling_distribution
 raw_data_hashes
 processed_data_hashes
 split_seed
+pretraining_seed
+downstream_seed
+train_sampler_seed
+relation_sample_seed
 split_indices_hash
 normalization_state_hash
 sgrl_target_update
+sgrl_target_initialization / update_cadence
 sgrl_checkpoint_path/hash
 embedding_path/hash
-pretraining_seed
-downstream_seed
 eval_seed
 eval_sampler_fingerprint
 loss and criterion state
@@ -538,18 +622,18 @@ summary 只允许读取 structured metrics，不从 console 正则解析正式�
 
 不要直接启动 P3。按以下顺序推进：
 
-1. [ ] 只读核验 Git、当前测试和 11 个 completed artifacts。
-2. [ ] 将 legacy 结果协议标记写入现有实验日志。
-3. [ ] 实现 WP1-WP7 的最小协议修复，不改 S6 架构数学定义。
-4. [ ] 增加对应 protocol regression tests。
-5. [ ] 运行全部单测和 1 epoch strict smoke。
-6. [ ] 运行 E0 协议差异审计。
-7. [ ] 根据 E0 决定是否需要额外拆分 normalization 与 target-update 消融。
-8. [ ] 运行 E1 严格协议最小复用基线。
-9. [ ] 只有达到继续条件后，才运行 E2/E3。
-10. [ ] 锁定架构后运行 E4/E5。
-11. [ ] 最后完成 WP8/WP9 和 E6 blind evaluation。
+1. [x] 只读核验 Git、五项现有协议单测和 11 个 legacy completed artifacts。
+2. [x] 在 `EXPERIMENT_LOG.md` 标明 legacy 结果的数据边界，禁止与 strict 结果混合。
+3. [x] 让 7 个 `E0-seed0-calibration-v1` 任务自然完成；已核验 final status、best epoch、final-only transfer 和 artifact。
+4. [x] 将七份相同 normalization state 写成机制结论；不得从 A/B、C/D、F/G 的随机 MSE 差异推断 normalization effect。
+5. [ ] 修复 SGRL cache hit/miss 导致的 downstream RNG 起点差异，拆分并记录 pretraining/downstream/train-sampler/eval seeds。
+6. [ ] 补真实 fixed-eval 重复测试、cache-hit/miss 等价测试、固定 embedding inference view，以及覆盖真实 online step 的 EMA 数值/cadence 测试。
+7. [ ] formal E0 前记录实际 embedding/checkpoint hash；confirmation/blind 前补 raw/processed/code/eval-view 指纹、原子 cache 发布、并发锁和 strong-boundary forbidden-transfer smoke。
+8. [ ] 将 formal E0 runner 固定为 160 epochs、独立 formal run tag，并增加 cache 单写者/依赖检查。
+9. [ ] 在修复后重新运行 formal E0 seeds 0-2；当前 calibration 不进入 formal group mean。
+10. [ ] formal E0 通过后才运行 E1；只有达到继续条件后才运行 E2/E3。
+11. [ ] 锁定架构后运行 E4/E5，最后完成 WP8/WP9 和 E6 blind evaluation。
 
 ## 11. 一句话结论
 
-现有实验已经证明“把 online GNN 与 downstream GNN 合成单一共享 backbone”在工程上可行，但现阶段最重要的不是继续扩大 rank/lambda sweep，而是先恢复 source-only zero-shot 边界、可审计的 dual/EMA target 消融、train-only label prior 和确定性评估；只有在这一基础上，P3-P5 的精度、紧凑性和 rebalancing interaction 结论才具有正式研究价值。
+现有实验已经证明“把 online GNN 与 downstream GNN 合成单一共享 backbone”在工程上可行，但完成的 E0 seed0 仍只是 calibration：normalization state 在本数据上完全相同，cache hit/miss 和训练级非确定性又污染了 matched 对照。先修复独立阶段 RNG、固定 inference/eval view 和必要 cache provenance，再统一以 160 epochs 重跑 formal E0 seeds 0-2；强 no-access、完整环境指纹和原子 cache 等增强项最迟在 confirmation/blind 阶段前闭环。只有在此基础上，E1-E5 的精度、紧凑性和 rebalancing interaction 结论才具有正式研究价值。
