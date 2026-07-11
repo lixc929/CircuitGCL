@@ -136,7 +136,7 @@ Use the current `test` branch for all implementation and experiment commits. Do 
 | S3. Online feature finetuning | Done | Check whether supervised gradients should update the online encoder. | Added `--sgrl_mode online_feature_finetune`; use separate optimizer groups with lower online-encoder LR. | `online_feature_frozen` vs `online_feature_finetune` |
 | S4. Parameter initialization reuse | Done | Reuse GCL online encoder weights to initialize compatible downstream layers. | Added `init_reuse`; copied only matching tensors, logged skipped keys, and recorded parameter counts. | compact `no-GCL/static/init_reuse + MSE`, all GPU verified |
 | S5. Partial shared backbone | Done for current round | Share early/lower GNN layers while keeping task-specific later layers/head. | Added `partial_shared`, `SharedGNNBackbone`, and `PartialSharedGraphHead`; full `k1 + gate` is the best reuse path tested but remains behind static in multi-seed transfer. S5.5 now preserves optimizer state on unfreeze and separates eval mode from gradient freezing. | `init_reuse` vs `partial_shared_k1/k2/gate/freeze/slim_gate` |
-| S6. Joint shared backbone | Seed-0 sweep complete; redesign needed | Train one online backbone with both GCL and supervised losses. | Added `joint_shared`: complete two-layer online initialization, zero-init statistics residual, supervised head, predictor, and stop-gradient EMA target. Lambda 0.05 is the best seed-0 tradeoff, but the fully shared model loses too much timing_ctrl accuracy. | `lambda=0/0.01/0.05/0.1`; next: lightweight in-backbone task adaptation |
+| S6. Joint shared backbone | LoRA multi-seed audit complete | Train one online backbone with both GCL and supervised losses. | Added `joint_shared` and a mergeable rank-8 adapter in the last GNN layer. `LoRA + lambda=0.05` is the best S6 three-seed tradeoff while retaining 29,378 deployment parameters, but remains behind static on validation and timing_ctrl. | 40-epoch `base/LoRA x lambda=0/0.05`, seeds 0/1/2 |
 | S7. Label rebalancing integration | Current sweep done | Test whether rebalancing helps after reuse is architecturally correct. | Ran GAI/BMC on `gate+freeze3`, `vector_gate+freeze3`, and `gate+freeze2`; single-seed gains did not close the static gap in the multi-seed audit. | best reuse + `MSE/GAI/BMC` |
 
 ### 4.3 First Implementation Target
@@ -452,17 +452,19 @@ partial_shared_k1 + gate + freeze2 + BMC: Val 0.0098; digtime/timing_ctrl/array 
    signed residual scale initialized to zero; and training can add
    `joint_gcl_lambda * L_gcl` against a stop-gradient EMA target. The target
    and predictor are training-only, leaving `29,378` deployment parameters.
-   A one-epoch `lambda=0.01` GPU smoke test completed with joint backward, EMA
-   updates, and isolated artifacts. The subsequent 20-epoch seed-0 sweep is
-   also complete. `lambda=0.05` is the best overall tradeoff at Val `0.0115`
-   and digtime/timing_ctrl/array `0.0136/0.0167/0.0119`; `lambda=0.01` gives
-   the best digtime/array at `0.0135/0.0115`. Every positive lambda improves
-   over `lambda=0` on validation and timing_ctrl, confirming that GCL alignment
-   helps preserve the shared representation. However, all variants remain far
-   behind static on timing_ctrl, showing that the complete removal of a
-   downstream message-passing adaptation path is now the main bottleneck.
-   Do not promote S6 to multi-seed or rebalancing yet. Preserve one deployment
-   backbone and add a lightweight task-specific adapter inside it next.
+   A one-epoch `lambda=0.01` GPU smoke test and the subsequent 20-epoch seed-0
+   sweep completed first. The follow-up adds a rank-8 LoRA adapter to the last
+   shared GNN layer. Its 2,048 train-time values merge into the backbone, so
+   deployment remains one 29,378-parameter GNN. The 40-epoch seeds 0/1/2 audit
+   gives the best S6 row with `LoRA + lambda=0.05`: Val
+   `0.010135 +/- 0.000227` and digtime/timing_ctrl/array
+   `0.014209/0.012319/0.011252`. This is a large correction to the 20-epoch
+   timing_ctrl result and is slightly better than joint_shared `lambda=0` on
+   validation and average transfer MSE. It still trails static + MSE on
+   validation and timing_ctrl, while matching array and slightly improving
+   digtime. The lightweight-adaptation direction is therefore viable, but not
+   yet an accuracy replacement for static GCL. Keep rebalancing paused until
+   adapter rank/layer and convergence controls establish a stable reuse winner.
 6. Only after the compact reuse architecture is stable, compare:
 
 ```text

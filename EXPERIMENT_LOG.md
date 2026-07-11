@@ -1488,3 +1488,66 @@ accidental CPU-only launch and is marked failed. The first GPU4 `lambda_001`
 run under the valid root was intentionally interrupted at epoch 9 and marked
 failed when it was migrated to GPU3. Only the four completed directories named
 above are used in the table.
+
+#### S6 40-Epoch LoRA Multi-Seed Audit
+
+The next design keeps the same single two-layer deployment backbone and adds a
+rank-8 LoRA update only to its final GNN layer. The adapter contains 2,048
+train-time values and is merged into the backbone after training, so deployment
+still has 29,378 parameters and no second GNN. All runs below use MSE, 40
+epochs, and seeds 0/1/2.
+
+```text
+base seed-0 root: logs/s6_convergence40_seed0_gpu_parallel_20260711
+LoRA seed-0 root: logs/s6_lora_r8_convergence40_seed0_gpu_parallel_20260711
+seed-1/2 root: logs/s6_overnight_multiseed_20260711
+base Git commit: 8ea5a18 (seed 0), ec1994d (seeds 1/2)
+LoRA Git commit: ec1994d
+GPU: 3/4
+```
+
+| Mode | Seed | Best epoch | Val loss | digtime MSE | timing_ctrl MSE | array MSE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| joint_shared, lambda=0 | 0 | 37 | 0.00994910 | 0.01376977 | 0.01252905 | 0.01176881 |
+| joint_shared, lambda=0 | 1 | 36 | 0.01021504 | 0.01374099 | 0.01225465 | 0.01112517 |
+| joint_shared, lambda=0 | 2 | 39 | 0.01048058 | 0.01490439 | 0.01245758 | 0.01166681 |
+| LoRA r8, lambda=0 | 0 | 39 | 0.00999989 | 0.01369054 | 0.01269085 | 0.01127510 |
+| LoRA r8, lambda=0 | 1 | 39 | 0.01024845 | 0.01367797 | 0.01262781 | 0.01138243 |
+| LoRA r8, lambda=0 | 2 | 39 | 0.01040588 | 0.01440152 | 0.01258184 | 0.01118199 |
+| LoRA r8, lambda=0.05 | 0 | 38 | 0.00990960 | 0.01407262 | 0.01265228 | 0.01163638 |
+| LoRA r8, lambda=0.05 | 1 | 36 | 0.01004999 | 0.01420917 | 0.01168040 | 0.01127877 |
+| LoRA r8, lambda=0.05 | 2 | 39 | 0.01044632 | 0.01434549 | 0.01262315 | 0.01084139 |
+
+Population mean and standard deviation over three seeds:
+
+| Mode | Val loss mean +/- std | digtime mean +/- std | timing_ctrl mean +/- std | array mean +/- std |
+| --- | ---: | ---: | ---: | ---: |
+| joint_shared, lambda=0 | 0.010215 +/- 0.000217 | 0.014138 +/- 0.000542 | 0.012414 +/- 0.000116 | 0.011520 +/- 0.000282 |
+| LoRA r8, lambda=0 | 0.010218 +/- 0.000167 | 0.013923 +/- 0.000338 | 0.012634 +/- 0.000045 | 0.011280 +/- 0.000082 |
+| LoRA r8, lambda=0.05 | 0.010135 +/- 0.000227 | 0.014209 +/- 0.000111 | 0.012319 +/- 0.000451 | 0.011252 +/- 0.000325 |
+| static + MSE reference | 0.009833 +/- 0.000094 | 0.014300 +/- 0.000374 | 0.011867 +/- 0.000205 | 0.011267 +/- 0.000125 |
+
+Conclusions:
+
+- The mergeable LoRA adapter solves the structural adaptation problem without
+  increasing deployment size. With `lambda=0`, it matches base validation,
+  improves digtime and array means, but slightly worsens timing_ctrl.
+- `LoRA r8 + lambda=0.05` has the best S6 validation mean and the best average
+  of the three transfer MSEs. Relative to base `lambda=0`, it improves
+  validation, timing_ctrl, and array, while digtime is slightly worse.
+- The gain is small and dataset-dependent. Compared with static + MSE, the best
+  S6 row is still worse on validation and timing_ctrl, approximately tied on
+  array, and slightly better on digtime. Three seeds are not enough to claim a
+  statistically stable accuracy improvement over static.
+- Most best checkpoints occur at epochs 38/39, so 40 epochs is a materially
+  fairer comparison than the earlier 20-epoch sweep, but convergence remains
+  close to the budget boundary.
+
+Run-selection note: the overnight queue orchestration accidentally launched
+`LoRA r8 + lambda=0.05` seeds 1 and 2 three times each. The table uses the
+earliest completed artifact for each seed. Their
+validation-loss ranges are only `0.01003465-0.01004999` and
+`0.01044632-0.01046414`, respectively, so the conclusion does not depend on
+which duplicate is selected. The non-LoRA `lambda=0.05` seed-0 process under
+`logs/s6_convergence40_seed0_gpu_parallel_20260711/lambda_005` stopped during
+epoch 37 and retains `running` artifact metadata; it is incomplete and excluded.
