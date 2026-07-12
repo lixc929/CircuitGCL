@@ -1812,3 +1812,101 @@ seeds 1-2 before lambda scheduling, PCGrad, distillation, or rebalancing.
 The compared commits differ only in experiment scripts and this log; model,
 loss, dataset, and training implementation files are unchanged across
 `fe542d9`, `ddc5eaa`, and `9680fda`.
+
+### Strict Rank-0 Positive-Lambda Three-Seed Completion and Gradient Audit
+
+The missing rank-0 `lambda=0.05` seeds 1-2 completed normally on 2026-07-12
+under `logs/strict_joint_rank0_lambda005_seeds12_audit_20260712`. Both cells
+ran all 160 epochs, restored their source-validation-selected best checkpoints,
+evaluated the three development transfer circuits once, and finished with
+return code zero. Together with the preregistered seed-0 control, the raw rows
+are:
+
+| Seed | Best epoch | Val MSE | digtime | timing_ctrl | array | Transfer mean | Commit |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 0 | 156 | 0.008035913 | 0.015224475 | 0.010998346 | 0.011695725 | 0.012639515 | `9680fda` |
+| 1 | 157 | 0.007928901 | 0.014354646 | 0.010798935 | 0.011398138 | 0.012183907 | `2d0ea91` |
+| 2 | 155 | 0.007928575 | 0.013772232 | 0.010914260 | 0.011053859 | 0.011913450 | `2d0ea91` |
+
+The final same-architecture three-seed comparison uses population standard
+deviation and the exact raw MSE stored in each `metrics.json`:
+
+| Method | Val MSE | digtime | timing_ctrl | array | Transfer mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| static dual | 0.007714418 +/- 0.000067849 | 0.015026925 +/- 0.001034566 | 0.010873532 +/- 0.000422270 | 0.010086297 +/- 0.000212843 | 0.011995585 +/- 0.000261850 |
+| joint rank0, lambda=0 | 0.007978297 +/- 0.000080919 | 0.014801401 +/- 0.000742506 | 0.010935558 +/- 0.000100515 | 0.012387784 +/- 0.000193157 | 0.012708248 +/- 0.000245843 |
+| joint rank0, lambda=0.05 | 0.007964463 +/- 0.000050523 | 0.014450451 +/- 0.000596734 | 0.010903847 +/- 0.000081742 | 0.011382574 +/- 0.000262272 | 0.012245624 +/- 0.000299610 |
+
+Relative to static dual, rank-0 `lambda=0.05` changes validation by `+3.241%`,
+digtime by `-3.836%`, timing_ctrl by `+0.279%`, array by `+12.852%`, and the
+three-circuit transfer mean by `+2.084%`. It therefore passes the preregistered
+`5%` source-validation, `10%` transfer-mean, and `25%` any-circuit gates. Each
+individual seed also passes all three gates. Relative to the identical
+rank-0 `lambda=0` architecture, positive lambda improves the mean validation,
+digtime, timing_ctrl, array, and transfer mean by `0.173%`, `2.371%`, `0.290%`,
+`8.115%`, and `3.640%`, respectively. The improvement is not pointwise
+universal: seed 0 transfer mean is `0.586%` worse and seed 2 validation is
+`0.304%` worse than their lambda-zero pairs. The population result nevertheless
+supports a stable positive-GCL contribution rather than the seed-0-only mixed
+signal.
+
+The diagnostic gradient audit did not alter the normal backward pass. It
+sampled batch zero every ten epochs from epoch 0 through 150 for seeds 1-2,
+giving 32 records. The pooled cosine statistics are:
+
+| Shared parameter group | Mean | Median | Q10 | Q25 | Q75 | Q90 | Negative fraction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| global | 0.173236 | 0.118057 | -0.079026 | -0.005059 | 0.289289 | 0.627376 | 25.000% |
+| embeddings | 0.220134 | 0.182139 | -0.327768 | 0.015305 | 0.461272 | 0.649180 | 21.875% |
+| layer 0 | 0.182120 | 0.113826 | -0.081090 | 0.002471 | 0.309506 | 0.637739 | 25.000% |
+| layer 1 | 0.041681 | 0.048010 | -0.061532 | -0.028455 | 0.100847 | 0.149597 | 34.375% |
+
+The conflict is seed-dependent. Seed 1 has global mean `0.268212` and `12.5%`
+negative global records; seed 2 has global mean `0.078259` and `37.5%`
+negative records. Layer 1 is the weakest group, reaching `50%` negative records
+for seed 2. The global mean and median remain positive, so this is not a
+catastrophic optimization failure, but a `25%` pooled global and `34.375%`
+layer-1 negative fraction is too large to describe as no conflict. Following
+the preregistered R3/R5 ordering, the next controlled experiment is one seed-0
+lambda schedule from `0.05` to `0.005`; PCGrad is not expanded in parallel.
+
+#### Canonical Teacher-Report Artifact
+
+To prevent manual transcription from multiple log directories,
+`scripts/summarize_strict_reuse.py` is the canonical strict reuse report
+builder. With no positional arguments it reads exactly these four whitelisted
+roots:
+
+- `logs/strict_seed0_seven_20260712_v2`
+- `logs/strict_selection_seeds12_20260712`
+- `logs/strict_joint_rank0_lambda005_seed0_20260712`
+- `logs/strict_joint_rank0_lambda005_seeds12_audit_20260712`
+
+It requires the exact 20-run method/seed matrix, validates every formal strict
+argument and restored raw validation MSE, verifies checkpoint existence,
+checks source-only graph scope, recomputes paired statistics and gates, checks
+the rank-0 lambda-zero/positive-lambda provenance pairing, and recomputes the
+gradient statistics from raw JSONL. The current audit has 20/20 completed
+artifacts, zero anomalies, and 68 unique path/SHA256 provenance references with
+zero missing files or hash mismatches. `SP8192W` is absent from every formal
+configuration, runtime graph list, and reported metric; no formal run artifact
+records access to it.
+
+Regenerate the centralized machine-readable report with:
+
+```bash
+/home/lixc/.conda/envs/RCG/bin/python scripts/summarize_strict_reuse.py
+```
+
+The only two generated report files are:
+
+- `logs/strict_reuse_report_20260712/strict_reuse_summary.json`
+- `logs/strict_reuse_report_20260712/strict_reuse_summary.tsv`
+
+The current SHA256 values are
+`50ff9c82cd9f3d8ad0b949c74f72cf7f9ccb3981aa0f1b70c884f764b6d6540f`
+and `51aa7dc229f4598255d5508a43c66b43971646230d5f9c5846105a08b0893470`,
+respectively. These generated files are ignored by Git and can always be
+reconstructed from the immutable raw artifacts; this experiment log remains
+the single human-readable project record rather than introducing another
+standalone Markdown report.
