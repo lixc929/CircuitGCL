@@ -1910,3 +1910,68 @@ respectively. These generated files are ignored by Git and can always be
 reconstructed from the immutable raw artifacts; this experiment log remains
 the single human-readable project record rather than introducing another
 standalone Markdown report.
+
+### Pre-Registered R3 Linear-Lambda Seed-0 Control
+
+The completed rank-0 `lambda=0.05` gradient audit has positive pooled mean and
+median cosine but `25.0%` negative global records and `34.375%` negative
+layer-1 records. R3 therefore tests one lower-complexity conflict mitigation
+before PCGrad: linearly decay the GCL weight while leaving the shared
+architecture, optimizer, data, checkpoint selection, and evaluation protocol
+unchanged. No PCGrad, alternating optimization, or distillation experiment is
+launched in parallel.
+
+For epoch `e` in the fixed 160-epoch run, the only new factor is:
+
+```text
+lambda(e) = 0.05 + (0.005 - 0.05) * e / 159
+lambda(0) = 0.05
+lambda(159) = 0.005
+```
+
+`args.joint_gcl_lambda` remains the initial value `0.05`; training uses a local
+effective value and never recursively mutates the argument. Run config,
+checkpoint metrics, epoch logs, and gradient-audit JSONL record the schedule
+and effective value. The formal seed-0 root and method are:
+
+```text
+logs/strict_joint_rank0_lambda005_to0005_linear_seed0_audit_20260712
+joint_rank0_lambda005_to0005_linear_seed0
+```
+
+The strict runner is
+`scripts/run_strict_joint_lambda_schedule_seed0.py`. It is write-free unless
+`--execute` is supplied, rejects physical GPU0/GPU1, maps one selected A100 to
+logical GPU0, and refuses an existing log root. The initial conservative plan
+required an empty device, but the operator subsequently authorized co-location
+with existing GPU work when memory is available. The executable gate therefore
+records utilization and process count but gates only on at least 6.5 GB free
+memory; it never stops or modifies another process. It also locks the queued
+commit and tracked-worktree state so code cannot change while waiting for a GPU,
+then rechecks that state before invoking the post-run validator.
+
+A successful queue completion additionally requires
+`scripts/summarize_joint_lambda_schedule_seed0.py` to validate the exact
+artifact count, strict runtime configuration, source-only provenance, paired
+seed-0 identities, scheduled audit values, and reproduced raw metrics. A
+validation mismatch propagates a nonzero summary and overall queue return code.
+
+Selection is preregistered before observing the result:
+
+1. The schedule must pass the existing `5%/10%/25%` gates relative to strict
+   seed-0 static dual.
+2. Candidate choice between scheduled and fixed `lambda=0.05` uses source
+   validation raw MSE only. Transfer metrics are gates/reporting, not a tuning
+   signal.
+3. The schedule advances to seeds 1-2 only if seed-0 validation improves by
+   more than `2e-5`. Within `2e-5`, retain fixed lambda because it is simpler
+   and already has three-seed evidence.
+4. Failure to advance does not automatically trigger PCGrad. Fixed
+   `lambda=0.05` already passes every strict gate; any further conflict method
+   requires a separate evidence review.
+
+The paired controls remain
+`logs/strict_joint_rank0_lambda005_seed0_20260712` and
+`logs/strict_seed0_seven_20260712_v2`. All stage seeds and fixed evaluation
+views remain unchanged, and the blind circuit is absent from the runner and
+manifest.

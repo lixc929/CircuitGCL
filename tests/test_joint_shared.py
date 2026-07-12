@@ -1,5 +1,6 @@
 import copy
 from pathlib import Path
+import random
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -12,8 +13,10 @@ from downstream_train import (
     build_joint_gradient_audit_context,
     build_joint_shared_audit_context,
     finalize_joint_gradient_audit,
+    joint_gcl_lambda_at_epoch,
     record_joint_gradient_audit,
     record_joint_shared_representation_audit,
+    validate_joint_gcl_schedule,
 )
 
 
@@ -46,6 +49,9 @@ def make_args(**overrides):
         'joint_gradient_audit': 0,
         'joint_gradient_audit_interval': 10,
         'joint_gcl_lambda': 0.0,
+        'joint_gcl_lambda_schedule': 'constant',
+        'joint_gcl_lambda_final': None,
+        'epochs': 160,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -88,6 +94,78 @@ class JointSharedTest(unittest.TestCase):
         model.load_online_encoder_state(encoder_state)
         model.eval()
         return model
+
+    def test_joint_gcl_lambda_schedule_endpoints_and_validation(self):
+        constant = make_args(joint_gcl_lambda=0.05)
+        validate_joint_gcl_schedule(constant)
+        self.assertEqual(joint_gcl_lambda_at_epoch(constant, 0), 0.05)
+        self.assertEqual(joint_gcl_lambda_at_epoch(constant, 159), 0.05)
+
+        linear = make_args(
+            joint_gcl_lambda=0.05,
+            joint_gcl_lambda_schedule='linear',
+            joint_gcl_lambda_final=0.005,
+        )
+        validate_joint_gcl_schedule(linear)
+        self.assertEqual(joint_gcl_lambda_at_epoch(linear, 0), 0.05)
+        self.assertEqual(joint_gcl_lambda_at_epoch(linear, 159), 0.005)
+        self.assertAlmostEqual(
+            joint_gcl_lambda_at_epoch(linear, 80),
+            0.05 + (80 / 159) * (0.005 - 0.05),
+        )
+        python_state = random.getstate()
+        torch_state = torch.get_rng_state().clone()
+        joint_gcl_lambda_at_epoch(linear, 80)
+        self.assertEqual(random.getstate(), python_state)
+        self.assertTrue(torch.equal(torch.get_rng_state(), torch_state))
+        with self.assertRaisesRegex(ValueError, 'outside'):
+            joint_gcl_lambda_at_epoch(linear, 160)
+
+        invalid = (
+            make_args(
+                joint_gcl_lambda=0.05,
+                joint_gcl_lambda_schedule='constant',
+                joint_gcl_lambda_final=0.005,
+            ),
+            make_args(
+                joint_gcl_lambda=0.05,
+                joint_gcl_lambda_schedule='linear',
+                joint_gcl_lambda_final=None,
+            ),
+            make_args(
+                joint_gcl_lambda=float('nan'),
+            ),
+            make_args(
+                joint_gcl_lambda=0.05,
+                joint_gcl_lambda_schedule='linear',
+                joint_gcl_lambda_final=float('inf'),
+            ),
+            make_args(
+                joint_gcl_lambda=0.05,
+                joint_gcl_lambda_schedule='linear',
+                joint_gcl_lambda_final=-0.001,
+            ),
+            make_args(
+                joint_gcl_lambda=0.05,
+                joint_gcl_lambda_schedule='linear',
+                joint_gcl_lambda_final=0.005,
+                epochs=1,
+            ),
+            make_args(
+                joint_gcl_lambda=0.05,
+                joint_gcl_lambda_schedule='linear',
+                joint_gcl_lambda_final=0.06,
+            ),
+            make_args(
+                joint_gcl_lambda=0.05,
+                joint_gcl_lambda_schedule='linear',
+                joint_gcl_lambda_final=0.005,
+                use_sgrl_joint_shared=0,
+            ),
+        )
+        for args in invalid:
+            with self.assertRaises(ValueError):
+                validate_joint_gcl_schedule(args)
 
     def test_zero_init_stats_residual_preserves_pretrained_path(self):
         first = make_batch(torch.randn(6, 17))
@@ -266,6 +344,9 @@ class JointSharedTest(unittest.TestCase):
             joint_gradient_audit=1,
             joint_gradient_audit_interval=2,
             joint_gcl_lambda=0.05,
+            joint_gcl_lambda_schedule='linear',
+            joint_gcl_lambda_final=0.005,
+            epochs=4,
         )
         batch = make_batch()
 
@@ -307,16 +388,20 @@ class JointSharedTest(unittest.TestCase):
             self.assertIsNone(skipped)
             self.assertIsNotNone(record)
             self.assertIsNotNone(record['global']['cosine'])
+            effective_lambda = joint_gcl_lambda_at_epoch(args, 2)
+            self.assertAlmostEqual(
+                record['joint_gcl_lambda'], effective_lambda
+            )
             self.assertTrue(all(
                 parameter.grad is None
                 for parameter in audited_model.parameters()
             ))
 
-            (supervised + args.joint_gcl_lambda * gcl).backward()
+            (supervised + effective_lambda * gcl).backward()
             reference_supervised, reference_gcl = losses(reference_model)
             (
                 reference_supervised
-                + args.joint_gcl_lambda * reference_gcl
+                + effective_lambda * reference_gcl
             ).backward()
             for audited_parameter, reference_parameter in zip(
                 audited_model.parameters(),
@@ -334,6 +419,10 @@ class JointSharedTest(unittest.TestCase):
             summary = finalize_joint_gradient_audit(context)
             self.assertEqual(summary['record_count'], 1)
             self.assertEqual(summary['global_cosine']['count'], 1)
+            self.assertEqual(summary['schema_version'], 2)
+            self.assertEqual(
+                summary['lambda_schedule']['schedule'], 'linear'
+            )
             self.assertEqual(
                 len((Path(temporary_dir) / (
                     'joint_shared_gradient_audit.jsonl'

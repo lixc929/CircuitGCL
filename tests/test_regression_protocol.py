@@ -166,6 +166,21 @@ class RegressionProtocolTest(unittest.TestCase):
                 checkpoint['metrics']['validation_results']['mse_raw'],
                 0.1,
             )
+            self.assertEqual(
+                checkpoint['metrics']['joint_gcl_lambda_schedule'],
+                'constant',
+            )
+            self.assertIsNone(
+                checkpoint['metrics']['joint_gcl_lambda_final']
+            )
+            self.assertEqual(
+                checkpoint['metrics']['joint_gcl_lambda_at_best_epoch'],
+                0.0,
+            )
+            self.assertEqual(
+                checkpoint['metrics']['joint_gcl_lambda_effective_last'],
+                0.0,
+            )
 
 
 if __name__ == '__main__':

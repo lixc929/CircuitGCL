@@ -1,6 +1,7 @@
 import copy
 from contextlib import contextmanager
 import json
+import math
 from pathlib import Path
 import random
 
@@ -755,6 +756,62 @@ def _gradient_alignment_stats(entries):
     }
 
 
+def validate_joint_gcl_schedule(args):
+    """Validate the configured joint GCL weight schedule before any training."""
+    schedule = getattr(args, 'joint_gcl_lambda_schedule', 'constant')
+    initial = float(getattr(args, 'joint_gcl_lambda', 0.0))
+    final = getattr(args, 'joint_gcl_lambda_final', None)
+    if not math.isfinite(initial) or initial < 0.0:
+        raise ValueError('--joint_gcl_lambda must be finite and non-negative.')
+    if schedule == 'constant':
+        if final is not None:
+            raise ValueError(
+                '--joint_gcl_lambda_final requires '
+                '--joint_gcl_lambda_schedule linear.'
+            )
+        return
+    if schedule != 'linear':
+        raise ValueError(f'Unsupported joint GCL lambda schedule: {schedule!r}.')
+    if not getattr(args, 'use_sgrl_joint_shared', 0):
+        raise ValueError(
+            '--joint_gcl_lambda_schedule linear requires joint_shared mode.'
+        )
+    if getattr(args, 'epochs', 0) < 2:
+        raise ValueError('Linear joint GCL lambda scheduling requires at least 2 epochs.')
+    if final is None or not math.isfinite(float(final)) or float(final) < 0.0:
+        raise ValueError(
+            '--joint_gcl_lambda_final must be finite and non-negative '
+            'for a linear schedule.'
+        )
+    if float(final) > initial:
+        raise ValueError(
+            '--joint_gcl_lambda_final cannot exceed --joint_gcl_lambda '
+            'for the preregistered decay schedule.'
+        )
+    if initial <= 0.0:
+        raise ValueError('Linear joint GCL lambda scheduling requires a positive start.')
+
+
+def joint_gcl_lambda_at_epoch(args, epoch):
+    """Return the deterministic effective GCL weight for one training epoch."""
+    initial = float(getattr(args, 'joint_gcl_lambda', 0.0))
+    schedule = getattr(args, 'joint_gcl_lambda_schedule', 'constant')
+    if schedule == 'constant':
+        return initial
+    if schedule != 'linear':
+        raise ValueError(f'Unsupported joint GCL lambda schedule: {schedule!r}.')
+    epochs = int(getattr(args, 'epochs', 0))
+    if epoch < 0 or epoch >= epochs:
+        raise ValueError(f'Joint GCL schedule epoch {epoch} is outside [0, {epochs}).')
+    final = float(args.joint_gcl_lambda_final)
+    if epoch == 0:
+        return initial
+    if epoch == epochs - 1:
+        return final
+    progress = epoch / (epochs - 1)
+    return initial + progress * (final - initial)
+
+
 def build_joint_gradient_audit_context(args, model):
     if not (
         getattr(args, 'joint_gradient_audit', 0)
@@ -790,6 +847,14 @@ def build_joint_gradient_audit_context(args, model):
         'path': audit_path,
         'summary_path': summary_path,
         'records': [],
+        'lambda_schedule': {
+            'initial': float(args.joint_gcl_lambda),
+            'schedule': getattr(
+                args, 'joint_gcl_lambda_schedule', 'constant'
+            ),
+            'final': getattr(args, 'joint_gcl_lambda_final', None),
+            'epochs': int(args.epochs),
+        },
     }
 
 
@@ -831,7 +896,10 @@ def record_joint_gradient_audit(
     record = {
         'epoch': epoch,
         'batch_index': batch_index,
-        'joint_gcl_lambda': float(args.joint_gcl_lambda),
+        'joint_gcl_lambda': joint_gcl_lambda_at_epoch(args, epoch),
+        'joint_gcl_lambda_schedule': getattr(
+            args, 'joint_gcl_lambda_schedule', 'constant'
+        ),
         'global': _gradient_alignment_stats(entries),
         'groups': {
             group: _gradient_alignment_stats(group_entries)
@@ -886,8 +954,9 @@ def finalize_joint_gradient_audit(context):
         for group in record['groups']
     })
     summary = {
-        'schema_version': 1,
+        'schema_version': 2,
         'record_count': len(records),
+        'lambda_schedule': context['lambda_schedule'],
         'global_cosine': _gradient_distribution_summary(global_cosines),
         'mean_supervised_norm': (
             float(np.mean([
@@ -936,6 +1005,7 @@ def regress_train(args, regressor, optimizier, criterion,
         'best_epoch': -1,
         'test_results': [],
         'test_results_by_name': {},
+        'best_joint_gcl_lambda': None,
     }
     epochs_without_improvement = 0
     audit_context = build_partial_shared_audit_context(
@@ -968,8 +1038,11 @@ def regress_train(args, regressor, optimizier, criterion,
         args,
         regressor,
     )
+    last_effective_joint_gcl_lambda = None
     
     for epoch in range(args.epochs):
+        effective_joint_gcl_lambda = joint_gcl_lambda_at_epoch(args, epoch)
+        last_effective_joint_gcl_lambda = effective_joint_gcl_lambda
         optimizier = maybe_unfreeze_partial_shared_backbone(
             args, regressor, optimizier, epoch
         )
@@ -1007,10 +1080,13 @@ def regress_train(args, regressor, optimizier, criterion,
             joint_gcl_loss = None
             if (
                 getattr(args, 'use_sgrl_joint_shared', 0)
-                and args.joint_gcl_lambda > 0.0
+                and effective_joint_gcl_lambda > 0.0
             ):
                 joint_gcl_loss = regressor.gcl_loss(batch, online_x=online_x)
-                loss = supervised_loss + args.joint_gcl_lambda * joint_gcl_loss
+                loss = (
+                    supervised_loss
+                    + effective_joint_gcl_lambda * joint_gcl_loss
+                )
                 joint_gcl_total += joint_gcl_loss.detach().item()
                 joint_gcl_batches += 1
             record_joint_gradient_audit(
@@ -1028,7 +1104,7 @@ def regress_train(args, regressor, optimizier, criterion,
             optimizier.step()
             if (
                 getattr(args, 'use_sgrl_joint_shared', 0)
-                and args.joint_gcl_lambda > 0.0
+                and effective_joint_gcl_lambda > 0.0
             ):
                 regressor.update_target_backbone()
             
@@ -1042,7 +1118,8 @@ def regress_train(args, regressor, optimizier, criterion,
         logger.write_epoch(split='train')
         if joint_gcl_batches:
             print(
-                f'joint_gcl epoch={epoch} lambda={args.joint_gcl_lambda} '
+                f'joint_gcl epoch={epoch} '
+                f'lambda={effective_joint_gcl_lambda:.8f} '
                 f'loss={joint_gcl_total / joint_gcl_batches:.8f}'
             )
         ## ========== validation ========== ##
@@ -1060,12 +1137,22 @@ def regress_train(args, regressor, optimizier, criterion,
             best_results['best_val_mse'] = validation_mse(val_res)
             best_results['best_val_loss'] = val_res['loss']
             best_results['best_epoch'] = epoch
+            best_results['best_joint_gcl_lambda'] = effective_joint_gcl_lambda
             epochs_without_improvement = 0
             artifact_metrics = {
                 'status': 'running',
                 'task': args.task,
                 'loss': args.regress_loss,
                 'joint_gcl_lambda': getattr(args, 'joint_gcl_lambda', 0.0),
+                'joint_gcl_lambda_schedule': getattr(
+                    args, 'joint_gcl_lambda_schedule', 'constant'
+                ),
+                'joint_gcl_lambda_final': getattr(
+                    args, 'joint_gcl_lambda_final', None
+                ),
+                'joint_gcl_lambda_at_best_epoch': (
+                    best_results['best_joint_gcl_lambda']
+                ),
                 'best_epoch': best_results['best_epoch'],
                 'best_val_mse': best_results['best_val_mse'],
                 'best_val_loss': best_results['best_val_loss'],
@@ -1178,6 +1265,18 @@ def regress_train(args, regressor, optimizier, criterion,
         'task': args.task,
         'loss': args.regress_loss,
         'joint_gcl_lambda': getattr(args, 'joint_gcl_lambda', 0.0),
+        'joint_gcl_lambda_schedule': getattr(
+            args, 'joint_gcl_lambda_schedule', 'constant'
+        ),
+        'joint_gcl_lambda_final': getattr(
+            args, 'joint_gcl_lambda_final', None
+        ),
+        'joint_gcl_lambda_at_best_epoch': (
+            best_results['best_joint_gcl_lambda']
+        ),
+        'joint_gcl_lambda_effective_last': (
+            last_effective_joint_gcl_lambda
+        ),
         'best_epoch': best_results['best_epoch'],
         'best_val_mse': best_results['best_val_mse'],
         'best_val_loss': best_results['best_val_loss'],

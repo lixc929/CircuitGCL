@@ -1,7 +1,7 @@
 import argparse
 import torch
 from sram_dataset import performat_SramDataset, adaption_for_sgrl
-from downstream_train import downstream_train
+from downstream_train import downstream_train, validate_joint_gcl_schedule
 import os
 from sgrl_train import (
     embedding_cache_identity,
@@ -233,6 +233,25 @@ if __name__ == "__main__":
         help='Weight of the EMA-target GCL loss in joint_shared mode.',
     )
     parser.add_argument(
+        '--joint_gcl_lambda_schedule',
+        choices=['constant', 'linear'],
+        default='constant',
+        help=(
+            'Epoch schedule for --joint_gcl_lambda. Linear interpolates from '
+            'the configured value at epoch zero to --joint_gcl_lambda_final '
+            'at the last epoch.'
+        ),
+    )
+    parser.add_argument(
+        '--joint_gcl_lambda_final',
+        type=float,
+        default=None,
+        help=(
+            'Final non-negative GCL weight for the linear joint schedule. '
+            'Unset for the default constant schedule.'
+        ),
+    )
+    parser.add_argument(
         '--joint_backbone_lr',
         type=float,
         default=None,
@@ -425,8 +444,6 @@ if __name__ == "__main__":
                 '--joint_shared_gnn_layers cannot exceed --cl_gnn_layers '
                 f'({args.joint_shared_gnn_layers} > {args.cl_gnn_layers}).'
             )
-        if args.joint_gcl_lambda < 0.0:
-            raise ValueError('--joint_gcl_lambda must be non-negative.')
         if args.joint_backbone_lr is not None and args.joint_backbone_lr < 0.0:
             raise ValueError('--joint_backbone_lr must be non-negative.')
         if args.joint_lora_rank < 0:
@@ -436,6 +453,7 @@ if __name__ == "__main__":
                 'Mergeable joint LoRA currently supports --cl_model '
                 'clustergcn only.'
             )
+    validate_joint_gcl_schedule(args)
     if args.early_stopping_patience < 0:
         raise ValueError('--early_stopping_patience must be non-negative.')
     if args.early_stopping_min_delta < 0.0:
