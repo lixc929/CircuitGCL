@@ -1725,3 +1725,43 @@ stage because array degrades by `35.21%`, exceeding the preregistered `25%`
 single-circuit veto. Tuning seeds 1-2 retain no-GCL, static dual, init_reuse,
 joint lambda=0, and LoRA r8 lambda=0.05. Distillation is deferred because the
 retained shared candidates remain within the `5%` source-validation gate.
+
+### 后续改进方法尝试
+
+目标优先级固定为：先争取使用完全共享、零额外部署参数的两层 GNN
+达到 static dual 的效果；只有纯共享方案不能通过门槛时，才采用可合并
+LoRA。以下实验不得接触最终 `sp8192w` 盲测集，并继续使用 strict
+source-only provenance、固定 evaluation view 和相同的 160-epoch 协议。
+
+| 顺序 | 方法 | 要回答的问题 | 部署额外参数 | 启动条件 |
+| --- | --- | --- | ---: | --- |
+| R0 | 完成当前 seeds 1-2 队列并汇总 | 当前候选是否稳定 | 0 | 当前运行项 |
+| R1 | `joint rank0 lambda=0` 对 `lambda=0.05` | 持续 GCL 是否改善完全共享模型 | 0 | R0 完成；先 seed0，过门槛再跑 seeds 1-2 |
+| R2 | supervised/GCL 梯度余弦审计 | 性能损失是否来自共享层梯度冲突 | 0 | 与 R1 seed0 同时记录，不改变优化行为 |
+| R3 | 从强到弱的 lambda 调度 | 防止早期 GCL 表示漂移并允许后期任务适配 | 0 | R1 固定 lambda 有帮助但仍落后 static |
+| R4 | GCL/downstream 交替优化 | 避免同一步中两个目标直接抵消 | 0 | R2 冲突明显或 R3 无法通过门槛 |
+| R5 | PCGrad | 投影共享参数上的冲突梯度 | 0 | R2 显示负梯度余弦占比较高 |
+| R6 | 预训练权重锚定（L2-SP） | 限制共享表示过快偏离 GCL 初始化 | 0 | 仅作低成本补充，不再扩展 freeze/低学习率 sweep |
+| R7 | static-dual teacher distillation | 将两套 GNN 的预测知识压缩进一套共享 GNN | 0 | R1-R5 最佳纯共享方案仍未通过门槛，只做一次 |
+| R8 | EMA/SWA 参数平均 | 减少联合训练末期波动 | 0 | 仅在最佳 epoch 波动明显时补充 |
+| R9 | mergeable LoRA | 用低秩任务增量缓解容量/任务冲突 | 合并后 0 | 纯共享方案均失败时的最终折中 |
+
+R1 是下一项必须补齐的严格同构实验：两行使用完全相同的 rank-0
+共享架构，只改变 `joint_gcl_lambda`。当前运行中的 `joint rank0 lambda=0`
+与 `LoRA rank8 lambda=0.05` 不能单独分离 GCL 和 LoRA 的贡献。
+
+R2 至少记录共享 GNN 梯度余弦的均值、中位数、负值比例和分位数。
+只有审计支持梯度冲突假设时才实现 PCGrad，避免无证据地增加训练复杂度。
+R3 首选单一预注册调度，例如在 160 epoch 内将 lambda 从 `0.05`
+衰减到 `0.005`，不进行无界超参数搜索。
+
+R7 的教师只在训练期间存在。学生损失优先使用
+`L_label + lambda * L_GCL + beta * L_teacher_output`；输出蒸馏不需要新增
+projection head。最终导出必须删除 teacher、EMA target、GCL predictor 和
+优化器状态，只保留一套两层共享 GNN 与 downstream head。
+
+所有候选继续使用既定门槛：相对 static dual 的 source validation 退化
+不超过 `5%`，三迁移集均值退化不超过 `10%`，任一单电路退化不超过
+`25%`。每轮只改变一个主要因素；未通过门槛的方法不扩展到 rebalancing
+矩阵。锁定架构后再依次执行 MSE/GAI/BMC、deployment export、合并前后
+预测一致性验证，以及一次性的 `sp8192w` 盲测。
