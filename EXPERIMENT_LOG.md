@@ -1765,3 +1765,50 @@ projection head。最终导出必须删除 teacher、EMA target、GCL predictor 
 `25%`。每轮只改变一个主要因素；未通过门槛的方法不扩展到 rebalancing
 矩阵。锁定架构后再依次执行 MSE/GAI/BMC、deployment export、合并前后
 预测一致性验证，以及一次性的 `sp8192w` 盲测。
+
+### Strict Seeds 0-2 Selection and Rank-0 Positive-Lambda Control
+
+The seeds 1-2 selection queue completed on 2026-07-12 under
+`logs/strict_selection_seeds12_20260712` with ten completed runs, no running
+runs, and no anomalous artifacts. Combined with the matching seed-0 runs in
+`logs/strict_seed0_seven_20260712_v2`, the three-seed population statistics
+are:
+
+| Method | Val MSE | digtime | timing_ctrl | array | Transfer mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| static dual | 0.007714 +/- 0.000068 | 0.015027 +/- 0.001035 | 0.010874 +/- 0.000422 | 0.010086 +/- 0.000213 | 0.011996 +/- 0.000262 |
+| no-GCL | 0.007713 +/- 0.000060 | 0.015206 +/- 0.000179 | 0.011248 +/- 0.000144 | 0.009922 +/- 0.000184 | 0.012125 +/- 0.000095 |
+| init reuse | 0.007714 +/- 0.000065 | 0.014964 +/- 0.000808 | 0.011276 +/- 0.000403 | 0.010009 +/- 0.000581 | 0.012083 +/- 0.000073 |
+| joint rank0, lambda=0 | 0.007978 +/- 0.000081 | 0.014801 +/- 0.000743 | 0.010936 +/- 0.000101 | 0.012388 +/- 0.000193 | 0.012708 +/- 0.000246 |
+| LoRA r8, lambda=0.05 | 0.008040 +/- 0.000074 | 0.014527 +/- 0.000224 | 0.011076 +/- 0.000176 | 0.013060 +/- 0.001017 | 0.012888 +/- 0.000330 |
+
+Relative to static dual, `init_reuse` is effectively neutral on source
+validation (`-0.01%`) and costs `0.73%` on transfer mean. It remains the
+strongest compact engineering fallback. Exact `joint rank0, lambda=0` costs
+`3.42%` on validation and `5.94%` on transfer mean; digtime improves `1.50%`,
+timing_ctrl costs `0.57%`, and array costs `22.82%`. It passes the aggregate
+selection gates but leaves little array margin. LoRA r8 lambda=0.05 costs
+`4.22%` on validation and `7.44%` on transfer mean, while array costs `29.48%`.
+It therefore fails the preregistered single-circuit `25%` veto and is not the
+primary reuse candidate.
+
+The missing strict same-architecture GCL control completed under
+`logs/strict_joint_rank0_lambda005_seed0_20260712`:
+
+| Rank-0 seed0 | Val MSE | digtime | timing_ctrl | array | Transfer mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| lambda=0 | 0.008091 | 0.014517 | 0.011066 | 0.012115 | 0.012566 |
+| lambda=0.05 | 0.008036 | 0.015224 | 0.010998 | 0.011696 | 0.012640 |
+
+Adding GCL loss improves source validation by `0.68%`, timing_ctrl by `0.61%`,
+and array by `3.46%` relative to the identical lambda-zero architecture, but
+digtime worsens by `4.87%` and transfer mean worsens by `0.59%`. Relative to
+seed-0 static dual, the positive-lambda row costs `2.90%` on validation and
+`2.66%` on transfer mean; its worst single-circuit degradation is array at
+`16.47%`. It therefore passes the promotion gates, but one seed is not evidence
+of a stable GCL benefit. The next controlled step is rank-0 lambda=0.05 on
+seeds 1-2 before lambda scheduling, PCGrad, distillation, or rebalancing.
+
+The compared commits differ only in experiment scripts and this log; model,
+loss, dataset, and training implementation files are unchanged across
+`fe542d9`, `ddc5eaa`, and `9680fda`.
