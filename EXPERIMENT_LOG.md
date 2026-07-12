@@ -1698,3 +1698,30 @@ controlled SGRL graph scope and normalization scope, source-train-only label
 priors, persisted splits and normalization state, fixed evaluation views, and
 matched `sgrl_dual_rsm_ema` versus `circuitgcl_text_ema_only` target-update
 experiments. Legacy and strict results must not be pooled in one group mean.
+
+### Strict Seed-0 Seven-Method Selection
+
+The provenance-repaired 160-epoch seed-0 group completed on 2026-07-12 under
+`logs/strict_seed0_seven_20260712_v2`. The summarizer reports seven completed
+artifacts, no running artifacts, and no anomalies. All runs use source-only
+SGRL fitting and normalization, relation seed `20260711`, fixed embedding and
+evaluation views, and commit `fe542d9`.
+
+| Method | Val MSE | digtime | timing_ctrl | array | Transfer mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| static dual | 0.007810 | 0.016487 | 0.010408 | 0.010042 | 0.012312 |
+| static EMA-only | 0.007813 | 0.017125 | 0.010185 | 0.009633 | 0.012314 |
+| no-GCL | 0.007781 | 0.015456 | 0.011312 | 0.009716 | 0.012161 |
+| init_reuse | **0.007770** | 0.016106 | 0.010707 | **0.009221** | **0.012011** |
+| joint lambda=0 | 0.008091 | **0.014517** | 0.011066 | 0.012115 | 0.012566 |
+| LoRA r8 lambda=0 | 0.008130 | 0.014855 | 0.011083 | 0.013578 | 0.013172 |
+| LoRA r8 lambda=0.05 | 0.008143 | 0.014833 | 0.011231 | 0.012388 | 0.012817 |
+
+Relative to static dual, `init_reuse` improves validation by `0.51%` and the
+three-circuit transfer mean by `2.44%`. Static dual and EMA-only are effectively
+tied; dual remains the mainline because it matches the author implementation
+and initializes all reuse candidates. LoRA lambda=0 is excluded from the next
+stage because array degrades by `35.21%`, exceeding the preregistered `25%`
+single-circuit veto. Tuning seeds 1-2 retain no-GCL, static dual, init_reuse,
+joint lambda=0, and LoRA r8 lambda=0.05. Distillation is deferred because the
+retained shared candidates remain within the `5%` source-validation gate.
