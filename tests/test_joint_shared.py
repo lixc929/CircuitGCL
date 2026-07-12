@@ -9,7 +9,10 @@ from torch_geometric.data import Data
 
 from model import JointSharedGraphHead, MergeableLoRALinear
 from downstream_train import (
+    build_joint_gradient_audit_context,
     build_joint_shared_audit_context,
+    finalize_joint_gradient_audit,
+    record_joint_gradient_audit,
     record_joint_shared_representation_audit,
 )
 
@@ -40,6 +43,9 @@ def make_args(**overrides):
         'use_sgrl_joint_shared': 1,
         'joint_shared_audit': 0,
         'joint_shared_audit_interval': 5,
+        'joint_gradient_audit': 0,
+        'joint_gradient_audit_interval': 10,
+        'joint_gcl_lambda': 0.0,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -252,6 +258,96 @@ class JointSharedTest(unittest.TestCase):
                 'joint_shared_representation_audit.jsonl'
             )
             self.assertEqual(len(audit_path.read_text().splitlines()), 4)
+
+    def test_gradient_audit_does_not_change_backward_gradients(self):
+        audited_model = copy.deepcopy(self.model)
+        reference_model = copy.deepcopy(self.model)
+        args = make_args(
+            joint_gradient_audit=1,
+            joint_gradient_audit_interval=2,
+            joint_gcl_lambda=0.05,
+        )
+        batch = make_batch()
+
+        def losses(model):
+            prediction, _, labels, online_x = model(
+                batch,
+                return_backbone=True,
+            )
+            supervised = torch.nn.functional.mse_loss(
+                prediction.view(-1),
+                labels[:, 0],
+            )
+            return supervised, model.gcl_loss(batch, online_x=online_x)
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            args.run_artifact_dir = temporary_dir
+            context = build_joint_gradient_audit_context(
+                args,
+                audited_model,
+            )
+            supervised, gcl = losses(audited_model)
+            skipped = record_joint_gradient_audit(
+                args,
+                context,
+                supervised,
+                gcl,
+                epoch=1,
+                batch_index=0,
+            )
+            record = record_joint_gradient_audit(
+                args,
+                context,
+                supervised,
+                gcl,
+                epoch=2,
+                batch_index=0,
+            )
+
+            self.assertIsNone(skipped)
+            self.assertIsNotNone(record)
+            self.assertIsNotNone(record['global']['cosine'])
+            self.assertTrue(all(
+                parameter.grad is None
+                for parameter in audited_model.parameters()
+            ))
+
+            (supervised + args.joint_gcl_lambda * gcl).backward()
+            reference_supervised, reference_gcl = losses(reference_model)
+            (
+                reference_supervised
+                + args.joint_gcl_lambda * reference_gcl
+            ).backward()
+            for audited_parameter, reference_parameter in zip(
+                audited_model.parameters(),
+                reference_model.parameters(),
+            ):
+                if audited_parameter.grad is None:
+                    self.assertIsNone(reference_parameter.grad)
+                else:
+                    self.assertTrue(torch.allclose(
+                        audited_parameter.grad,
+                        reference_parameter.grad,
+                        atol=1e-7,
+                    ))
+
+            summary = finalize_joint_gradient_audit(context)
+            self.assertEqual(summary['record_count'], 1)
+            self.assertEqual(summary['global_cosine']['count'], 1)
+            self.assertEqual(
+                len((Path(temporary_dir) / (
+                    'joint_shared_gradient_audit.jsonl'
+                )).read_text().splitlines()),
+                1,
+            )
+            self.assertTrue((Path(temporary_dir) / (
+                'joint_shared_gradient_summary.json'
+            )).exists())
+
+        self.assertIsNone(build_joint_gradient_audit_context(
+            make_args(),
+            self.model,
+        ))
 
 
 if __name__ == '__main__':

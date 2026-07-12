@@ -259,6 +259,22 @@ if __name__ == "__main__":
         help='Epoch interval for source-validation joint_shared audit records.',
     )
     parser.add_argument(
+        '--joint_gradient_audit',
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            'Record supervised/GCL gradient alignment on the shared GNN. '
+            'This is observational and does not modify optimizer gradients.'
+        ),
+    )
+    parser.add_argument(
+        '--joint_gradient_audit_interval',
+        type=int,
+        default=10,
+        help='Epoch interval for first-training-batch gradient audit records.',
+    )
+    parser.add_argument(
         '--joint_lora_rank',
         type=int,
         default=0,
@@ -426,6 +442,17 @@ if __name__ == "__main__":
         raise ValueError('--early_stopping_min_delta must be non-negative.')
     if args.joint_shared_audit_interval <= 0:
         raise ValueError('--joint_shared_audit_interval must be positive.')
+    if args.joint_gradient_audit_interval <= 0:
+        raise ValueError('--joint_gradient_audit_interval must be positive.')
+    if args.joint_gradient_audit:
+        if not args.use_sgrl_joint_shared:
+            raise ValueError(
+                '--joint_gradient_audit requires --sgrl_mode joint_shared.'
+            )
+        if args.joint_gcl_lambda <= 0.0:
+            raise ValueError(
+                '--joint_gradient_audit requires --joint_gcl_lambda > 0.'
+            )
 
     # Preserve legacy dataset/setup behavior before stage-specific boundaries.
     seed_all(args.seed)

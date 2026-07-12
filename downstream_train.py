@@ -33,6 +33,7 @@ from run_artifacts import (
     save_best_checkpoint,
     update_run_config,
     update_best_checkpoint_metrics,
+    write_json_atomic,
     write_run_metrics,
 )
 from rng_utils import (
@@ -713,6 +714,205 @@ def record_joint_shared_representation_audit(
     model.shared_backbone.train(current_training)
     return records
 
+
+def _joint_gradient_group(parameter_name):
+    if parameter_name.startswith('layers.'):
+        return '_'.join(parameter_name.split('.')[:2])
+    if parameter_name.startswith(('node_type_embed.', 'edge_type_embed.')):
+        return 'embeddings'
+    return 'normalization_activation'
+
+
+def _gradient_alignment_stats(entries):
+    dot = 0.0
+    supervised_squared = 0.0
+    gcl_squared = 0.0
+    parameter_tensors = 0
+    parameter_values = 0
+    for _, parameter, supervised_grad, gcl_grad in entries:
+        if supervised_grad is None or gcl_grad is None:
+            continue
+        supervised_value = supervised_grad.detach().float()
+        gcl_value = gcl_grad.detach().float()
+        dot += torch.sum(supervised_value * gcl_value).item()
+        supervised_squared += torch.sum(supervised_value.square()).item()
+        gcl_squared += torch.sum(gcl_value.square()).item()
+        parameter_tensors += 1
+        parameter_values += parameter.numel()
+
+    supervised_norm = supervised_squared ** 0.5
+    gcl_norm = gcl_squared ** 0.5
+    denominator = supervised_norm * gcl_norm
+    cosine = dot / denominator if denominator > 0.0 else None
+    return {
+        'cosine': cosine,
+        'dot': dot,
+        'supervised_norm': supervised_norm,
+        'gcl_norm': gcl_norm,
+        'negative': cosine is not None and cosine < 0.0,
+        'parameter_tensors': parameter_tensors,
+        'parameter_values': parameter_values,
+    }
+
+
+def build_joint_gradient_audit_context(args, model):
+    if not (
+        getattr(args, 'joint_gradient_audit', 0)
+        and getattr(args, 'use_sgrl_joint_shared', 0)
+        and getattr(args, 'joint_gcl_lambda', 0.0) > 0.0
+        and hasattr(model, 'shared_backbone')
+    ):
+        return None
+
+    named_parameters = tuple(
+        (name, parameter)
+        for name, parameter in model.shared_backbone.gnn.named_parameters()
+        if parameter.requires_grad
+    )
+    if not named_parameters:
+        raise ValueError('Joint gradient audit found no trainable shared GNN parameters.')
+    audit_path = os.path.join(
+        args.run_artifact_dir,
+        'joint_shared_gradient_audit.jsonl',
+    )
+    summary_path = os.path.join(
+        args.run_artifact_dir,
+        'joint_shared_gradient_summary.json',
+    )
+    print(
+        'Joint-shared gradient audit enabled: '
+        f'interval={args.joint_gradient_audit_interval}, '
+        f'parameters={sum(parameter.numel() for _, parameter in named_parameters)}, '
+        f'output={audit_path}'
+    )
+    return {
+        'named_parameters': named_parameters,
+        'path': audit_path,
+        'summary_path': summary_path,
+        'records': [],
+    }
+
+
+def record_joint_gradient_audit(
+        args, context, supervised_loss, gcl_loss, epoch, batch_index):
+    if context is None or gcl_loss is None or batch_index != 0:
+        return None
+    interval = getattr(args, 'joint_gradient_audit_interval', 10)
+    if epoch % interval != 0:
+        return None
+
+    named_parameters = context['named_parameters']
+    parameters = tuple(parameter for _, parameter in named_parameters)
+    supervised_gradients = torch.autograd.grad(
+        supervised_loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    gcl_gradients = torch.autograd.grad(
+        gcl_loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    entries = list(zip(
+        (name for name, _ in named_parameters),
+        parameters,
+        supervised_gradients,
+        gcl_gradients,
+    ))
+    grouped_entries = {}
+    for entry in entries:
+        grouped_entries.setdefault(
+            _joint_gradient_group(entry[0]),
+            [],
+        ).append(entry)
+
+    record = {
+        'epoch': epoch,
+        'batch_index': batch_index,
+        'joint_gcl_lambda': float(args.joint_gcl_lambda),
+        'global': _gradient_alignment_stats(entries),
+        'groups': {
+            group: _gradient_alignment_stats(group_entries)
+            for group, group_entries in sorted(grouped_entries.items())
+        },
+    }
+    context['records'].append(record)
+    with open(context['path'], 'a', encoding='utf-8') as output:
+        output.write(json.dumps(record, sort_keys=True) + '\n')
+    cosine = record['global']['cosine']
+    cosine_text = 'undefined' if cosine is None else f'{cosine:.6f}'
+    print(
+        'Joint-shared gradient audit '
+        f'epoch={epoch} cosine={cosine_text} '
+        f"supervised_norm={record['global']['supervised_norm']:.6f} "
+        f"gcl_norm={record['global']['gcl_norm']:.6f}"
+    )
+    return record
+
+
+def _gradient_distribution_summary(values):
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return {'count': 0}
+    return {
+        'count': int(values.size),
+        'mean': float(values.mean()),
+        'std': float(values.std()),
+        'min': float(values.min()),
+        'q10': float(np.quantile(values, 0.10)),
+        'q25': float(np.quantile(values, 0.25)),
+        'median': float(np.quantile(values, 0.50)),
+        'q75': float(np.quantile(values, 0.75)),
+        'q90': float(np.quantile(values, 0.90)),
+        'max': float(values.max()),
+        'negative_fraction': float(np.mean(values < 0.0)),
+    }
+
+
+def finalize_joint_gradient_audit(context):
+    if context is None:
+        return None
+    records = context['records']
+    global_cosines = [
+        record['global']['cosine']
+        for record in records
+        if record['global']['cosine'] is not None
+    ]
+    group_names = sorted({
+        group
+        for record in records
+        for group in record['groups']
+    })
+    summary = {
+        'schema_version': 1,
+        'record_count': len(records),
+        'global_cosine': _gradient_distribution_summary(global_cosines),
+        'mean_supervised_norm': (
+            float(np.mean([
+                record['global']['supervised_norm'] for record in records
+            ])) if records else None
+        ),
+        'mean_gcl_norm': (
+            float(np.mean([
+                record['global']['gcl_norm'] for record in records
+            ])) if records else None
+        ),
+        'groups': {},
+    }
+    for group in group_names:
+        cosines = [
+            record['groups'][group]['cosine']
+            for record in records
+            if group in record['groups']
+            and record['groups'][group]['cosine'] is not None
+        ]
+        summary['groups'][group] = _gradient_distribution_summary(cosines)
+
+    write_json_atomic(context['summary_path'], summary)
+    return summary
+
 def regress_train(args, regressor, optimizier, criterion,
           train_loader, val_loader, test_loaders, max_label,
           device):
@@ -764,6 +964,10 @@ def regress_train(args, regressor, optimizier, criterion,
         joint_audit_context,
         epoch=-1,
     )
+    joint_gradient_context = build_joint_gradient_audit_context(
+        args,
+        regressor,
+    )
     
     for epoch in range(args.epochs):
         optimizier = maybe_unfreeze_partial_shared_backbone(
@@ -800,6 +1004,7 @@ def regress_train(args, regressor, optimizier, criterion,
                 criterion=criterion,
             )
             loss = supervised_loss
+            joint_gcl_loss = None
             if (
                 getattr(args, 'use_sgrl_joint_shared', 0)
                 and args.joint_gcl_lambda > 0.0
@@ -808,6 +1013,14 @@ def regress_train(args, regressor, optimizier, criterion,
                 loss = supervised_loss + args.joint_gcl_lambda * joint_gcl_loss
                 joint_gcl_total += joint_gcl_loss.detach().item()
                 joint_gcl_batches += 1
+            record_joint_gradient_audit(
+                args,
+                joint_gradient_context,
+                supervised_loss,
+                joint_gcl_loss,
+                epoch,
+                i,
+            )
             _true = true.detach().to('cpu', non_blocking=True)
             _pred = y_pred.detach().to('cpu', non_blocking=True)
 
@@ -900,6 +1113,23 @@ def regress_train(args, regressor, optimizier, criterion,
             )
             break
 
+    joint_gradient_summary = finalize_joint_gradient_audit(
+        joint_gradient_context
+    )
+    if joint_gradient_summary is not None:
+        update_run_config(args, {
+            'joint_gradient_audit_path': joint_gradient_context['path'],
+            'joint_gradient_audit_sha256': file_sha256(
+                joint_gradient_context['path']
+            ),
+            'joint_gradient_summary_path': (
+                joint_gradient_context['summary_path']
+            ),
+            'joint_gradient_summary_sha256': file_sha256(
+                joint_gradient_context['summary_path']
+            ),
+        })
+
     checkpoint_path = os.path.join(args.run_artifact_dir, 'best_model.pt')
     load_best_checkpoint(
         args,
@@ -954,6 +1184,7 @@ def regress_train(args, regressor, optimizier, criterion,
         'validation_results': best_validation_result,
         'test_results': test_results_by_name,
         'best_checkpoint': checkpoint_path,
+        'joint_gradient_audit_summary': joint_gradient_summary,
     }
     update_best_checkpoint_metrics(args, final_metrics)
     write_run_metrics(args, final_metrics)
