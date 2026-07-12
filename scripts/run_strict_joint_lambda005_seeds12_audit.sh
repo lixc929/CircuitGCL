@@ -8,6 +8,8 @@ LOG_ROOT="${LOG_ROOT:-logs/strict_joint_rank0_lambda005_seeds12_audit_20260712}"
 STATUS_FILE="${ROOT_DIR}/${LOG_ROOT}/queue_status.tsv"
 MIN_FREE_MB="${MIN_FREE_MB:-6500}"
 POLL_SECONDS="${POLL_SECONDS:-60}"
+GPU_SEED1="${GPU_SEED1:-3}"
+GPU_SEED2="${GPU_SEED2:-4}"
 
 mkdir -p "${ROOT_DIR}/${LOG_ROOT}"
 cd "${ROOT_DIR}"
@@ -139,10 +141,10 @@ run_experiment() {
 write_manifest
 status orchestrator "queue_started commit=$(git rev-parse HEAD)"
 
-run_experiment seed1_gpu3 3 1 &
+run_experiment "seed1_gpu${GPU_SEED1}" "${GPU_SEED1}" 1 &
 pid_seed1=$!
 sleep 20
-run_experiment seed2_gpu4 4 2 &
+run_experiment "seed2_gpu${GPU_SEED2}" "${GPU_SEED2}" 2 &
 pid_seed2=$!
 
 rc=0
