@@ -1,4 +1,5 @@
 import copy
+import math
 from pathlib import Path
 import random
 import tempfile
@@ -10,13 +11,18 @@ from torch_geometric.data import Data
 
 from model import JointSharedGraphHead, MergeableLoRALinear
 from downstream_train import (
+    build_joint_pcgrad_context,
     build_joint_gradient_audit_context,
     build_joint_shared_audit_context,
     finalize_joint_gradient_audit,
+    finalize_joint_pcgrad,
+    joint_pcgrad_backward,
     joint_gcl_lambda_at_epoch,
     record_joint_gradient_audit,
+    record_joint_pcgrad_epoch,
     record_joint_shared_representation_audit,
     validate_joint_gcl_schedule,
+    validate_joint_gradient_strategy,
 )
 
 
@@ -48,6 +54,7 @@ def make_args(**overrides):
         'joint_shared_audit_interval': 5,
         'joint_gradient_audit': 0,
         'joint_gradient_audit_interval': 10,
+        'joint_gradient_strategy': 'none',
         'joint_gcl_lambda': 0.0,
         'joint_gcl_lambda_schedule': 'constant',
         'joint_gcl_lambda_final': None,
@@ -167,6 +174,161 @@ class JointSharedTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_joint_gcl_schedule(args)
 
+    def test_pcgrad_validation_and_deterministic_projection(self):
+        valid = make_args(
+            joint_gcl_lambda=0.05,
+            joint_gradient_strategy='pcgrad',
+        )
+        validate_joint_gradient_strategy(valid)
+        invalid = (
+            make_args(
+                joint_gcl_lambda=0.05,
+                joint_gradient_strategy='pcgrad',
+                use_sgrl_joint_shared=0,
+            ),
+            make_args(joint_gradient_strategy='pcgrad'),
+            make_args(
+                joint_gcl_lambda=0.05,
+                joint_gradient_strategy='pcgrad',
+                joint_gcl_lambda_schedule='linear',
+                joint_gcl_lambda_final=0.005,
+            ),
+            make_args(
+                joint_gcl_lambda=0.05,
+                joint_gradient_strategy='pcgrad',
+                joint_lora_rank=2,
+            ),
+        )
+        for args in invalid:
+            with self.assertRaises(ValueError):
+                validate_joint_gradient_strategy(args)
+
+        shared = torch.nn.Parameter(torch.tensor([1.0, 1.0]))
+        supervised_only = torch.nn.Parameter(torch.tensor(1.0))
+        gcl_only = torch.nn.Parameter(torch.tensor(1.0))
+        context = {'named_parameters': (('shared', shared),)}
+        supervised = shared[0] + 2.0 * supervised_only
+        gcl = -shared[0] + shared[1] + 3.0 * gcl_only
+        python_state = random.getstate()
+        torch_state = torch.get_rng_state().clone()
+        stats = joint_pcgrad_backward(context, supervised, gcl, 0.5)
+        self.assertTrue(stats['projection_applied'])
+        self.assertAlmostEqual(stats['raw_cosine'], -(0.5 ** 0.5))
+        self.assertTrue(torch.allclose(
+            shared.grad,
+            torch.tensor([0.5, 1.0]),
+            atol=1e-7,
+        ))
+        self.assertAlmostEqual(supervised_only.grad.item(), 2.0)
+        self.assertAlmostEqual(gcl_only.grad.item(), 1.5)
+        self.assertEqual(random.getstate(), python_state)
+        self.assertTrue(torch.equal(torch.get_rng_state(), torch_state))
+
+        shared = torch.nn.Parameter(torch.tensor([1.0, 1.0]))
+        supervised_only = torch.nn.Parameter(torch.tensor(1.0))
+        gcl_only = torch.nn.Parameter(torch.tensor(1.0))
+        context = {'named_parameters': (('shared', shared),)}
+        supervised = shared[0] + 2.0 * supervised_only
+        gcl = shared[0] + shared[1] + 3.0 * gcl_only
+        stats = joint_pcgrad_backward(context, supervised, gcl, 0.5)
+        self.assertFalse(stats['projection_applied'])
+        self.assertTrue(torch.allclose(
+            shared.grad,
+            torch.tensor([1.5, 0.5]),
+            atol=1e-7,
+        ))
+        self.assertAlmostEqual(supervised_only.grad.item(), 2.0)
+        self.assertAlmostEqual(gcl_only.grad.item(), 1.5)
+
+        shared = torch.nn.Parameter(torch.tensor(1.0))
+        supervised_exclusive = torch.nn.Parameter(torch.tensor(1.0))
+        context = {
+            'named_parameters': (
+                ('shared', shared),
+                ('supervised_exclusive', supervised_exclusive),
+            )
+        }
+        supervised = shared + supervised_exclusive
+        gcl = -shared
+        with self.assertRaisesRegex(RuntimeError, 'task-exclusive'):
+            joint_pcgrad_backward(context, supervised, gcl, 0.5)
+
+        first = torch.nn.Parameter(torch.tensor(1.0))
+        second = torch.nn.Parameter(torch.tensor(1.0))
+        unused = torch.nn.Parameter(torch.tensor(1.0))
+        context = {
+            'named_parameters': (
+                ('first', first),
+                ('second', second),
+                ('unused', unused),
+            )
+        }
+        stats = joint_pcgrad_backward(
+            context,
+            first + second,
+            first - 2.0 * second,
+            1.0,
+        )
+        self.assertTrue(stats['projection_applied'])
+        self.assertAlmostEqual(first.grad.item(), 2.7, places=6)
+        self.assertAlmostEqual(second.grad.item(), -0.9, places=6)
+        self.assertIsNone(unused.grad)
+
+        shared = torch.nn.Parameter(torch.tensor(1.0))
+        context = {'named_parameters': (('shared', shared),)}
+        stats = joint_pcgrad_backward(
+            context,
+            shared * 0.0,
+            shared,
+            1.0,
+        )
+        self.assertFalse(stats['projection_applied'])
+        self.assertIsNone(stats['raw_cosine'])
+        self.assertAlmostEqual(shared.grad.item(), 1.0)
+
+    def test_pcgrad_epoch_audit_is_persisted(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            args = make_args(
+                joint_gcl_lambda=0.05,
+                joint_gradient_strategy='pcgrad',
+                run_artifact_dir=temporary_dir,
+                epochs=2,
+            )
+            model = SimpleNamespace(
+                shared_backbone=SimpleNamespace(
+                    gnn=torch.nn.Linear(2, 2, bias=False)
+                )
+            )
+            context = build_joint_pcgrad_context(args, model)
+            projected = {
+                'raw_cosine': -0.5,
+                'projection_applied': True,
+                'standard_combined_norm': 1.0,
+                'projected_combined_norm': 1.2,
+                'projected_to_standard_norm': 1.2,
+            }
+            aligned = {
+                'raw_cosine': 0.25,
+                'projection_applied': False,
+                'standard_combined_norm': 2.0,
+                'projected_combined_norm': 2.0,
+                'projected_to_standard_norm': 1.0,
+            }
+            record_joint_pcgrad_epoch(
+                args, context, 0, [projected, aligned]
+            )
+            record_joint_pcgrad_epoch(args, context, 1, [projected])
+            summary = finalize_joint_pcgrad(context)
+            self.assertEqual(summary['epoch_count'], 2)
+            self.assertEqual(summary['batch_count'], 3)
+            self.assertEqual(summary['conflict_count'], 2)
+            self.assertAlmostEqual(summary['conflict_fraction'], 2 / 3)
+            self.assertEqual(
+                len(Path(context['path']).read_text().splitlines()),
+                2,
+            )
+            self.assertTrue(Path(context['summary_path']).is_file())
+
     def test_zero_init_stats_residual_preserves_pretrained_path(self):
         first = make_batch(torch.randn(6, 17))
         second = make_batch(torch.randn(6, 17) * 100.0)
@@ -215,6 +377,110 @@ class JointSharedTest(unittest.TestCase):
             for key in target_before
             if target_before[key].is_floating_point()
         ))
+
+    def test_pcgrad_accepts_real_rank0_joint_scope(self):
+        batch = make_batch()
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            args = make_args(
+                joint_gcl_lambda=0.05,
+                joint_gradient_strategy='pcgrad',
+                run_artifact_dir=temporary_dir,
+            )
+            context = build_joint_pcgrad_context(args, self.model)
+            prediction, _, labels, online_x = self.model(
+                batch,
+                return_backbone=True,
+            )
+            supervised = torch.nn.functional.mse_loss(
+                prediction.view(-1),
+                labels[:, 0],
+            )
+            gcl = self.model.gcl_loss(batch, online_x=online_x)
+            stats = joint_pcgrad_backward(
+                context,
+                supervised,
+                gcl,
+                0.05,
+            )
+            self.assertTrue(math.isfinite(stats['raw_cosine']))
+            self.assertTrue(any(
+                parameter.grad is not None
+                for parameter in self.model.shared_backbone.gnn.parameters()
+            ))
+            self.assertTrue(all(
+                parameter.grad is None
+                for parameter in self.model.target_backbone.parameters()
+            ))
+
+    def test_pcgrad_real_model_forced_conflict_step_and_ema(self):
+        batch = make_batch()
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            args = make_args(
+                joint_gcl_lambda=0.05,
+                joint_gradient_strategy='pcgrad',
+                run_artifact_dir=temporary_dir,
+            )
+            context = build_joint_pcgrad_context(args, self.model)
+            online_x = self.model.shared_backbone(batch, task_path=False)
+            base_loss = online_x.square().mean()
+            perturbation = 1e-3 * online_x.mean()
+            head_parameter = next(self.model.head_layers.parameters())
+            predictor_parameter = next(self.model.predictor.parameters())
+            supervised = base_loss + 2.0 * head_parameter.view(-1)[0]
+            gcl = (
+                -base_loss
+                + perturbation
+                + 3.0 * predictor_parameter.view(-1)[0]
+            )
+            target_before = copy.deepcopy(
+                self.model.target_backbone.state_dict()
+            )
+            shared_before = copy.deepcopy(
+                self.model.shared_backbone.gnn.state_dict()
+            )
+            optimizer = torch.optim.SGD(
+                [
+                    parameter for parameter in self.model.parameters()
+                    if parameter.requires_grad
+                ],
+                lr=0.01,
+            )
+            optimizer.zero_grad()
+            stats = joint_pcgrad_backward(
+                context,
+                supervised,
+                gcl,
+                0.05,
+            )
+            self.assertTrue(stats['projection_applied'])
+            self.assertAlmostEqual(
+                head_parameter.grad.view(-1)[0].item(),
+                2.0,
+                places=6,
+            )
+            self.assertAlmostEqual(
+                predictor_parameter.grad.view(-1)[0].item(),
+                0.15,
+                places=6,
+            )
+            self.assertTrue(all(
+                parameter.grad is None
+                for parameter in self.model.target_backbone.parameters()
+            ))
+            optimizer.step()
+            shared_after = self.model.shared_backbone.gnn.state_dict()
+            self.assertTrue(any(
+                not torch.equal(shared_before[key], shared_after[key])
+                for key in shared_before
+                if shared_before[key].is_floating_point()
+            ))
+            self.model.update_target_backbone()
+            target_after = self.model.target_backbone.state_dict()
+            self.assertTrue(any(
+                not torch.equal(target_before[key], target_after[key])
+                for key in target_before
+                if target_before[key].is_floating_point()
+            ))
 
     def test_lora_zero_init_and_merge_preserve_task_output(self):
         model = self.make_lora_model(rank=2)
@@ -437,6 +703,78 @@ class JointSharedTest(unittest.TestCase):
             make_args(),
             self.model,
         ))
+
+    def test_gradient_audit_does_not_change_pcgrad_backward(self):
+        audited_model = copy.deepcopy(self.model)
+        reference_model = copy.deepcopy(self.model)
+        args = make_args(
+            joint_gradient_audit=1,
+            joint_gradient_audit_interval=10,
+            joint_gcl_lambda=0.05,
+            joint_gradient_strategy='pcgrad',
+        )
+        batch = make_batch()
+
+        def losses(model):
+            prediction, _, labels, online_x = model(
+                batch,
+                return_backbone=True,
+            )
+            supervised = torch.nn.functional.mse_loss(
+                prediction.view(-1),
+                labels[:, 0],
+            )
+            return supervised, model.gcl_loss(batch, online_x=online_x)
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            args.run_artifact_dir = temporary_dir
+            gradient_context = build_joint_gradient_audit_context(
+                args, audited_model
+            )
+            audited_pcgrad = build_joint_pcgrad_context(args, audited_model)
+            reference_pcgrad = build_joint_pcgrad_context(args, reference_model)
+            audited_supervised, audited_gcl = losses(audited_model)
+            reference_supervised, reference_gcl = losses(reference_model)
+            record_joint_gradient_audit(
+                args,
+                gradient_context,
+                audited_supervised,
+                audited_gcl,
+                epoch=0,
+                batch_index=0,
+            )
+            audited_stats = joint_pcgrad_backward(
+                audited_pcgrad,
+                audited_supervised,
+                audited_gcl,
+                0.05,
+            )
+            reference_stats = joint_pcgrad_backward(
+                reference_pcgrad,
+                reference_supervised,
+                reference_gcl,
+                0.05,
+            )
+            self.assertEqual(
+                audited_stats['projection_applied'],
+                reference_stats['projection_applied'],
+            )
+            self.assertAlmostEqual(
+                audited_stats['raw_cosine'],
+                reference_stats['raw_cosine'],
+            )
+            for audited_parameter, reference_parameter in zip(
+                audited_model.parameters(),
+                reference_model.parameters(),
+            ):
+                if audited_parameter.grad is None:
+                    self.assertIsNone(reference_parameter.grad)
+                else:
+                    self.assertTrue(torch.allclose(
+                        audited_parameter.grad,
+                        reference_parameter.grad,
+                        atol=1e-7,
+                    ))
 
 
 if __name__ == '__main__':

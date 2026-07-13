@@ -1975,3 +1975,97 @@ The paired controls remain
 `logs/strict_seed0_seven_20260712_v2`. All stage seeds and fixed evaluation
 views remain unchanged, and the blind circuit is absent from the runner and
 manifest.
+
+### R3 Linear-Lambda Seed-0 Result
+
+The formal run at commit `4375c9f` completed all 160 epochs on physical GPU4.
+The method, dedicated validator, and overall queue all returned `rc=0`. The
+best checkpoint was epoch 156, where the effective GCL weight was
+`0.0058490566`; epoch 159 used the exact registered endpoint `0.005`.
+
+| Method | Val raw MSE | digtime | timing_ctrl | array | Transfer mean |
+|---|---:|---:|---:|---:|---:|
+| static dual seed0 | 0.007809748 | 0.016486799 | 0.010408374 | 0.010042039 | 0.012312404 |
+| fixed lambda=0.05 seed0 | 0.008035913 | 0.015224475 | 0.010998346 | 0.011695725 | 0.012639515 |
+| linear 0.05 -> 0.005 seed0 | 0.008049868 | 0.015027398 | 0.010868106 | 0.011445360 | 0.012446955 |
+
+Relative to static, the linear schedule is `+3.0746%` on source validation,
+`+1.0928%` on transfer mean, `-8.8519%` on digtime, `+4.4169%` on
+timing_ctrl, and `+13.9745%` on array. It passes every `5%/10%/25%` gate.
+Relative to fixed `lambda=0.05`, it improves transfer mean by `1.5235%` and
+all three individual transfer circuits by `1.1842%` to `2.1407%`, but worsens
+the registered primary source-validation metric by `1.395494e-5` (`0.1737%`).
+The registered expansion rule required an improvement greater than `2e-5`, so
+`advances_to_seeds12=false`. Transfer improvements cannot be used after the
+fact to reverse that decision. Fixed `lambda=0.05` remains the incumbent.
+
+The schedule also did not remove the motivating conflict. Across 16 fixed
+audit views, global cosine mean/median were `0.02065/0.00148` with `50.0%`
+negative records. Embeddings and layer 0 were negative in `50.0%/43.75%` of
+records. Layer 1 had mean/median `-0.02590/-0.02883` and `68.75%` negative
+records; all final eight layer-1 records were negative. This supplies evidence
+for exactly one sequential PCGrad seed-0 control, not for expanding the failed
+schedule or launching multiple optimization variants.
+
+The immutable result sources are:
+
+```text
+logs/strict_joint_rank0_lambda005_to0005_linear_seed0_audit_20260712/
+  schedule_seed0_summary.json
+  schedule_seed0_summary.tsv
+```
+
+### Pre-Registered R5 PCGrad Seed-0 Control
+
+R5 keeps the incumbent rank-0 architecture, constant `lambda=0.05`, optimizer,
+data, stage seeds, audits, checkpoint selection, and evaluations unchanged.
+The only factor is deterministic two-task PCGrad on trainable parameters under
+`shared_backbone.gnn`. Let
+
+```text
+u = grad(L_supervised)
+v = grad(0.05 * L_GCL)
+d = dot(u, v)
+```
+
+When `d < 0` and both global norms are nonzero, R5 uses both original task
+gradients to compute
+
+```text
+u_projected = u - d / ||v||^2 * v
+v_projected = v - d / ||u||^2 * u
+g_shared = u_projected + v_projected
+```
+
+Otherwise `g_shared = u + v`. With exactly two tasks there is no randomized
+task order and therefore no new RNG consumption. Head/criterion gradients stay
+supervised-only, predictor gradients remain `0.05 * grad(L_GCL)`, parameters
+outside the GNN scope retain the standard combined-loss gradient, and the EMA
+target is updated once after the optimizer step as before. PCGrad is restricted
+to rank 0 and fails fast if a selected parameter belongs to only one task.
+
+The formal root and method are:
+
+```text
+logs/strict_joint_rank0_lambda005_pcgrad_seed0_audit_20260713
+joint_rank0_lambda005_pcgrad_seed0
+```
+
+The runner accepts physical GPU3/GPU4 only, maps the selected device to logical
+GPU0, ignores utilization/process count, and waits only for at least 6.5 GB of
+free memory. It records a per-epoch PCGrad JSONL audit covering every training
+batch, including raw cosine, conflict/projection fraction, and combined-gradient
+norm changes. The dedicated validator requires exactly 160 epoch records,
+finite values, at least one applied projection, matching file hashes, canonical
+strict controls, and paired source-only provenance. No blind circuit appears.
+
+Selection is fixed before observing PCGrad performance:
+
+1. PCGrad must pass the existing `5%/10%/25%` gates relative to static seed0.
+2. Expansion versus fixed `lambda=0.05` uses source-validation raw MSE only.
+3. PCGrad advances to seeds 1-2 only for an improvement greater than `2e-5`.
+4. Within `2e-5`, or if worse, retain fixed `lambda=0.05`; transfer metrics are
+   gates/reporting only and cannot override the primary selection metric.
+5. No linear schedule, distillation, or other reuse method runs in parallel.
+   If PCGrad does not advance, the evidence supports locking the already-passing
+   fixed positive-lambda shared architecture before rebalancing integration.

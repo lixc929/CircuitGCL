@@ -1,7 +1,11 @@
 import argparse
 import torch
 from sram_dataset import performat_SramDataset, adaption_for_sgrl
-from downstream_train import downstream_train, validate_joint_gcl_schedule
+from downstream_train import (
+    downstream_train,
+    validate_joint_gcl_schedule,
+    validate_joint_gradient_strategy,
+)
 import os
 from sgrl_train import (
     embedding_cache_identity,
@@ -294,6 +298,16 @@ if __name__ == "__main__":
         help='Epoch interval for first-training-batch gradient audit records.',
     )
     parser.add_argument(
+        '--joint_gradient_strategy',
+        choices=['none', 'pcgrad'],
+        default='none',
+        help=(
+            'Optional training-only gradient surgery on the shared GNN. '
+            'pcgrad deterministically projects the supervised and weighted '
+            'GCL task gradients when their global dot product is negative.'
+        ),
+    )
+    parser.add_argument(
         '--joint_lora_rank',
         type=int,
         default=0,
@@ -454,6 +468,7 @@ if __name__ == "__main__":
                 'clustergcn only.'
             )
     validate_joint_gcl_schedule(args)
+    validate_joint_gradient_strategy(args)
     if args.early_stopping_patience < 0:
         raise ValueError('--early_stopping_patience must be non-negative.')
     if args.early_stopping_min_delta < 0.0:

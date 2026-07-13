@@ -181,6 +181,13 @@ class RegressionProtocolTest(unittest.TestCase):
                 checkpoint['metrics']['joint_gcl_lambda_effective_last'],
                 0.0,
             )
+            self.assertEqual(
+                checkpoint['metrics']['joint_gradient_strategy'],
+                'none',
+            )
+            self.assertIsNone(
+                checkpoint['metrics']['joint_pcgrad_audit_summary']
+            )
 
 
 if __name__ == '__main__':

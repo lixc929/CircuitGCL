@@ -812,6 +812,227 @@ def joint_gcl_lambda_at_epoch(args, epoch):
     return initial + progress * (final - initial)
 
 
+def validate_joint_gradient_strategy(args):
+    """Reject unsupported gradient-surgery combinations before artifacts exist."""
+    strategy = getattr(args, 'joint_gradient_strategy', 'none')
+    if strategy == 'none':
+        return
+    if strategy != 'pcgrad':
+        raise ValueError(f'Unsupported joint gradient strategy: {strategy!r}.')
+    if not getattr(args, 'use_sgrl_joint_shared', 0):
+        raise ValueError('--joint_gradient_strategy pcgrad requires joint_shared mode.')
+    if float(getattr(args, 'joint_gcl_lambda', 0.0)) <= 0.0:
+        raise ValueError('--joint_gradient_strategy pcgrad requires positive GCL weight.')
+    if getattr(args, 'joint_gcl_lambda_schedule', 'constant') != 'constant':
+        raise ValueError(
+            '--joint_gradient_strategy pcgrad currently requires the constant '
+            'GCL-weight control so only one optimization factor changes.'
+        )
+    if int(getattr(args, 'joint_lora_rank', 0)) != 0:
+        raise ValueError(
+            '--joint_gradient_strategy pcgrad currently requires '
+            '--joint_lora_rank 0 so every projected parameter belongs to the '
+            'shared base GNN.'
+        )
+
+
+def build_joint_pcgrad_context(args, model):
+    if getattr(args, 'joint_gradient_strategy', 'none') != 'pcgrad':
+        return None
+    named_parameters = tuple(
+        (name, parameter)
+        for name, parameter in model.shared_backbone.gnn.named_parameters()
+        if parameter.requires_grad
+    )
+    if not named_parameters:
+        raise ValueError('PCGrad found no trainable shared GNN parameters.')
+    audit_path = os.path.join(
+        args.run_artifact_dir,
+        'joint_shared_pcgrad_audit.jsonl',
+    )
+    summary_path = os.path.join(
+        args.run_artifact_dir,
+        'joint_shared_pcgrad_summary.json',
+    )
+    print(
+        'Joint-shared PCGrad enabled: '
+        f'parameters={sum(parameter.numel() for _, parameter in named_parameters)}, '
+        f'output={audit_path}'
+    )
+    return {
+        'named_parameters': named_parameters,
+        'scope': {
+            'module': 'shared_backbone.gnn',
+            'parameter_tensors': len(named_parameters),
+            'parameter_values': sum(
+                parameter.numel() for _, parameter in named_parameters
+            ),
+            'parameter_names': [name for name, _ in named_parameters],
+        },
+        'path': audit_path,
+        'summary_path': summary_path,
+        'records': [],
+        'batch_count': 0,
+        'conflict_count': 0,
+        'raw_cosines': [],
+        'standard_combined_norms': [],
+        'projected_combined_norms': [],
+        'projected_to_standard_norms': [],
+    }
+
+
+def _gradient_squared_norm(gradients):
+    return sum(
+        gradient.detach().float().square().sum().item()
+        for gradient in gradients
+        if gradient is not None
+    )
+
+
+def _gradient_dot(first, second):
+    return sum(
+        (first_gradient.detach().float()
+         * second_gradient.detach().float()).sum().item()
+        for first_gradient, second_gradient in zip(first, second)
+        if first_gradient is not None and second_gradient is not None
+    )
+
+
+def _combined_gradient_norm(first, second):
+    squared = 0.0
+    for first_gradient, second_gradient in zip(first, second):
+        if first_gradient is None and second_gradient is None:
+            continue
+        if first_gradient is None:
+            combined = second_gradient
+        elif second_gradient is None:
+            combined = first_gradient
+        else:
+            combined = first_gradient + second_gradient
+        squared += combined.detach().float().square().sum().item()
+    return squared ** 0.5
+
+
+def joint_pcgrad_backward(
+        context, supervised_loss, gcl_loss, gcl_weight):
+    """Backpropagate two losses and apply deterministic two-task PCGrad."""
+    if context is None:
+        raise ValueError('PCGrad backward requires an initialized context.')
+    if gcl_loss is None or not math.isfinite(float(gcl_weight)) or gcl_weight <= 0.0:
+        raise ValueError('PCGrad backward requires a finite positive weighted GCL loss.')
+
+    parameters = tuple(parameter for _, parameter in context['named_parameters'])
+    supervised_gradients = torch.autograd.grad(
+        supervised_loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    raw_gcl_gradients = torch.autograd.grad(
+        gcl_loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    exclusive_parameters = [
+        name
+        for (name, _), supervised_gradient, gcl_gradient in zip(
+            context['named_parameters'],
+            supervised_gradients,
+            raw_gcl_gradients,
+        )
+        if (supervised_gradient is None) != (gcl_gradient is None)
+    ]
+    if exclusive_parameters:
+        raise RuntimeError(
+            'PCGrad projection scope contains task-exclusive parameters: '
+            f'{exclusive_parameters}. Only parameters shared by both losses '
+            'may be projected.'
+        )
+    weighted_gcl_gradients = tuple(
+        None if gradient is None else gradient * gcl_weight
+        for gradient in raw_gcl_gradients
+    )
+    dot = _gradient_dot(supervised_gradients, weighted_gcl_gradients)
+    supervised_squared = _gradient_squared_norm(supervised_gradients)
+    weighted_gcl_squared = _gradient_squared_norm(weighted_gcl_gradients)
+    denominator = (supervised_squared * weighted_gcl_squared) ** 0.5
+    raw_cosine = dot / denominator if denominator > 0.0 else None
+    conflict = dot < 0.0 and supervised_squared > 0.0 and weighted_gcl_squared > 0.0
+
+    standard_norm = _combined_gradient_norm(
+        supervised_gradients,
+        weighted_gcl_gradients,
+    )
+    combined_loss = supervised_loss + gcl_weight * gcl_loss
+    combined_loss.backward()
+
+    projected_supervised = supervised_gradients
+    projected_gcl = weighted_gcl_gradients
+    if conflict:
+        supervised_coefficient = dot / weighted_gcl_squared
+        gcl_coefficient = dot / supervised_squared
+        projected_supervised = tuple(
+            (
+                supervised_gradient
+                if weighted_gcl_gradient is None
+                else (
+                    -supervised_coefficient * weighted_gcl_gradient
+                    if supervised_gradient is None
+                    else supervised_gradient - supervised_coefficient * weighted_gcl_gradient
+                )
+            )
+            for supervised_gradient, weighted_gcl_gradient in zip(
+                supervised_gradients, weighted_gcl_gradients
+            )
+        )
+        projected_gcl = tuple(
+            (
+                weighted_gcl_gradient
+                if supervised_gradient is None
+                else (
+                    -gcl_coefficient * supervised_gradient
+                    if weighted_gcl_gradient is None
+                    else weighted_gcl_gradient - gcl_coefficient * supervised_gradient
+                )
+            )
+            for supervised_gradient, weighted_gcl_gradient in zip(
+                supervised_gradients, weighted_gcl_gradients
+            )
+        )
+        for parameter, supervised_gradient, weighted_gcl_gradient in zip(
+            parameters, projected_supervised, projected_gcl
+        ):
+            if supervised_gradient is None and weighted_gcl_gradient is None:
+                parameter.grad = None
+                continue
+            if supervised_gradient is None:
+                combined_gradient = weighted_gcl_gradient
+            elif weighted_gcl_gradient is None:
+                combined_gradient = supervised_gradient
+            else:
+                combined_gradient = supervised_gradient + weighted_gcl_gradient
+            combined_gradient = combined_gradient.detach()
+            if parameter.grad is None:
+                parameter.grad = combined_gradient.clone()
+            else:
+                parameter.grad.copy_(combined_gradient)
+
+    projected_norm = _combined_gradient_norm(projected_supervised, projected_gcl)
+    return {
+        'raw_dot': dot,
+        'raw_cosine': raw_cosine,
+        'supervised_norm': supervised_squared ** 0.5,
+        'weighted_gcl_norm': weighted_gcl_squared ** 0.5,
+        'projection_applied': conflict,
+        'standard_combined_norm': standard_norm,
+        'projected_combined_norm': projected_norm,
+        'projected_to_standard_norm': (
+            projected_norm / standard_norm if standard_norm > 0.0 else None
+        ),
+    }
+
+
 def build_joint_gradient_audit_context(args, model):
     if not (
         getattr(args, 'joint_gradient_audit', 0)
@@ -939,6 +1160,95 @@ def _gradient_distribution_summary(values):
     }
 
 
+def record_joint_pcgrad_epoch(args, context, epoch, batch_stats):
+    if context is None:
+        return None
+    if not batch_stats:
+        raise ValueError(f'PCGrad epoch {epoch} produced no batch statistics.')
+    cosines = [
+        stat['raw_cosine']
+        for stat in batch_stats
+        if stat['raw_cosine'] is not None
+    ]
+    ratios = [
+        stat['projected_to_standard_norm']
+        for stat in batch_stats
+        if stat['projected_to_standard_norm'] is not None
+    ]
+    conflict_count = sum(stat['projection_applied'] for stat in batch_stats)
+    record = {
+        'epoch': int(epoch),
+        'joint_gcl_lambda': joint_gcl_lambda_at_epoch(args, epoch),
+        'strategy': 'pcgrad',
+        'batch_count': len(batch_stats),
+        'conflict_count': conflict_count,
+        'conflict_fraction': conflict_count / len(batch_stats),
+        'raw_cosine': _gradient_distribution_summary(cosines),
+        'mean_standard_combined_norm': float(np.mean([
+            stat['standard_combined_norm'] for stat in batch_stats
+        ])),
+        'mean_projected_combined_norm': float(np.mean([
+            stat['projected_combined_norm'] for stat in batch_stats
+        ])),
+        'mean_projected_to_standard_norm': (
+            float(np.mean(ratios)) if ratios else None
+        ),
+        'projected_to_standard_norm_count': len(ratios),
+    }
+    context['records'].append(record)
+    context['batch_count'] += len(batch_stats)
+    context['conflict_count'] += conflict_count
+    context['raw_cosines'].extend(cosines)
+    context['standard_combined_norms'].extend(
+        stat['standard_combined_norm'] for stat in batch_stats
+    )
+    context['projected_combined_norms'].extend(
+        stat['projected_combined_norm'] for stat in batch_stats
+    )
+    context['projected_to_standard_norms'].extend(ratios)
+    with open(context['path'], 'a', encoding='utf-8') as output:
+        output.write(json.dumps(record, sort_keys=True) + '\n')
+    print(
+        f'pcgrad epoch={epoch} conflicts={conflict_count}/{len(batch_stats)} '
+        f'fraction={record["conflict_fraction"]:.6f} '
+        f'raw_cosine_mean={record["raw_cosine"].get("mean", float("nan")):.6f}'
+    )
+    return record
+
+
+def finalize_joint_pcgrad(context):
+    if context is None:
+        return None
+    ratios = context['projected_to_standard_norms']
+    summary = {
+        'schema_version': 1,
+        'strategy': 'pcgrad',
+        'scope': context['scope'],
+        'epoch_count': len(context['records']),
+        'batch_count': context['batch_count'],
+        'conflict_count': context['conflict_count'],
+        'conflict_fraction': (
+            context['conflict_count'] / context['batch_count']
+            if context['batch_count'] else None
+        ),
+        'raw_cosine': _gradient_distribution_summary(context['raw_cosines']),
+        'mean_standard_combined_norm': (
+            float(np.mean(context['standard_combined_norms']))
+            if context['standard_combined_norms'] else None
+        ),
+        'mean_projected_combined_norm': (
+            float(np.mean(context['projected_combined_norms']))
+            if context['projected_combined_norms'] else None
+        ),
+        'mean_projected_to_standard_norm': (
+            float(np.mean(ratios)) if ratios else None
+        ),
+        'projected_to_standard_norm_count': len(ratios),
+    }
+    write_json_atomic(context['summary_path'], summary)
+    return summary
+
+
 def finalize_joint_gradient_audit(context):
     if context is None:
         return None
@@ -1038,6 +1348,7 @@ def regress_train(args, regressor, optimizier, criterion,
         args,
         regressor,
     )
+    joint_pcgrad_context = build_joint_pcgrad_context(args, regressor)
     last_effective_joint_gcl_lambda = None
     
     for epoch in range(args.epochs):
@@ -1051,6 +1362,7 @@ def regress_train(args, regressor, optimizier, criterion,
         apply_partial_shared_backbone_eval_policy(args, regressor, epoch)
         joint_gcl_total = 0.0
         joint_gcl_batches = 0
+        joint_pcgrad_batch_stats = []
 
         for i, batch in enumerate(tqdm(train_loader, desc=f'Epoch:{epoch}')):
             if epoch == 0 and i == 0:
@@ -1100,7 +1412,15 @@ def regress_train(args, regressor, optimizier, criterion,
             _true = true.detach().to('cpu', non_blocking=True)
             _pred = y_pred.detach().to('cpu', non_blocking=True)
 
-            loss.backward()
+            if joint_pcgrad_context is not None:
+                joint_pcgrad_batch_stats.append(joint_pcgrad_backward(
+                    joint_pcgrad_context,
+                    supervised_loss,
+                    joint_gcl_loss,
+                    effective_joint_gcl_lambda,
+                ))
+            else:
+                loss.backward()
             optimizier.step()
             if (
                 getattr(args, 'use_sgrl_joint_shared', 0)
@@ -1115,6 +1435,12 @@ def regress_train(args, regressor, optimizier, criterion,
                 loss=supervised_loss.detach().cpu().item()
             )
 
+        record_joint_pcgrad_epoch(
+            args,
+            joint_pcgrad_context,
+            epoch,
+            joint_pcgrad_batch_stats,
+        )
         logger.write_epoch(split='train')
         if joint_gcl_batches:
             print(
@@ -1152,6 +1478,9 @@ def regress_train(args, regressor, optimizier, criterion,
                 ),
                 'joint_gcl_lambda_at_best_epoch': (
                     best_results['best_joint_gcl_lambda']
+                ),
+                'joint_gradient_strategy': getattr(
+                    args, 'joint_gradient_strategy', 'none'
                 ),
                 'best_epoch': best_results['best_epoch'],
                 'best_val_mse': best_results['best_val_mse'],
@@ -1216,6 +1545,18 @@ def regress_train(args, regressor, optimizier, criterion,
                 joint_gradient_context['summary_path']
             ),
         })
+    joint_pcgrad_summary = finalize_joint_pcgrad(joint_pcgrad_context)
+    if joint_pcgrad_summary is not None:
+        update_run_config(args, {
+            'joint_pcgrad_audit_path': joint_pcgrad_context['path'],
+            'joint_pcgrad_audit_sha256': file_sha256(
+                joint_pcgrad_context['path']
+            ),
+            'joint_pcgrad_summary_path': joint_pcgrad_context['summary_path'],
+            'joint_pcgrad_summary_sha256': file_sha256(
+                joint_pcgrad_context['summary_path']
+            ),
+        })
 
     checkpoint_path = os.path.join(args.run_artifact_dir, 'best_model.pt')
     load_best_checkpoint(
@@ -1277,6 +1618,9 @@ def regress_train(args, regressor, optimizier, criterion,
         'joint_gcl_lambda_effective_last': (
             last_effective_joint_gcl_lambda
         ),
+        'joint_gradient_strategy': getattr(
+            args, 'joint_gradient_strategy', 'none'
+        ),
         'best_epoch': best_results['best_epoch'],
         'best_val_mse': best_results['best_val_mse'],
         'best_val_loss': best_results['best_val_loss'],
@@ -1284,6 +1628,7 @@ def regress_train(args, regressor, optimizier, criterion,
         'test_results': test_results_by_name,
         'best_checkpoint': checkpoint_path,
         'joint_gradient_audit_summary': joint_gradient_summary,
+        'joint_pcgrad_audit_summary': joint_pcgrad_summary,
     }
     update_best_checkpoint_metrics(args, final_metrics)
     write_run_metrics(args, final_metrics)
