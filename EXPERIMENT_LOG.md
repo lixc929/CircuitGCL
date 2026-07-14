@@ -2186,3 +2186,66 @@ Selection is fixed before observing either GraphSAGE result:
 6. If neither qualifies, retain ClusterGCN `lambda=0.05` and stop GraphSAGE.
    If at least one qualifies, do not automatically launch more seeds: first
    register a matched static-GraphSAGE control and the exact multi-seed plan.
+
+### Compact GraphSAGE Shared Seed-0 Result
+
+The formal two-arm screen completed at commit `62894d9`. The sequential queue
+ran `lambda=0` on physical GPU3, completed the source-only GraphSAGE checkpoint
+handoff, and then ran `lambda=0.05` on physical GPU4. Both 160-epoch training
+processes, the dedicated summary validator, and the overall queue returned
+`rc=0`. Both source-validation-selected checkpoints were from epoch 156.
+
+| Method | Val raw MSE | digtime | timing_ctrl | array | Transfer mean |
+|---|---:|---:|---:|---:|---:|
+| static dual seed0 | 0.007809748 | 0.016486799 | 0.010408374 | 0.010042039 | 0.012312404 |
+| ClusterGCN lambda=0 seed0 | 0.008090950 | 0.014517009 | 0.011066118 | 0.012114635 | 0.012565921 |
+| ClusterGCN lambda=0.05 seed0 | 0.008035913 | 0.015224475 | 0.010998346 | 0.011695725 | 0.012639515 |
+| GraphSAGE lambda=0 seed0 | 0.008095136 | 0.014649815 | 0.011226653 | 0.012096140 | 0.012657536 |
+| GraphSAGE lambda=0.05 seed0 | 0.008076897 | 0.014475943 | 0.011024745 | 0.010522621 | 0.012007770 |
+
+Relative to static dual, GraphSAGE `lambda=0` changes source validation by
+`+3.6542%`, transfer mean by `+2.8031%`, digtime by `-11.1422%`, timing_ctrl
+by `+7.8617%`, and array by `+20.4550%`. GraphSAGE `lambda=0.05` changes the
+same metrics by `+3.4207%`, `-2.4742%`, `-12.1968%`, `+5.9219%`, and
+`+4.7857%`, respectively. Both arms therefore pass every registered
+`5%/10%/25%` safety gate.
+
+Within the matched GraphSAGE pair, `lambda=0.05` improves source validation by
+`0.2253%`, transfer mean by `5.1334%`, digtime by `1.1869%`, timing_ctrl by
+`1.7985%`, and array by `13.0084%` relative to `lambda=0`. Continuous GCL is
+therefore beneficial inside the compact GraphSAGE architecture at identical
+deployment cost.
+
+GraphSAGE `lambda=0.05` also improves transfer mean by `4.9982%`, digtime by
+`4.9166%`, and array by `10.0302%` relative to the seed-0 ClusterGCN
+`lambda=0.05` incumbent; timing_ctrl is `0.2400%` worse. However, its source
+validation is `0.5100%` worse: `0.008076896891` versus `0.008035913110`.
+The preregistered expansion threshold was strictly below `0.008015913110`, so
+the best GraphSAGE arm misses that threshold by `6.098378e-5`. Transfer results
+are gates and reporting rather than an architecture-selection signal and
+cannot reverse this source-based decision after observation.
+
+The validator found both arms gate-eligible but no advancement-eligible
+candidate, with selection reason `no_candidate_met_source_improvement` and
+`advances_to_seeds12=false`. The paired checkpoint, split, normalization,
+processed-cache, sampler, and evaluation provenance checks all pass. Each arm
+contains the required 21 representation-audit records, and the blind circuit
+is absent from commands, runtime graphs, and metrics.
+
+The compact GraphSAGE and ClusterGCN deployment models each contain one
+two-layer hidden-64 GNN and 29,378 trainable parameters, so parameter count
+does not decide this comparison. GraphSAGE shows useful seed-0 transfer
+behavior, especially on array, but does not satisfy the pre-observation source
+criterion and is not expanded to seeds 1-2. The strict shared-backbone
+incumbent is therefore locked as rank-0 ClusterGCN with constant
+`lambda=0.05`, for which three-seed evidence already exists. The next reuse
+milestone is single-GNN deployment export and export-equivalence validation,
+not another architecture or optimizer sweep.
+
+The immutable GraphSAGE screen summaries are:
+
+```text
+logs/strict_joint_sage_rank0_seed0_screen_20260714/
+  sage_seed0_summary.json
+  sage_seed0_summary.tsv
+```
