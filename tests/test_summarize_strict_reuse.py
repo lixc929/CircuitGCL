@@ -1,6 +1,8 @@
+import copy
 import hashlib
 import json
 from pathlib import Path
+import statistics
 import sys
 import tempfile
 import unittest
@@ -15,14 +17,21 @@ from summarize_strict_reuse import (
     EXPECTED_AUDIT_EPOCHS,
     EXPECTED_MATRIX,
     EXPECTED_METHOD_SEEDS,
+    EXPECTED_SEED0_SCREEN_COMMITS,
+    SEED0_SCREEN_ROOT_NAMES,
+    _tsv_rows,
     compare_methods,
+    extend_report_with_seed0_screens,
     group_runs,
     load_run,
+    normalize_seed0_screen_records,
     promotion_gate,
     summary_stats,
     summarize_gradient_audit,
+    validate_canonical_core_roots,
     validate_lambda_pairing,
     validate_matrix,
+    validate_seed0_screen_roots,
 )
 
 
@@ -49,10 +58,308 @@ def synthetic_run(method, seed, scale=1.0):
         'array': 0.04 * scale,
         'transfer_mean': 0.03 * scale,
         'provenance': provenance,
+        'best_epoch': 1,
+        'git_commit': 'core-commit',
+        'artifact_dir': f'artifact/{method}/seed{seed}',
+        'checkpoint_path': f'artifact/{method}/seed{seed}/best_model.pt',
+        'checkpoint_sha256': f'{method}-{seed}-checkpoint',
     }
 
 
+def synthetic_core_report():
+    runs = []
+    for method, seeds in EXPECTED_METHOD_SEEDS.items():
+        if method == 'joint_rank0_lambda005':
+            scale = 1.02
+        elif method == 'joint_lora_r8_lambda005':
+            scale = 1.30
+        else:
+            scale = 1.0
+        for seed in seeds:
+            runs.append(synthetic_run(method, seed, scale))
+    summaries, by_method = group_runs(runs)
+    gates = {
+        method: promotion_gate(compare_methods(method, 'static_dual', by_method))
+        for method, seeds in EXPECTED_METHOD_SEEDS.items()
+        if seeds == {0, 1, 2}
+    }
+    return {
+        'schema_version': 1,
+        'report_kind': 'strict_reuse_teacher_report',
+        'roots': ['core-a', 'core-b', 'core-c', 'core-d'],
+        'protocol': {},
+        'inventory': {
+            'expected_artifacts': 20,
+            'completed_artifacts': 20,
+            'commits': ['core-commit'],
+            'verified_hashed_provenance_files': 0,
+            'anomalies': [],
+        },
+        'runs': runs,
+        'method_summaries': summaries,
+        'comparisons': {},
+        'promotion_gates_vs_static_dual': gates,
+        'rank0_lambda_pairing': {'passes': True},
+        'gradient_audit': {'sources': [], 'pooled': {}},
+    }
+
+
+def metric_values(row):
+    return {
+        key: row[key]
+        for key in ('val_mse', 'digtime', 'timing_ctrl', 'array', 'transfer_mean')
+    }
+
+
+def synthetic_screen_reports(core):
+    static = metric_values(next(
+        run for run in core['runs']
+        if run['method'] == 'static_dual' and run['seed'] == 0
+    ))
+    cluster0 = metric_values(next(
+        run for run in core['runs']
+        if run['method'] == 'joint_rank0_lambda0' and run['seed'] == 0
+    ))
+    fixed = metric_values(next(
+        run for run in core['runs']
+        if run['method'] == 'joint_rank0_lambda005' and run['seed'] == 0
+    ))
+
+    def candidate(val_delta, transfer_scale):
+        row = {
+            'val_mse': fixed['val_mse'] + val_delta,
+            'digtime': fixed['digtime'] * transfer_scale,
+            'timing_ctrl': fixed['timing_ctrl'] * transfer_scale,
+            'array': fixed['array'] * transfer_scale,
+        }
+        row['transfer_mean'] = statistics.mean(
+            row[key] for key in ('digtime', 'timing_ctrl', 'array')
+        )
+        return row
+
+    linear_row = candidate(1e-5, 0.99)
+    pcgrad_row = candidate(1.5e-5, 0.98)
+    sage0_row = candidate(3e-5, 0.97)
+    sage005_row = candidate(2e-5, 0.96)
+
+    def simple_report(screen, method, row):
+        improvement = fixed['val_mse'] - row['val_mse']
+        return {
+            'schema_version': 1,
+            'method': method,
+            'git_commit': EXPECTED_SEED0_SCREEN_COMMITS[screen],
+            'artifact_dir': f'/artifact/{screen}',
+            'checkpoint': f'/artifact/{screen}/best_model.pt',
+            'checkpoint_sha256': f'{screen}-checkpoint',
+            'best_epoch': 100,
+            'candidate': row,
+            'fixed_lambda005': fixed,
+            'static_dual': static,
+            'promotion_gate': {'passes': True},
+            'selection': {
+                'source_val_improvement_over_fixed': improvement,
+                'minimum_improvement_to_expand': 2e-5,
+                'advances_to_seeds12': False,
+            },
+            'paired_provenance': {'passes': True},
+        }
+
+    linear = simple_report(
+        'linear_lambda',
+        'joint_rank0_lambda005_to0005_linear_seed0',
+        linear_row,
+    )
+    pcgrad = simple_report(
+        'pcgrad', 'joint_rank0_lambda005_pcgrad_seed0', pcgrad_row
+    )
+    pcgrad['linear_lambda'] = dict(linear_row)
+    sage_runs = {}
+    for method, row in (
+        ('joint_sage_rank0_lambda0_seed0', sage0_row),
+        ('joint_sage_rank0_lambda005_seed0', sage005_row),
+    ):
+        sage_runs[method] = {
+            **row,
+            'best_epoch': 100,
+            'artifact': {
+                'metrics_path': f'artifact/{method}/metrics.json',
+                'checkpoint_path': f'artifact/{method}/best_model.pt',
+                'checkpoint_sha256': f'{method}-checkpoint',
+            },
+        }
+    sage = {
+        'schema_version': 1,
+        'report_kind': 'compact_shared_sage_seed0_screen',
+        'git_commit': EXPECTED_SEED0_SCREEN_COMMITS['graphsage'],
+        'runs': sage_runs,
+        'controls': {
+            'canonical_static_dual': static,
+            'cluster_rank0_lambda0': cluster0,
+            'cluster_rank0_lambda005': fixed,
+        },
+        'promotion_gates_vs_canonical_static': {
+            method: {'passes': True} for method in sage_runs
+        },
+        'selection': {
+            'advancement_eligible_candidates': [],
+            'selected_candidate': None,
+            'selection_reason': 'no_candidate_met_source_improvement',
+            'minimum_improvement_to_expand': 2e-5,
+            'advances_to_seeds12': False,
+        },
+        'paired_provenance': {'passes': True},
+    }
+    reports = {
+        'linear_lambda': linear,
+        'pcgrad': pcgrad,
+        'graphsage': sage,
+    }
+    sources = {
+        screen: {
+            'json_path': f'{screen}.json',
+            'json_sha256': f'{screen}-json',
+            'tsv_path': f'{screen}.tsv',
+            'tsv_sha256': f'{screen}-tsv',
+            'manifest_path': f'{screen}-manifest.json',
+            'manifest_sha256': f'{screen}-manifest',
+            'blind_scanned_text_files': 1,
+        }
+        for screen in reports
+    }
+    return reports, sources
+
+
+def relocate_screen_paths(reports, screen_roots):
+    reports['linear_lambda']['artifact_dir'] = str(
+        screen_roots['linear_lambda'] / 'artifact'
+    )
+    reports['linear_lambda']['checkpoint'] = str(
+        screen_roots['linear_lambda'] / 'artifact' / 'best_model.pt'
+    )
+    reports['pcgrad']['artifact_dir'] = str(
+        screen_roots['pcgrad'] / 'artifact'
+    )
+    reports['pcgrad']['checkpoint'] = str(
+        screen_roots['pcgrad'] / 'artifact' / 'best_model.pt'
+    )
+    for method, run in reports['graphsage']['runs'].items():
+        artifact = screen_roots['graphsage'] / method / 'artifact'
+        run['artifact']['metrics_path'] = str(artifact / 'metrics.json')
+        run['artifact']['checkpoint_path'] = str(artifact / 'best_model.pt')
+
+
 class StrictReuseSummaryTest(unittest.TestCase):
+    def test_seed0_screens_are_separate_from_three_seed_summaries(self):
+        core = synthetic_core_report()
+        reports, sources = synthetic_screen_reports(core)
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repo = Path(temporary_dir)
+            screen_roots = {
+                screen: repo / 'logs' / root_name
+                for screen, root_name in SEED0_SCREEN_ROOT_NAMES.items()
+            }
+            relocate_screen_paths(reports, screen_roots)
+            extended = extend_report_with_seed0_screens(
+                core, reports, sources, screen_roots, repo, 4
+            )
+
+        self.assertEqual(extended['schema_version'], 2)
+        self.assertFalse(extended['protocol']['blind_evaluation_completed'])
+        self.assertEqual(
+            extended['protocol']['blind_claim_scope'],
+            'included_formal_text_artifacts_only',
+        )
+        self.assertEqual(len(extended['runs']), 20)
+        self.assertEqual(len(extended['method_summaries']), 8)
+        self.assertEqual(extended['inventory']['completed_artifacts'], 20)
+        self.assertEqual(extended['inventory']['seed0_screen_artifacts'], 4)
+        self.assertEqual(extended['inventory']['total_completed_artifacts'], 24)
+        screen_records = extended['seed0_screens']['records']
+        self.assertEqual(len(screen_records), 4)
+        self.assertTrue(all(
+            record['evidence_scope'] == 'seed0_screen'
+            and record['advances_to_seeds12'] is False
+            and 'pstdev' not in record
+            for record in screen_records
+        ))
+        teacher = extended['teacher_tables']
+        self.assertEqual(len(teacher['three_seed_formal_comparison']), 6)
+        self.assertEqual(len(teacher['seed0_controlled_screens']), 5)
+        self.assertEqual(
+            extended['final_shared_selection']['method'],
+            'joint_rank0_lambda005',
+        )
+        rows = _tsv_rows(extended)
+        self.assertEqual(
+            sum(row['record_type'] == 'seed0_screen_run' for row in rows), 4
+        )
+        self.assertEqual(
+            sum(row['record_type'] == 'seed0_screen_control' for row in rows), 1
+        )
+        self.assertEqual(
+            sum(row['record_type'] == 'final_selection' for row in rows), 1
+        )
+
+    def test_seed0_screen_cross_checks_fail_closed(self):
+        core = synthetic_core_report()
+        reports, sources = synthetic_screen_reports(core)
+        broken = copy.deepcopy(reports)
+        broken['pcgrad']['linear_lambda']['val_mse'] += 1e-4
+        with self.assertRaisesRegex(ValueError, 'PCGrad/linear prerequisite'):
+            normalize_seed0_screen_records(core, broken, sources)
+
+        broken = copy.deepcopy(reports)
+        broken['linear_lambda']['promotion_gate']['passes'] = False
+        with self.assertRaisesRegex(ValueError, 'selection fields'):
+            normalize_seed0_screen_records(core, broken, sources)
+
+        broken = copy.deepcopy(reports)
+        broken['graphsage']['extra'] = {'dataset': 'sram_sp_8192w'}
+        with self.assertRaisesRegex(ValueError, 'blind identifier'):
+            normalize_seed0_screen_records(core, broken, sources)
+
+    def test_seed0_screen_roots_require_exact_repo_paths(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repo = Path(temporary_dir) / 'repo'
+            roots = {}
+            for screen, root_name in SEED0_SCREEN_ROOT_NAMES.items():
+                root = repo / 'logs' / root_name
+                root.mkdir(parents=True)
+                roots[screen] = root
+            validated = validate_seed0_screen_roots(roots, repo)
+            self.assertEqual(set(validated), set(SEED0_SCREEN_ROOT_NAMES))
+
+            external = Path(temporary_dir) / 'external' / (
+                SEED0_SCREEN_ROOT_NAMES['linear_lambda']
+            )
+            external.mkdir(parents=True)
+            roots['linear_lambda'] = external
+            with self.assertRaisesRegex(ValueError, 'root must be'):
+                validate_seed0_screen_roots(roots, repo)
+
+    def test_canonical_core_roots_require_exact_repo_paths(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repo = Path(temporary_dir) / 'repo'
+            roots = []
+            for root_name, expected_runs in EXPECTED_MATRIX.items():
+                root = repo / 'logs' / root_name
+                roots.append(root)
+                for run_name in expected_runs:
+                    artifact = root / run_name / 'artifact'
+                    artifact.mkdir(parents=True)
+                    (artifact / 'run_config.json').write_text('{}')
+            validated = validate_canonical_core_roots(roots, repo)
+            self.assertEqual(set(validated), set(EXPECTED_MATRIX))
+
+            external = Path(temporary_dir) / 'external' / roots[0].name
+            for run_name in EXPECTED_MATRIX[roots[0].name]:
+                artifact = external / run_name / 'artifact'
+                artifact.mkdir(parents=True)
+                (artifact / 'run_config.json').write_text('{}')
+            roots[0] = external
+            with self.assertRaisesRegex(ValueError, 'Canonical core root'):
+                validate_canonical_core_roots(roots, repo)
+
     def test_three_seed_group_comparison_gate_and_pairing(self):
         runs = []
         for method, seeds in EXPECTED_METHOD_SEEDS.items():

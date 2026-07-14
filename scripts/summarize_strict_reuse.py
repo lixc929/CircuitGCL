@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Build the canonical teacher-facing summary for strict reuse experiments.
 
-The report is intentionally tied to the four preregistered 2026-07-12 roots.
-It validates the completed artifacts before combining seeds, then emits one
-JSON file for traceability and one TSV file for convenient inspection.  Raw
-checkpoints and run artifacts remain in their original directories.
+The report is intentionally tied to the four preregistered multi-seed roots
+and the three later seed-0 screen roots.  It validates completed artifacts
+before combining seeds, preserves seed-0 screens as a separate evidence scope,
+then emits one JSON file for traceability and one TSV file for convenient
+inspection.  Raw checkpoints and run artifacts remain in their original
+directories.
 """
 
 from __future__ import annotations
@@ -30,6 +32,90 @@ GATES = {
     'digtime': 0.25,
     'timing_ctrl': 0.25,
     'array': 0.25,
+}
+DEPLOYMENT_PARAMETER_COUNT = 29378
+
+SEED0_SCREEN_ROOT_NAMES = {
+    'linear_lambda': (
+        'strict_joint_rank0_lambda005_to0005_linear_seed0_audit_20260712'
+    ),
+    'pcgrad': 'strict_joint_rank0_lambda005_pcgrad_seed0_audit_20260713',
+    'graphsage': 'strict_joint_sage_rank0_seed0_screen_20260714',
+}
+
+SEED0_SCREEN_SUMMARY_FILES = {
+    'linear_lambda': ('schedule_seed0_summary.json', 'schedule_seed0_summary.tsv'),
+    'pcgrad': ('pcgrad_seed0_summary.json', 'pcgrad_seed0_summary.tsv'),
+    'graphsage': ('sage_seed0_summary.json', 'sage_seed0_summary.tsv'),
+}
+
+EXPECTED_SEED0_SCREEN_COMMITS = {
+    'linear_lambda': '4375c9f2bf2a27e20ccba2a0f3a644cd6745f8b8',
+    'pcgrad': '95cb94834bf7696fc3223cabb5d3be5997ecbad0',
+    'graphsage': '62894d9d353a5eb0f3e19a113afe7224eaa02f04',
+}
+
+EXPECTED_SEED0_SCREEN_HASHES = {
+    'linear_lambda': {
+        'json': 'f95b1e87a0307f35583885a32ee489300f1ef415146be7216b95f3d3192b9141',
+        'tsv': '96061154d46b492753dde7d1e8ffb2e5992fffb598487d3ac5eb983b70dbd24e',
+        'manifest': 'e89f793e3d7a12425359f27b6ad16efa398aa51311681d81403c33f116c24ace',
+    },
+    'pcgrad': {
+        'json': 'f90c7cb42435c11195a3e368d3934a2f11e612929208c46629f464b3fabbfc7f',
+        'tsv': 'add618609b45b67cd7dcd8f366e4882f04d616c7aecfed53d86677111669e435',
+        'manifest': 'fa473620f2852acf113ea70f09987c57bed673fa47762c857ce791661c023d35',
+    },
+    'graphsage': {
+        'json': 'c78fc01f369784f2f4844f261abb3044578b5265b692692fe67a0c4125dcaa6e',
+        'tsv': '485ab1c0e27875c85104ece3c20ce4ac894ed63dbfc2af9a28b18a23654cc6f5',
+        'manifest': 'eb1b0ee022c039e83521b85690197bc5e21ab1ec2daa5feb63b889b4daa0d2b1',
+    },
+}
+
+FORBIDDEN_BLIND_IDENTIFIERS = ('sp8192w', 'sp_8192w', 'sram_sp_8192w')
+BLIND_SCAN_SUFFIXES = {'.json', '.jsonl', '.tsv', '.txt', '.log'}
+
+THREE_SEED_TEACHER_ORDER = (
+    'static_dual',
+    'no_gcl',
+    'init_reuse',
+    'joint_rank0_lambda0',
+    'joint_rank0_lambda005',
+    'joint_lora_r8_lambda005',
+)
+
+THREE_SEED_METHOD_METADATA = {
+    'static_dual': {
+        'display_name': 'static dual',
+        'continuous_gcl': False,
+        'decision': 'reference',
+    },
+    'no_gcl': {
+        'display_name': 'no-GCL',
+        'continuous_gcl': False,
+        'decision': 'diagnostic_control',
+    },
+    'init_reuse': {
+        'display_name': 'init_reuse',
+        'continuous_gcl': False,
+        'decision': 'engineering_fallback',
+    },
+    'joint_rank0_lambda0': {
+        'display_name': 'ClusterGCN rank0 lambda=0',
+        'continuous_gcl': False,
+        'decision': 'passes_but_not_selected',
+    },
+    'joint_lora_r8_lambda005': {
+        'display_name': 'ClusterGCN LoRA r8 lambda=0.05',
+        'continuous_gcl': True,
+        'decision': 'rejected_by_per_circuit_gate',
+    },
+    'joint_rank0_lambda005': {
+        'display_name': 'ClusterGCN rank0 lambda=0.05',
+        'continuous_gcl': True,
+        'decision': 'selected_shared_incumbent',
+    },
 }
 
 # root -> run directory -> (stable method id, seed)
@@ -691,8 +777,761 @@ def build_report(roots, repo_root):
     }
 
 
+def validate_seed0_screen_roots(screen_roots, repo_root):
+    if set(screen_roots) != set(SEED0_SCREEN_ROOT_NAMES):
+        raise ValueError(
+            'Seed-0 screen report requires exactly these roots: '
+            f'{sorted(SEED0_SCREEN_ROOT_NAMES)}.'
+        )
+    resolved = {}
+    for screen, expected_name in SEED0_SCREEN_ROOT_NAMES.items():
+        root = Path(screen_roots[screen]).resolve()
+        expected_root = (Path(repo_root).resolve() / 'logs' / expected_name)
+        if root != expected_root:
+            raise ValueError(
+                f'{screen} root must be {expected_root}; got {root}.'
+            )
+        if not root.is_dir():
+            raise ValueError(f'Missing seed-0 screen root: {root}')
+        resolved[screen] = root
+    return resolved
+
+
+def validate_canonical_core_roots(roots, repo_root):
+    if len(roots) != len(EXPECTED_MATRIX):
+        raise ValueError('Canonical report requires four distinct core roots.')
+    roots_by_name = validate_matrix(roots)
+    for root_name, root in roots_by_name.items():
+        expected = Path(repo_root).resolve() / 'logs' / root_name
+        if root != expected:
+            raise ValueError(
+                f'Canonical core root must be {expected}; got {root}.'
+            )
+    return roots_by_name
+
+
+def _scan_text_artifacts_for_blind(root, context):
+    paths = [
+        path for path in sorted(Path(root).rglob('*'))
+        if path.is_file() and path.suffix.lower() in BLIND_SCAN_SUFFIXES
+    ]
+    for path in paths:
+        content = path.read_text(encoding='utf-8').lower()
+        matched = [
+            identifier for identifier in FORBIDDEN_BLIND_IDENTIFIERS
+            if identifier in content
+        ]
+        if matched:
+            raise ValueError(
+                f'{context} contains blind identifier {matched[0]} in {path}.'
+            )
+    return len(paths)
+
+
+def _validate_linear_screen_integrity(root, report):
+    manifest_path = root / 'selection_manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    _expect(manifest, {
+        'schema_version': 1,
+        'method': 'joint_rank0_lambda005_to0005_linear_seed0',
+        'protocol': 'strict_inductive',
+        'seeds': [0],
+        'epochs': 160,
+        'automatic_multiseed_expansion': False,
+        'blind_circuits': [],
+        'physical_gpu': 4,
+        'child_cuda_visible_devices': '4',
+        'child_logical_gpu': 0,
+        'comparison_roots': [
+            'logs/strict_joint_rank0_lambda005_seed0_20260712',
+            'logs/strict_seed0_seven_20260712_v2',
+        ],
+        'gpu_gate': {
+            'compute_processes': 'record_only',
+            'minimum_free_mb': 6500,
+            'poll_seconds': 60,
+            'required_consecutive_capacity_samples': 1,
+            'utilization': 'record_only',
+        },
+        'gradient_audit': {
+            'batch_index': 0,
+            'enabled': True,
+            'interval': 10,
+            'observational_only': True,
+        },
+        'selection': {
+            'minimum_source_val_improvement_to_expand': 2e-5,
+            'primary': 'source validation raw MSE',
+            'promotion_gates': {
+                'any_transfer_circuit_degradation_max': 0.25,
+                'source_validation_degradation_max': 0.05,
+                'transfer_mean_degradation_max': 0.1,
+            },
+            'transfer_role': 'promotion gates and reporting only',
+        },
+    }, 'linear-lambda manifest')
+    if manifest.get('git_commit') != EXPECTED_SEED0_SCREEN_COMMITS['linear_lambda']:
+        raise ValueError('Linear-lambda manifest commit changed.')
+    config_path = Path(report.get('sources', {}).get('candidate_config', ''))
+    metrics_path = Path(report.get('sources', {}).get('candidate_metrics', ''))
+    for path, label in ((config_path, 'config'), (metrics_path, 'metrics')):
+        try:
+            path.resolve().relative_to(root)
+        except ValueError as error:
+            raise ValueError(f'Linear-lambda {label} escaped its root.') from error
+        if not path.is_file():
+            raise ValueError(f'Linear-lambda {label} is missing.')
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    runtime = config.get('runtime_metadata')
+    if not isinstance(runtime, dict):
+        raise ValueError('Linear-lambda runtime provenance is missing.')
+    if runtime.get('resolved_seeds') != _expected_resolved_seeds(0):
+        raise ValueError('Linear-lambda resolved seeds changed.')
+    _verify_hashed_paths(
+        runtime, set(), 'linear-lambda supplemental runtime provenance'
+    )
+
+
+def _validate_materialized_screen_report(
+        screen, report, root, writer, repo_root):
+    json_name, tsv_name = SEED0_SCREEN_SUMMARY_FILES[screen]
+    json_path = root / json_name
+    tsv_path = root / tsv_name
+    if not json_path.is_file() or not tsv_path.is_file():
+        raise ValueError(f'{screen} is missing its materialized JSON/TSV summary.')
+    manifest_path = root / 'selection_manifest.json'
+    if not manifest_path.is_file():
+        raise ValueError(f'{screen} is missing selection_manifest.json.')
+    expected_hashes = EXPECTED_SEED0_SCREEN_HASHES[screen]
+    actual_hashes = {
+        'json': file_sha256(json_path),
+        'tsv': file_sha256(tsv_path),
+        'manifest': file_sha256(manifest_path),
+    }
+    if actual_hashes != expected_hashes:
+        raise ValueError(
+            f'{screen} immutable summary/manifest hashes changed: '
+            f'{actual_hashes}.'
+        )
+    blind_scanned_text_files = _scan_text_artifacts_for_blind(root, screen)
+    with tempfile.TemporaryDirectory() as temporary_dir:
+        generated_json, generated_tsv = writer(report, Path(temporary_dir))
+        if generated_json.read_bytes() != json_path.read_bytes():
+            raise ValueError(f'{screen} JSON summary is stale or inconsistent.')
+        if generated_tsv.read_bytes() != tsv_path.read_bytes():
+            raise ValueError(f'{screen} TSV summary is stale or inconsistent.')
+    return {
+        'json_path': repo_relative(json_path, repo_root),
+        'json_sha256': file_sha256(json_path),
+        'tsv_path': repo_relative(tsv_path, repo_root),
+        'tsv_sha256': actual_hashes['tsv'],
+        'manifest_path': repo_relative(manifest_path, repo_root),
+        'manifest_sha256': actual_hashes['manifest'],
+        'blind_scanned_text_files': blind_scanned_text_files,
+    }
+
+
+def rebuild_seed0_screen_reports(
+        screen_roots, core_roots, repo_root):
+    # Lazy imports avoid a module-level cycle because the dedicated validators
+    # share utility functions from this module.
+    from summarize_joint_lambda_schedule_seed0 import (
+        build_report as build_schedule_report,
+        write_report as write_schedule_report,
+    )
+    from summarize_joint_pcgrad_seed0 import (
+        build_report as build_pcgrad_report,
+        write_report as write_pcgrad_report,
+    )
+    from summarize_joint_sage_seed0 import (
+        build_report as build_sage_report,
+        write_report as write_sage_report,
+    )
+
+    screen_roots = validate_seed0_screen_roots(screen_roots, repo_root)
+    static_root = core_roots['strict_seed0_seven_20260712_v2']
+    fixed_root = core_roots['strict_joint_rank0_lambda005_seed0_20260712']
+    schedule_root = screen_roots['linear_lambda']
+    reports = {
+        'linear_lambda': build_schedule_report(
+            schedule_root, fixed_root, static_root
+        ),
+        'pcgrad': build_pcgrad_report(
+            screen_roots['pcgrad'], fixed_root, static_root, schedule_root
+        ),
+        'graphsage': build_sage_report(
+            screen_roots['graphsage'], static_root, fixed_root,
+            repo_root=repo_root,
+        ),
+    }
+    for screen, expected_commit in EXPECTED_SEED0_SCREEN_COMMITS.items():
+        if reports[screen].get('git_commit') != expected_commit:
+            raise ValueError(f'{screen} immutable commit changed.')
+    _validate_linear_screen_integrity(schedule_root, reports['linear_lambda'])
+    writers = {
+        'linear_lambda': write_schedule_report,
+        'pcgrad': write_pcgrad_report,
+        'graphsage': write_sage_report,
+    }
+    sources = {
+        screen: _validate_materialized_screen_report(
+            screen, reports[screen], screen_roots[screen], writers[screen],
+            repo_root,
+        )
+        for screen in SEED0_SCREEN_ROOT_NAMES
+    }
+    return reports, sources, screen_roots
+
+
+def _validated_metric_values(payload, context):
+    if not isinstance(payload, dict):
+        raise ValueError(f'{context} must be a metric object.')
+    values = {}
+    for metric in METRICS:
+        value = payload.get(metric)
+        if value is None or not math.isfinite(float(value)):
+            raise ValueError(f'{context} has invalid {metric}.')
+        values[metric] = float(value)
+    expected_transfer = statistics.mean(
+        values[metric] for metric in ('digtime', 'timing_ctrl', 'array')
+    )
+    if not math.isclose(
+            values['transfer_mean'], expected_transfer,
+            rel_tol=1e-12, abs_tol=1e-15):
+        raise ValueError(f'{context} has inconsistent transfer mean.')
+    return values
+
+
+def _core_seed0_metrics(report, method):
+    matches = [
+        run for run in report['runs']
+        if run['method'] == method and run['seed'] == 0
+    ]
+    if len(matches) != 1:
+        raise ValueError(f'Canonical core is missing {method}/seed0.')
+    return {metric: float(matches[0][metric]) for metric in METRICS}
+
+
+def _require_metric_match(candidate, reference, context):
+    candidate = _validated_metric_values(candidate, f'{context} candidate')
+    reference = _validated_metric_values(reference, f'{context} reference')
+    mismatches = [
+        metric for metric in METRICS
+        if not math.isclose(
+            candidate[metric], reference[metric], rel_tol=1e-12, abs_tol=1e-15
+        )
+    ]
+    if mismatches:
+        raise ValueError(f'{context} metric mismatch: {mismatches}.')
+
+
+def _screen_gate(candidate, static):
+    relative = {
+        metric: candidate[metric] / static[metric] - 1.0
+        for metric in METRICS
+    }
+    checks = {
+        metric: {
+            'observed_degradation': relative[metric],
+            'maximum_degradation': GATES[metric],
+            'passes': relative[metric] <= GATES[metric],
+        }
+        for metric in GATES
+    }
+    return {
+        'reference': 'static_dual/seed0',
+        'relative_delta': relative,
+        'checks': checks,
+        'passes': all(check['passes'] for check in checks.values()),
+    }
+
+
+def _normalized_screen_path(path, screen_root, repo_root, context):
+    if path in (None, ''):
+        return None
+    path = Path(path)
+    if not path.is_absolute():
+        path = Path(repo_root) / path
+    path = path.resolve()
+    try:
+        path.relative_to(Path(screen_root).resolve())
+    except ValueError as error:
+        raise ValueError(f'{context} escaped its registered screen root.') from error
+    return repo_relative(path, repo_root)
+
+
+def _simple_screen_best_epoch(report, context):
+    best_epoch = report.get('best_epoch')
+    if best_epoch is None:
+        metrics_path = Path(
+            report.get('sources', {}).get('candidate_metrics', '')
+        )
+        if not metrics_path.is_file():
+            raise ValueError(f'{context} candidate metrics are missing.')
+        metrics = json.loads(metrics_path.read_text(encoding='utf-8'))
+        best_epoch = metrics.get('best_epoch')
+    if type(best_epoch) is not int or not 0 <= best_epoch < 160:
+        raise ValueError(f'{context} has an invalid best epoch.')
+    return best_epoch
+
+
+def _simple_screen_record(
+        screen, report, source, architecture, variant, continuous_gcl,
+        static, incumbent, screen_root=None, repo_root=None):
+    candidate = _validated_metric_values(
+        report.get('candidate'), f'{screen} candidate'
+    )
+    gate = _screen_gate(candidate, static)
+    recorded_gate = report.get('promotion_gate', {}).get('passes')
+    selection = report.get('selection', {})
+    advances = selection.get('advances_to_seeds12')
+    recorded_improvement = selection.get(
+        'source_val_improvement_over_fixed'
+    )
+    minimum_improvement = selection.get('minimum_improvement_to_expand')
+    improvement = incumbent['val_mse'] - candidate['val_mse']
+    if minimum_improvement != 2e-5:
+        raise ValueError(f'{screen} expansion threshold changed.')
+    if (
+        recorded_improvement is None
+        or not math.isclose(
+            float(recorded_improvement), improvement,
+            rel_tol=1e-12, abs_tol=1e-15,
+        )
+    ):
+        raise ValueError(f'{screen} source improvement is inconsistent.')
+    expected_advances = gate['passes'] and improvement > minimum_improvement
+    if recorded_gate is not gate['passes'] or advances is not expected_advances:
+        raise ValueError(f'{screen} selection fields are inconsistent.')
+    if not gate['passes'] or advances is not False:
+        raise ValueError(f'{screen} immutable selection conclusion changed.')
+    artifact_dir = report.get('artifact_dir')
+    checkpoint_path = report.get('checkpoint')
+    best_epoch = _simple_screen_best_epoch(report, screen)
+    if screen_root is not None and repo_root is not None:
+        artifact_dir = _normalized_screen_path(
+            artifact_dir, screen_root, repo_root, f'{screen} artifact'
+        )
+        checkpoint_path = _normalized_screen_path(
+            checkpoint_path, screen_root, repo_root, f'{screen} checkpoint'
+        )
+    return {
+        'screen': screen,
+        'method': report.get('method'),
+        'seed': 0,
+        'evidence_scope': 'seed0_screen',
+        'architecture': architecture,
+        'variant': variant,
+        'continuous_gcl': continuous_gcl,
+        'planned_deployment_gnns': 1,
+        'shared_model_trainable_parameters': DEPLOYMENT_PARAMETER_COUNT,
+        **candidate,
+        'best_epoch': best_epoch,
+        'gate_reference': 'static_dual/seed0',
+        'selection_reference': 'joint_rank0_lambda005/seed0',
+        'relative_to_gate_reference': gate['relative_delta'],
+        'relative_to_selection_reference': {
+            metric: candidate[metric] / incumbent[metric] - 1.0
+            for metric in METRICS
+        },
+        'source_val_improvement_over_incumbent': improvement,
+        'minimum_improvement_to_expand': minimum_improvement,
+        'promotion_gate': gate,
+        'promotion_gate_passes': gate['passes'],
+        'advances_to_seeds12': False,
+        'selection_status': 'not_advanced',
+        'selection_reason': 'source_improvement_not_over_2e-5',
+        'git_commit': report.get('git_commit'),
+        'artifact_dir': artifact_dir,
+        'checkpoint_path': checkpoint_path,
+        'checkpoint_sha256': report.get('checkpoint_sha256'),
+        'summary_source': source,
+    }
+
+
+def normalize_seed0_screen_records(
+        core_report, reports, sources, screen_roots=None, repo_root=None):
+    if set(reports) != set(SEED0_SCREEN_ROOT_NAMES):
+        raise ValueError('Seed-0 screen report set is incomplete.')
+    if set(sources) != set(SEED0_SCREEN_ROOT_NAMES):
+        raise ValueError('Seed-0 screen source set is incomplete.')
+    serialized = json.dumps(reports, sort_keys=True).lower()
+    if any(identifier in serialized for identifier in FORBIDDEN_BLIND_IDENTIFIERS):
+        raise ValueError('Seed-0 screen reports contain a blind identifier.')
+
+    static = _core_seed0_metrics(core_report, 'static_dual')
+    cluster0 = _core_seed0_metrics(core_report, 'joint_rank0_lambda0')
+    cluster005 = _core_seed0_metrics(core_report, 'joint_rank0_lambda005')
+    linear = reports['linear_lambda']
+    pcgrad = reports['pcgrad']
+    sage = reports['graphsage']
+    if (
+        linear.get('schema_version') != 1
+        or linear.get('method') != (
+            'joint_rank0_lambda005_to0005_linear_seed0'
+        )
+    ):
+        raise ValueError('Unexpected linear-lambda summary schema or method.')
+    if (
+        pcgrad.get('schema_version') != 1
+        or pcgrad.get('method') != 'joint_rank0_lambda005_pcgrad_seed0'
+    ):
+        raise ValueError('Unexpected PCGrad summary schema or method.')
+    expected_sage_runs = {
+        'joint_sage_rank0_lambda0_seed0',
+        'joint_sage_rank0_lambda005_seed0',
+    }
+    if (
+        sage.get('schema_version') != 1
+        or sage.get('report_kind') != 'compact_shared_sage_seed0_screen'
+        or set(sage.get('runs', {})) != expected_sage_runs
+    ):
+        raise ValueError('Unexpected GraphSAGE summary schema or run set.')
+    _require_metric_match(linear.get('static_dual'), static, 'linear/static')
+    _require_metric_match(
+        linear.get('fixed_lambda005'), cluster005, 'linear/fixed'
+    )
+    _require_metric_match(pcgrad.get('static_dual'), static, 'PCGrad/static')
+    _require_metric_match(
+        pcgrad.get('fixed_lambda005'), cluster005, 'PCGrad/fixed'
+    )
+    _require_metric_match(
+        pcgrad.get('linear_lambda'), linear.get('candidate'),
+        'PCGrad/linear prerequisite',
+    )
+    _require_metric_match(
+        sage.get('controls', {}).get('canonical_static_dual'),
+        static, 'GraphSAGE/static',
+    )
+    _require_metric_match(
+        sage.get('controls', {}).get('cluster_rank0_lambda0'),
+        cluster0, 'GraphSAGE/Cluster lambda=0',
+    )
+    _require_metric_match(
+        sage.get('controls', {}).get('cluster_rank0_lambda005'),
+        cluster005, 'GraphSAGE/Cluster lambda=0.05',
+    )
+    if linear.get('paired_provenance', {}).get('passes') is not True:
+        raise ValueError('Linear-lambda paired provenance failed.')
+    if pcgrad.get('paired_provenance', {}).get('passes') is not True:
+        raise ValueError('PCGrad paired provenance failed.')
+    if sage.get('paired_provenance', {}).get('passes') is not True:
+        raise ValueError('GraphSAGE paired provenance failed.')
+
+    records = [
+        _simple_screen_record(
+            'linear_lambda', linear, sources['linear_lambda'], 'clustergcn',
+            'linear_lambda_0.05_to_0.005', True, static, cluster005,
+            screen_roots['linear_lambda'] if screen_roots else None, repo_root,
+        ),
+        _simple_screen_record(
+            'pcgrad', pcgrad, sources['pcgrad'], 'clustergcn',
+            'pcgrad_lambda_0.05', True, static, cluster005,
+            screen_roots['pcgrad'] if screen_roots else None, repo_root,
+        ),
+    ]
+    sage_selection = sage.get('selection', {})
+    if (
+        sage_selection.get('advances_to_seeds12') is not False
+        or sage_selection.get('selected_candidate') is not None
+        or sage_selection.get('selection_reason') != (
+            'no_candidate_met_source_improvement'
+        )
+    ):
+        raise ValueError('GraphSAGE immutable selection conclusion changed.')
+    advancement_eligible = set(
+        sage_selection.get('advancement_eligible_candidates', [])
+    )
+    if sage_selection.get('minimum_improvement_to_expand') != 2e-5:
+        raise ValueError('GraphSAGE expansion threshold changed.')
+    sage_specs = (
+        ('joint_sage_rank0_lambda0_seed0', 'constant_lambda_0', False),
+        ('joint_sage_rank0_lambda005_seed0', 'constant_lambda_0.05', True),
+    )
+    for method, variant, continuous_gcl in sage_specs:
+        run = sage.get('runs', {}).get(method)
+        metrics = _validated_metric_values(run, f'{method} metrics')
+        best_epoch = run.get('best_epoch')
+        if type(best_epoch) is not int or not 0 <= best_epoch < 160:
+            raise ValueError(f'{method} has an invalid best epoch.')
+        gate = _screen_gate(metrics, static)
+        recorded_gate = sage.get(
+            'promotion_gates_vs_canonical_static', {}
+        ).get(method, {})
+        improvement = cluster005['val_mse'] - metrics['val_mse']
+        expected_eligible = gate['passes'] and improvement > 2e-5
+        if recorded_gate.get('passes') is not gate['passes']:
+            raise ValueError(f'{method} gate result is inconsistent.')
+        if (method in advancement_eligible) is not expected_eligible:
+            raise ValueError(f'{method} advancement eligibility is inconsistent.')
+        if not gate['passes'] or expected_eligible:
+            raise ValueError(f'{method} immutable promotion conclusion changed.')
+        artifact = run.get('artifact', {})
+        artifact_dir = (
+            str(Path(artifact.get('metrics_path', '')).parent)
+            if artifact.get('metrics_path') else None
+        )
+        checkpoint_path = artifact.get('checkpoint_path')
+        if screen_roots is not None and repo_root is not None:
+            artifact_dir = _normalized_screen_path(
+                artifact_dir, screen_roots['graphsage'], repo_root,
+                f'{method} artifact',
+            )
+            checkpoint_path = _normalized_screen_path(
+                checkpoint_path, screen_roots['graphsage'], repo_root,
+                f'{method} checkpoint',
+            )
+        records.append({
+            'screen': 'graphsage',
+            'method': method,
+            'seed': 0,
+            'evidence_scope': 'seed0_screen',
+            'architecture': 'sage',
+            'variant': variant,
+            'continuous_gcl': continuous_gcl,
+            'planned_deployment_gnns': 1,
+            'shared_model_trainable_parameters': DEPLOYMENT_PARAMETER_COUNT,
+            **metrics,
+            'best_epoch': best_epoch,
+            'gate_reference': 'static_dual/seed0',
+            'selection_reference': 'joint_rank0_lambda005/seed0',
+            'relative_to_gate_reference': gate['relative_delta'],
+            'relative_to_selection_reference': {
+                metric: metrics[metric] / cluster005[metric] - 1.0
+                for metric in METRICS
+            },
+            'source_val_improvement_over_incumbent': improvement,
+            'minimum_improvement_to_expand': 2e-5,
+            'promotion_gate': gate,
+            'promotion_gate_passes': gate['passes'],
+            'advances_to_seeds12': False,
+            'selection_status': 'not_advanced',
+            'selection_reason': sage_selection['selection_reason'],
+            'git_commit': sage.get('git_commit'),
+            'artifact_dir': artifact_dir,
+            'checkpoint_path': checkpoint_path,
+            'checkpoint_sha256': artifact.get('checkpoint_sha256'),
+            'summary_source': sources['graphsage'],
+        })
+    if len(records) != 4:
+        raise ValueError('Expected exactly four seed-0 screening records.')
+    return records
+
+
+def build_three_seed_teacher_rows(report):
+    static = report['method_summaries']['static_dual']['metrics']
+    rows = []
+    for method in THREE_SEED_TEACHER_ORDER:
+        summary = report['method_summaries'].get(method)
+        if summary is None or summary.get('seeds') != [0, 1, 2]:
+            raise ValueError(f'{method} lacks the required three-seed summary.')
+        gate = report['promotion_gates_vs_static_dual'].get(method)
+        if gate is None:
+            raise ValueError(f'{method} lacks its promotion-gate summary.')
+        metadata = THREE_SEED_METHOD_METADATA[method]
+        per_seed = gate.get('per_seed', {})
+        passed_seed_count = sum(
+            seed_gate.get('passes') is True for seed_gate in per_seed.values()
+        )
+        if set(per_seed) != {'0', '1', '2'}:
+            raise ValueError(f'{method} lacks complete per-seed gate results.')
+        if (
+            metadata['decision'] == 'rejected_by_per_circuit_gate'
+            and gate['passes'] is not False
+        ):
+            raise ValueError(f'{method} rejection no longer matches its gate.')
+        if (
+            metadata['decision'] == 'selected_shared_incumbent'
+            and (gate['passes'] is not True or passed_seed_count != 3)
+        ):
+            raise ValueError(f'{method} selection no longer has passing evidence.')
+        rows.append({
+            'method': method,
+            **metadata,
+            'evidence_scope': 'three_seed',
+            'seeds': [0, 1, 2],
+            'metrics': {
+                metric: {
+                    'mean': summary['metrics'][metric]['mean'],
+                    'pstdev': summary['metrics'][metric]['pstdev'],
+                }
+                for metric in METRICS
+            },
+            'relative_to_static': {
+                metric: (
+                    summary['metrics'][metric]['mean'] /
+                    static[metric]['mean'] - 1.0
+                )
+                for metric in METRICS
+            },
+            'promotion_gate_passes': gate['passes'],
+            'per_seed_gate_pass_count': passed_seed_count,
+            'all_seed_gates_pass': passed_seed_count == 3,
+        })
+    return rows
+
+
+def build_seed0_teacher_rows(core_report, screen_records):
+    fixed = _core_seed0_metrics(core_report, 'joint_rank0_lambda005')
+    gate = core_report['promotion_gates_vs_static_dual'][
+        'joint_rank0_lambda005'
+    ]['per_seed']['0']['passes']
+    control = {
+        'screen': 'registered_control',
+        'method': 'joint_rank0_lambda005_seed0',
+        'seed': 0,
+        'evidence_scope': 'seed0_control',
+        'architecture': 'clustergcn',
+        'variant': 'constant_lambda_0.05',
+        'continuous_gcl': True,
+        **fixed,
+        'gate_reference': 'static_dual/seed0',
+        'selection_reference': 'self',
+        'relative_to_incumbent': {metric: 0.0 for metric in METRICS},
+        'promotion_gate_passes': gate,
+        'advances_to_seeds12': None,
+        'selection_status': 'selected_shared_incumbent',
+    }
+    rows = [control]
+    for record in screen_records:
+        rows.append({
+            **record,
+            'relative_to_incumbent': {
+                metric: record[metric] / fixed[metric] - 1.0
+                for metric in METRICS
+            },
+        })
+    return rows
+
+
+def extend_report_with_seed0_screens(
+        report, reports, sources, screen_roots, repo_root,
+        core_blind_scanned_text_files):
+    if report.get('inventory', {}).get('completed_artifacts') != 20:
+        raise ValueError('Canonical core inventory must contain 20 artifacts.')
+    if (
+        type(core_blind_scanned_text_files) is not int
+        or core_blind_scanned_text_files <= 0
+    ):
+        raise ValueError('Core blind scan must cover at least one text artifact.')
+    report = json.loads(json.dumps(report))
+    screen_records = normalize_seed0_screen_records(
+        report, reports, sources, screen_roots, repo_root
+    )
+    core_roots = list(report['roots'])
+    report['schema_version'] = 2
+    report['report_scope'] = 'reuse_selection_pre_deployment_pre_blind'
+    report['protocol'].update({
+        'blind_identifier_present_in_included_text_artifacts': False,
+        'blind_evaluation_completed': False,
+        'blind_claim_scope': 'included_formal_text_artifacts_only',
+    })
+    report['core_roots'] = core_roots
+    report['seed0_screen_roots'] = [
+        repo_relative(screen_roots[screen], repo_root)
+        for screen in SEED0_SCREEN_ROOT_NAMES
+    ]
+    report['roots'] = core_roots + report['seed0_screen_roots']
+    report['inventory'].update({
+        'core_artifacts': 20,
+        'seed0_screen_artifacts': len(screen_records),
+        'total_expected_artifacts': 20 + len(screen_records),
+        'total_completed_artifacts': 20 + len(screen_records),
+        'validated_seed0_screen_reports': len(reports),
+        'verified_screen_summary_files': 2 * len(sources),
+        'verified_screen_manifest_files': len(sources),
+        'verified_hashed_provenance_files_scope': 'core_20_artifacts_only',
+        'blind_scanned_core_text_files': core_blind_scanned_text_files,
+        'blind_scanned_screen_text_files': sum(
+            source['blind_scanned_text_files'] for source in sources.values()
+        ),
+    })
+    screen_commits = [
+        screen_report.get('git_commit') for screen_report in reports.values()
+    ]
+    if not all(isinstance(commit, str) and commit for commit in screen_commits):
+        raise ValueError('Seed-0 screen reports have invalid commit provenance.')
+    report['inventory']['commits'] = sorted(set(
+        report['inventory']['commits'] + screen_commits
+    ))
+    incumbent_gate = report['promotion_gates_vs_static_dual'].get(
+        'joint_rank0_lambda005', {}
+    )
+    incumbent_summary = report['method_summaries'].get(
+        'joint_rank0_lambda005', {}
+    )
+    if (
+        incumbent_summary.get('seeds') != [0, 1, 2]
+        or incumbent_gate.get('passes') is not True
+        or not all(
+            value.get('passes') is True
+            for value in incumbent_gate.get('per_seed', {}).values()
+        )
+        or set(incumbent_gate.get('per_seed', {})) != {'0', '1', '2'}
+    ):
+        raise ValueError('The locked incumbent lacks complete passing evidence.')
+    report['seed0_screens'] = {
+        'records': screen_records,
+        'source_reports': sources,
+        'validated_reports': reports,
+        'selection': {
+            'advancement_eligible_candidates': [],
+            'advances_to_seeds12': False,
+            'locked_method': 'joint_rank0_lambda005',
+            'locked_architecture': 'clustergcn',
+            'locked_variant': 'constant_lambda_0.05',
+            'reason': 'all_seed0_screens_failed_registered_source_improvement',
+        },
+    }
+    report['teacher_tables'] = {
+        'three_seed_formal_comparison': build_three_seed_teacher_rows(report),
+        'seed0_controlled_screens': build_seed0_teacher_rows(
+            report, screen_records
+        ),
+        'scope_note': (
+            'Seed-0 screens are not pooled into three-seed means. Deployment '
+            'and blind measurements are pending.'
+        ),
+    }
+    report['final_shared_selection'] = {
+        'method': 'joint_rank0_lambda005',
+        'architecture': 'clustergcn',
+        'variant': 'constant_lambda_0.05',
+        'rank': 0,
+        'continuous_gcl': True,
+        'planned_deployment_gnns': 1,
+        'shared_model_trainable_parameters': DEPLOYMENT_PARAMETER_COUNT,
+        'evidence_scope': 'three_seed',
+        'status': 'locked_for_deployment_export',
+        'deployment_export_validated': False,
+    }
+    return report
+
+
+def build_canonical_report(roots, screen_roots, repo_root):
+    core_roots = validate_canonical_core_roots(roots, repo_root)
+    core_blind_scanned_text_files = sum(
+        _scan_text_artifacts_for_blind(root, f'core/{root_name}')
+        for root_name, root in core_roots.items()
+    )
+    report = build_report(roots, repo_root)
+    reports, sources, resolved_screen_roots = rebuild_seed0_screen_reports(
+        screen_roots, core_roots, repo_root
+    )
+    return extend_report_with_seed0_screens(
+        report, reports, sources, resolved_screen_roots, repo_root,
+        core_blind_scanned_text_files,
+    )
+
+
 def _tsv_rows(report):
     rows = []
+    teacher_rows = {
+        row['method']: row
+        for row in report.get('teacher_tables', {}).get(
+            'three_seed_formal_comparison', []
+        )
+    }
     for run in report['runs']:
         rows.append({
             'record_type': 'run', 'id': f"{run['method']}/seed{run['seed']}",
@@ -709,7 +1548,83 @@ def _tsv_rows(report):
         for metric in METRICS:
             row[metric] = summary['metrics'][metric]['mean']
             row[f'{metric}_pstdev'] = summary['metrics'][metric]['pstdev']
+        teacher = teacher_rows.get(method)
+        if teacher is not None:
+            row.update({
+                'evidence_scope': teacher['evidence_scope'],
+                'continuous_gcl': teacher['continuous_gcl'],
+                'passes': teacher['promotion_gate_passes'],
+                'per_seed_gate_pass_count': (
+                    teacher['per_seed_gate_pass_count']
+                ),
+                'all_seed_gates_pass': teacher['all_seed_gates_pass'],
+                'selection_status': teacher['decision'],
+            })
         rows.append(row)
+    seed0_teacher_rows = report.get('teacher_tables', {}).get(
+        'seed0_controlled_screens', []
+    )
+    if seed0_teacher_rows:
+        control = seed0_teacher_rows[0]
+        if control.get('selection_status') != 'selected_shared_incumbent':
+            raise ValueError('Seed-0 teacher control row is invalid.')
+        core_control = next(
+            run for run in report['runs']
+            if run['method'] == 'joint_rank0_lambda005' and run['seed'] == 0
+        )
+        rows.append({
+            'record_type': 'seed0_screen_control',
+            'id': control['method'],
+            'method': control['method'],
+            'reference': control['selection_reference'],
+            'seed': 0,
+            'screen': control['screen'],
+            'evidence_scope': control['evidence_scope'],
+            'architecture': control['architecture'],
+            'variant': control['variant'],
+            'continuous_gcl': control['continuous_gcl'],
+            **{metric: control[metric] for metric in METRICS},
+            'passes': control['promotion_gate_passes'],
+            'source_val_improvement_over_incumbent': 0.0,
+            'selection_status': control['selection_status'],
+            'best_epoch': core_control['best_epoch'],
+            'git_commit': core_control['git_commit'],
+            'artifact_dir': core_control['artifact_dir'],
+            'checkpoint_path': core_control['checkpoint_path'],
+            'checkpoint_sha256': core_control['checkpoint_sha256'],
+        })
+    for record in report.get('seed0_screens', {}).get('records', []):
+        source = record['summary_source']
+        rows.append({
+            'record_type': 'seed0_screen_run',
+            'id': record['method'],
+            'method': record['method'],
+            'reference': record['selection_reference'],
+            'seed': record['seed'],
+            'screen': record['screen'],
+            'evidence_scope': record['evidence_scope'],
+            'architecture': record['architecture'],
+            'variant': record['variant'],
+            'continuous_gcl': record['continuous_gcl'],
+            **{metric: record[metric] for metric in METRICS},
+            'passes': record['promotion_gate_passes'],
+            'source_val_improvement_over_incumbent': (
+                record['source_val_improvement_over_incumbent']
+            ),
+            'minimum_improvement_to_expand': (
+                record['minimum_improvement_to_expand']
+            ),
+            'advances_to_seeds12': record['advances_to_seeds12'],
+            'selection_status': record['selection_status'],
+            'selection_reason': record['selection_reason'],
+            'best_epoch': record.get('best_epoch'),
+            'git_commit': record['git_commit'],
+            'artifact_dir': record['artifact_dir'],
+            'checkpoint_path': record['checkpoint_path'],
+            'checkpoint_sha256': record['checkpoint_sha256'],
+            'source_summary_path': source['json_path'],
+            'source_summary_sha256': source['json_sha256'],
+        })
     for name, comparison in report['comparisons'].items():
         row = {
             'record_type': 'comparison_delta_of_means', 'id': name,
@@ -748,10 +1663,32 @@ def _tsv_rows(report):
         })
     rows.append({
         'record_type': 'provenance_check', 'id': 'strict_inventory',
-        'count': report['inventory']['completed_artifacts'],
+        'count': report['inventory'].get(
+            'total_completed_artifacts',
+            report['inventory']['completed_artifacts'],
+        ),
         'passes': not report['inventory']['anomalies'],
         'mean': report['inventory']['verified_hashed_provenance_files'],
     })
+    if 'final_shared_selection' in report:
+        selection = report['final_shared_selection']
+        rows.append({
+            'record_type': 'final_selection',
+            'id': 'shared_backbone',
+            'method': selection['method'],
+            'architecture': selection['architecture'],
+            'variant': selection['variant'],
+            'evidence_scope': selection['evidence_scope'],
+            'continuous_gcl': selection['continuous_gcl'],
+            'planned_deployment_gnns': selection['planned_deployment_gnns'],
+            'shared_model_trainable_parameters': (
+                selection['shared_model_trainable_parameters']
+            ),
+            'deployment_export_validated': (
+                selection['deployment_export_validated']
+            ),
+            'selection_status': selection['status'],
+        })
     return rows
 
 
@@ -775,9 +1712,18 @@ def write_report(report, output_dir):
     rows = _tsv_rows(report)
     columns = [
         'record_type', 'id', 'method', 'reference', 'seed', 'seeds', 'scope',
-        'count', *METRICS, *[f'{metric}_pstdev' for metric in METRICS],
+        'screen', 'evidence_scope', 'architecture', 'variant',
+        'continuous_gcl', 'count', *METRICS,
+        *[f'{metric}_pstdev' for metric in METRICS],
         'mean', 'pstdev', 'median', 'q10', 'q25', 'q75', 'q90',
-        'negative_fraction', 'passes', 'best_epoch', 'git_commit', 'artifact_dir',
+        'negative_fraction', 'passes', 'per_seed_gate_pass_count',
+        'all_seed_gates_pass', 'source_val_improvement_over_incumbent',
+        'minimum_improvement_to_expand', 'advances_to_seeds12',
+        'planned_deployment_gnns', 'shared_model_trainable_parameters',
+        'deployment_export_validated',
+        'selection_status', 'selection_reason', 'best_epoch', 'git_commit',
+        'artifact_dir', 'checkpoint_path', 'checkpoint_sha256',
+        'source_summary_path', 'source_summary_sha256',
     ]
     with tempfile.NamedTemporaryFile(
         mode='w', encoding='utf-8', newline='', dir=output_dir, delete=False
@@ -799,13 +1745,34 @@ def main(argv=None):
         '--output_dir', type=Path,
         default=Path('logs/strict_reuse_report_20260712'),
     )
+    parser.add_argument('--schedule_root', type=Path)
+    parser.add_argument('--pcgrad_root', type=Path)
+    parser.add_argument('--sage_root', type=Path)
     args = parser.parse_args(argv)
     repo_root = Path(__file__).resolve().parents[1]
     roots = args.roots or [repo_root / 'logs' / name for name in EXPECTED_MATRIX]
-    report = build_report(roots, repo_root)
+    screen_roots = {
+        'linear_lambda': args.schedule_root or (
+            repo_root / 'logs' / SEED0_SCREEN_ROOT_NAMES['linear_lambda']
+        ),
+        'pcgrad': args.pcgrad_root or (
+            repo_root / 'logs' / SEED0_SCREEN_ROOT_NAMES['pcgrad']
+        ),
+        'graphsage': args.sage_root or (
+            repo_root / 'logs' / SEED0_SCREEN_ROOT_NAMES['graphsage']
+        ),
+    }
+    report = build_canonical_report(roots, screen_roots, repo_root)
     json_path, tsv_path = write_report(report, args.output_dir)
     print(json.dumps({
-        'completed_artifacts': report['inventory']['completed_artifacts'],
+        'core_completed_artifacts': report['inventory']['completed_artifacts'],
+        'seed0_screen_artifacts': report['inventory']['seed0_screen_artifacts'],
+        'total_completed_artifacts': report['inventory'][
+            'total_completed_artifacts'
+        ],
+        'validated_seed0_screen_reports': report['inventory'][
+            'validated_seed0_screen_reports'
+        ],
         'verified_hashed_provenance_files': (
             report['inventory']['verified_hashed_provenance_files']
         ),
@@ -813,6 +1780,7 @@ def main(argv=None):
             'promotion_gates_vs_static_dual'
         ]['joint_rank0_lambda005']['passes'],
         'gradient_audit_records': report['gradient_audit']['record_count'],
+        'locked_shared_method': report['final_shared_selection']['method'],
         'json': str(json_path),
         'tsv': str(tsv_path),
     }, indent=2))

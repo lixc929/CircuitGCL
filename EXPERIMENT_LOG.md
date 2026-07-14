@@ -1875,22 +1875,38 @@ lambda schedule from `0.05` to `0.005`; PCGrad is not expanded in parallel.
 To prevent manual transcription from multiple log directories,
 `scripts/summarize_strict_reuse.py` is the canonical strict reuse report
 builder. With no positional arguments it reads exactly these four whitelisted
-roots:
+core roots:
 
 - `logs/strict_seed0_seven_20260712_v2`
 - `logs/strict_selection_seeds12_20260712`
 - `logs/strict_joint_rank0_lambda005_seed0_20260712`
 - `logs/strict_joint_rank0_lambda005_seeds12_audit_20260712`
 
+and these three whitelisted supplemental seed-0 screen roots:
+
+- `logs/strict_joint_rank0_lambda005_to0005_linear_seed0_audit_20260712`
+- `logs/strict_joint_rank0_lambda005_pcgrad_seed0_audit_20260713`
+- `logs/strict_joint_sage_rank0_seed0_screen_20260714`
+
 It requires the exact 20-run method/seed matrix, validates every formal strict
 argument and restored raw validation MSE, verifies checkpoint existence,
 checks source-only graph scope, recomputes paired statistics and gates, checks
 the rank-0 lambda-zero/positive-lambda provenance pairing, and recomputes the
-gradient statistics from raw JSONL. The current audit has 20/20 completed
-artifacts, zero anomalies, and 68 unique path/SHA256 provenance references with
-zero missing files or hash mismatches. `SP8192W` is absent from every formal
-configuration, runtime graph list, and reported metric; no formal run artifact
-records access to it.
+gradient statistics from raw JSONL. It separately rebuilds the Linear, PCGrad,
+and GraphSAGE validators from raw artifacts, requires their materialized
+JSON/TSV files to be byte-identical to the rebuild, checks their pinned
+manifest/summary hashes, and imports exactly four seed-0 candidate rows without
+mixing them into three-seed means or standard deviations.
+
+The current audit has a 20/20 core matrix plus 4/4 supplemental screen
+artifacts, for 24/24 included artifacts with zero anomalies. The 68 unique
+path/SHA256 provenance references retain their original meaning for the core
+20-run matrix; supplemental validation separately covers three manifests and
+six materialized summary files. Known blind identifiers are absent from the
+included configurations, commands, runtime graph lists, processed-cache
+metadata, and metrics; the validator scans 94 core and 35 supplemental text
+files for the known aliases. This is an included-artifact claim only: blind
+evaluation is still pending and no blind result is present in this report.
 
 Regenerate the centralized machine-readable report with:
 
@@ -1904,8 +1920,8 @@ The only two generated report files are:
 - `logs/strict_reuse_report_20260712/strict_reuse_summary.tsv`
 
 The current SHA256 values are
-`50ff9c82cd9f3d8ad0b949c74f72cf7f9ccb3981aa0f1b70c884f764b6d6540f`
-and `51aa7dc229f4598255d5508a43c66b43971646230d5f9c5846105a08b0893470`,
+`52bc272c82e90c07090d4534bfe502df6a2c5914e992808f6adf0eb944ad3821`
+and `ce47fc753e0548d9151d62e3edc55dde741042276674338339cbe7cf23fa2b95`,
 respectively. These generated files are ignored by Git and can always be
 reconstructed from the immutable raw artifacts; this experiment log remains
 the single human-readable project record rather than introducing another
@@ -2249,3 +2265,54 @@ logs/strict_joint_sage_rank0_seed0_screen_20260714/
   sage_seed0_summary.json
   sage_seed0_summary.tsv
 ```
+
+### Canonical Teacher-Facing Reuse Tables (Pre-Deployment, Pre-Blind)
+
+The following two tables are generated from the schema-v2 canonical report.
+They deliberately separate three-seed formal evidence from seed-0 method
+screens. Values in the first table are `mean +/- population standard deviation`
+over independent seeds 0-2 (`ddof=0`). For each seed, transfer mean is first
+computed as the unweighted mean of the three transfer-circuit raw MSE values;
+those three per-seed means are then summarized across seeds.
+
+| Method | Val raw MSE | digtime | timing_ctrl | array | Transfer mean | Mean gate / passing seeds | Decision |
+|---|---:|---:|---:|---:|---:|---:|---|
+| static dual | 0.007714418 +/- 0.000067849 | 0.015026925 +/- 0.001034566 | 0.010873532 +/- 0.000422270 | 0.010086297 +/- 0.000212843 | 0.011995585 +/- 0.000261850 | pass / 3 of 3 | reference |
+| no-GCL | 0.007713429 +/- 0.000060170 | 0.015206145 +/- 0.000178528 | 0.011248288 +/- 0.000144290 | 0.009921565 +/- 0.000183533 | 0.012125333 +/- 0.000094850 | pass / 3 of 3 | diagnostic control |
+| init_reuse | 0.007713537 +/- 0.000064594 | 0.014964127 +/- 0.000807866 | 0.011275733 +/- 0.000403020 | 0.010008573 +/- 0.000580558 | 0.012082811 +/- 0.000072951 | pass / 3 of 3 | engineering fallback |
+| ClusterGCN rank0, lambda=0 | 0.007978297 +/- 0.000080919 | 0.014801401 +/- 0.000742506 | 0.010935558 +/- 0.000100515 | 0.012387784 +/- 0.000193157 | 0.012708248 +/- 0.000245843 | pass / 2 of 3 | passes mean gate; not selected |
+| ClusterGCN rank0, lambda=0.05 | 0.007964463 +/- 0.000050523 | 0.014450451 +/- 0.000596734 | 0.010903847 +/- 0.000081742 | 0.011382574 +/- 0.000262272 | 0.012245624 +/- 0.000299610 | pass / 3 of 3 | selected shared incumbent |
+| ClusterGCN LoRA r8, lambda=0.05 | 0.008040104 +/- 0.000074085 | 0.014526975 +/- 0.000224405 | 0.011076303 +/- 0.000176066 | 0.013059814 +/- 0.001016669 | 0.012887697 +/- 0.000329714 | fail / 2 of 3 | array veto; rejected |
+
+The mean-level gate and the number of individually passing seeds are distinct.
+For example, rank-0 `lambda=0` passes the gate on three-seed means, but seed 1
+fails its transfer-mean and array checks. LoRA fails the mean-level array gate
+and seed 2. The selected rank-0 `lambda=0.05` candidate passes both the
+mean-level checks and all three per-seed checks.
+
+The second table contains raw seed-0 results only. It does not report a fake
+zero standard deviation and none of these candidates is pooled into the first
+table. Its safety-gate reference is static dual seed0, while its selection
+reference is fixed ClusterGCN rank-0 `lambda=0.05` seed0. `Val improvement` is
+defined as `incumbent Val - candidate Val`; advancement requires it to be
+strictly greater than `2e-5`.
+
+| Seed-0 method | Val raw MSE | digtime | timing_ctrl | array | Transfer mean | Val improvement | Safety gate | Advancement |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| fixed ClusterGCN rank0, lambda=0.05 | 0.008035913 | 0.015224475 | 0.010998346 | 0.011695725 | 0.012639515 | 0 | pass | incumbent |
+| Linear lambda 0.05 -> 0.005 | 0.008049868 | 0.015027398 | 0.010868106 | 0.011445360 | 0.012446955 | -1.395494e-5 | pass | no |
+| PCGrad lambda=0.05 | 0.008055134 | 0.013704132 | 0.010625650 | 0.010672306 | 0.011667363 | -1.922064e-5 | pass | no |
+| GraphSAGE lambda=0 | 0.008095136 | 0.014649815 | 0.011226653 | 0.012096140 | 0.012657536 | -5.922280e-5 | pass | no |
+| GraphSAGE lambda=0.05 | 0.008076897 | 0.014475943 | 0.011024745 | 0.010522621 | 0.012007770 | -4.098378e-5 | pass | no |
+
+All four seed-0 candidates pass the safety gates but fail the registered source
+improvement rule. Linear, PCGrad, and GraphSAGE `lambda=0.05` improve some or
+all transfer metrics relative to the fixed seed-0 incumbent, but transfer is a
+gate/reporting signal and cannot replace the preregistered source-validation
+selection metric. No seed0 screen advances to seeds 1-2.
+
+The reuse architecture is therefore locked as one rank-0, two-layer,
+hidden-64 ClusterGCN shared backbone with constant `lambda=0.05`. Its shared
+model has 29,378 trainable parameters as an architecture property; standalone
+export size, prediction equivalence, peak memory, latency, and blind accuracy
+remain pending and are not claimed by these tables.
