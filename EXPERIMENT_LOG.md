@@ -2069,3 +2069,120 @@ Selection is fixed before observing PCGrad performance:
 5. No linear schedule, distillation, or other reuse method runs in parallel.
    If PCGrad does not advance, the evidence supports locking the already-passing
    fixed positive-lambda shared architecture before rebalancing integration.
+
+### R5 PCGrad Seed-0 Result
+
+The formal PCGrad control completed at commit `95cb948` on physical GPU4. The
+training process, dedicated validator, and overall queue all returned `rc=0`.
+The source-validation-selected checkpoint was epoch 159.
+
+| Method | Val raw MSE | digtime | timing_ctrl | array | Transfer mean |
+|---|---:|---:|---:|---:|---:|
+| static dual seed0 | 0.007809748 | 0.016486799 | 0.010408374 | 0.010042039 | 0.012312404 |
+| fixed lambda=0.05 seed0 | 0.008035913 | 0.015224475 | 0.010998346 | 0.011695725 | 0.012639515 |
+| PCGrad lambda=0.05 seed0 | 0.008055134 | 0.013704132 | 0.010625650 | 0.010672306 | 0.011667363 |
+
+Relative to static dual, PCGrad changes source validation by `+3.1420%`,
+transfer mean by `-5.2390%`, digtime by `-16.8782%`, timing_ctrl by `+2.0875%`,
+and array by `+6.2763%`; all `5%/10%/25%` gates pass. Relative to fixed
+`lambda=0.05`, PCGrad improves transfer mean by `7.6914%` and all three
+transfer circuits by `3.3887%` to `9.9862%`, but worsens the preregistered
+primary source-validation metric by `1.922064e-5` (`0.2392%`). It therefore
+does not satisfy the required source improvement greater than `2e-5` and does
+not advance to seeds 1-2. The observed transfer improvement cannot override
+the registered primary metric. Fixed `lambda=0.05` remains the incumbent.
+
+Across all 44,000 training batches, PCGrad projected 20,480 conflicts
+(`46.5455%`). Raw global cosine had mean/median `0.029427/0.015871`, with
+Q10/Q25/Q75/Q90 of `-0.230510/-0.106989/0.156354/0.317414`. The mean ratio of
+projected to standard combined-gradient norm was `0.997096`. Thus conflict is
+real and frequent, but removing its negative component shifts the
+source/transfer tradeoff rather than improving the registered source metric.
+
+The immutable summaries are:
+
+```text
+logs/strict_joint_rank0_lambda005_pcgrad_seed0_audit_20260713/
+  pcgrad_seed0_summary.json
+  pcgrad_seed0_summary.tsv
+```
+
+### Pre-Registered Compact GraphSAGE Shared Seed-0 Screen
+
+The completed compact ClusterGCN rank-0 `lambda=0.05` model passes every
+strict gate but remains `3.241%` worse than static dual on mean source
+validation. The paper used GraphSAGE for its independent downstream GNN. A
+single compact GraphSAGE screen therefore tests whether the remaining source
+gap reflects the shared ClusterGCN operator rather than sharing itself. This
+is an architecture screen, not a relaxation of the strict protocol or a
+paper-scale reproduction.
+
+At two layers and hidden dimension 64, PyG `SAGEConv` and `ClusterGCNConv`
+each contain 8,256 trainable values per layer. The two-layer shared GNN and
+the full deployment model therefore retain the same parameter count. The
+paper-scale five-layer, hidden-144 GraphSAGE configuration is not tested here
+because it would confound operator choice with a large capacity increase.
+
+The only two candidate arms are:
+
+```text
+joint_sage_rank0_lambda0_seed0
+joint_sage_rank0_lambda005_seed0
+```
+
+under:
+
+```text
+logs/strict_joint_sage_rank0_seed0_screen_20260714
+```
+
+Both arms use a two-layer hidden-64 GraphSAGE online/shared backbone and the
+same two-layer head. Every other strict factor remains fixed: SSRAM-only SGRL
+and normalization, five pretraining epochs, 160 downstream epochs without
+early stopping, MSE, batch 512, learning rate `1e-4`, two hops with eight
+neighbors, source/transfer sampling rates `1.0/0.1`, stage seed 0, and fixed
+relation/embedding/evaluation seeds `20260711`. Representation audit remains
+enabled every ten epochs. Gradient audit, PCGrad, LoRA, lambda schedules, and
+distillation are excluded. The blind circuit is absent from commands,
+manifests, runtime graph lists, and metrics.
+
+The GraphSAGE SGRL checkpoint does not exist before this screen. To prevent a
+checkpoint/metadata writer race, execution is fail-closed and sequential:
+
+1. `lambda=0` is the only source-only GraphSAGE checkpoint producer.
+2. Only after that run and its checkpoint provenance complete successfully may
+   `lambda=0.05` validate and reuse the same checkpoint.
+3. Any failure stops the queue; no second writer or automatic retry is allowed.
+
+The dedicated validator must confirm exactly two completed artifacts, exact
+strict arguments and stage seeds, source-only graph provenance, finite raw
+metrics, restored-best validation equality, identical SAGE checkpoint/hash,
+split, normalization, train/evaluation sampler provenance across the two arms,
+absence of embedding-cache use, and the complete 21-record representation
+audit. It also compares immutable processed-cache references with the canonical
+seed-0 controls. SAGE and Cluster checkpoints or initial-model fingerprints are
+intentionally not required to match because the operator is the experimental
+factor.
+
+Selection is fixed before observing either GraphSAGE result:
+
+1. Each eligible arm must pass the existing gates relative to canonical
+   seed-0 static dual: source degradation at most `5%`, transfer-mean
+   degradation at most `10%`, and every transfer-circuit degradation at most
+   `25%`.
+2. The exact upper bounds are source Val `0.008200235828`, transfer mean
+   `0.013543644268`, digtime `0.020608499181`, timing_ctrl `0.013010466937`,
+   and array `0.012552548433`.
+3. Advancement additionally requires source Val to improve over incumbent
+   ClusterGCN `lambda=0.05` by more than `2e-5`, i.e. GraphSAGE Val must be
+   strictly below `0.008015913110`.
+4. Transfer metrics are gates and reporting only; they cannot select the
+   architecture or reverse a source-based decision.
+5. An arm qualifies only if it satisfies both the safety gates and the source
+   improvement in item 3. If both GraphSAGE arms qualify, choose the lower raw
+   source Val. If their difference is at most `2e-5`, prefer `lambda=0.05`
+   because it retains the continuous GCL objective at identical deployment
+   cost.
+6. If neither qualifies, retain ClusterGCN `lambda=0.05` and stop GraphSAGE.
+   If at least one qualifies, do not automatically launch more seeds: first
+   register a matched static-GraphSAGE control and the exact multi-seed plan.

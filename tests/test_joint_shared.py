@@ -8,8 +8,10 @@ import unittest
 
 import torch
 from torch_geometric.data import Data
+from torch_geometric.nn import SAGEConv
 
 from model import JointSharedGraphHead, MergeableLoRALinear
+from sgrl_models import CustomConv
 from downstream_train import (
     build_joint_pcgrad_context,
     build_joint_gradient_audit_context,
@@ -91,6 +93,81 @@ class JointSharedTest(unittest.TestCase):
         }
         self.model.load_online_encoder_state(encoder_state)
         self.model.eval()
+
+    def test_rank0_sage_constructs_and_runs_joint_forward(self):
+        model = JointSharedGraphHead(make_args(cl_model='sage'))
+        model.eval()
+        batch = make_batch()
+
+        self.assertEqual(model.shared_backbone.lora_rank, 0)
+        self.assertTrue(all(
+            isinstance(layer, SAGEConv)
+            for layer in model.shared_backbone.gnn.layers
+        ))
+        with torch.no_grad():
+            prediction, true_class, labels, online_x = model(
+                batch,
+                return_backbone=True,
+            )
+            gcl_loss = model.gcl_loss(batch, online_x=online_x)
+
+        self.assertEqual(tuple(prediction.shape), (2, 1))
+        self.assertEqual(tuple(true_class.shape), (2,))
+        self.assertEqual(tuple(labels.shape), (2, 2))
+        self.assertEqual(tuple(online_x.shape), (6, 8))
+        self.assertTrue(torch.isfinite(prediction).all())
+        self.assertTrue(torch.isfinite(gcl_loss))
+
+    def test_sage_pretraining_checkpoint_loads_online_and_target_state(self):
+        args = make_args(cl_model='sage')
+        pretrained_encoder = CustomConv(args)
+        pretrained_state = pretrained_encoder.state_dict()
+        with torch.no_grad():
+            for index, tensor in enumerate(pretrained_state.values(), start=1):
+                tensor.fill_(index / 100.0 if tensor.is_floating_point() else index)
+        checkpoint_state = {
+            f'online_encoder.{key}': value.clone()
+            for key, value in pretrained_state.items()
+        }
+        model = JointSharedGraphHead(args)
+
+        model.load_online_encoder_state(checkpoint_state)
+
+        online_state = model.shared_backbone.gnn.state_dict()
+        target_state = model.target_backbone.gnn.state_dict()
+        for key, value in online_state.items():
+            self.assertTrue(torch.equal(value, pretrained_state[key]), key)
+            self.assertTrue(torch.equal(target_state[key], value), key)
+
+    def test_rank0_sage_and_clustergcn_have_equal_parameter_counts(self):
+        cluster_model = JointSharedGraphHead(make_args(cl_model='clustergcn'))
+        sage_model = JointSharedGraphHead(make_args(cl_model='sage'))
+
+        cluster_gnn_parameters = sum(
+            parameter.numel()
+            for parameter in cluster_model.shared_backbone.gnn.parameters()
+        )
+        sage_gnn_parameters = sum(
+            parameter.numel()
+            for parameter in sage_model.shared_backbone.gnn.parameters()
+        )
+        self.assertEqual(sage_gnn_parameters, cluster_gnn_parameters)
+        self.assertEqual(
+            sage_model.deployment_parameter_count(),
+            cluster_model.deployment_parameter_count(),
+        )
+
+    def test_nonzero_lora_rejects_sage_checkpoint_load(self):
+        args = make_args(cl_model='sage', joint_lora_rank=2)
+        pretrained_encoder = CustomConv(args)
+        checkpoint_state = {
+            f'online_encoder.{key}': value.clone()
+            for key, value in pretrained_encoder.state_dict().items()
+        }
+        model = JointSharedGraphHead(args)
+
+        with self.assertRaisesRegex(ValueError, 'supports clustergcn only'):
+            model.load_online_encoder_state(checkpoint_state)
 
     def make_lora_model(self, rank=2):
         model = JointSharedGraphHead(make_args(joint_lora_rank=rank))
